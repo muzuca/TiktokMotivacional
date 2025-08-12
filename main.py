@@ -67,7 +67,7 @@ def rotina():
         # Para vídeos existentes, usar o último vídeo e uma descrição padrão
         video_path = obter_ultimo_video()
         if video_path:
-            postar_no_tiktok_e_renomear(descricao_personalizada="Conteúdo motivacional pendente! #Motivacao #Inspiracao #TikTokMotivacional", video_final=video_path)
+            postar_no_tiktok_e_renomear(descricao_personalizada="Conteúdo motivacional! #Motivacao #Inspiracao #TikTokMotivacional", video_final=video_path)
 
     logger.info("✅ Tudo pronto!")
 
