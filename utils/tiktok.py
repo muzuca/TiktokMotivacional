@@ -1,5 +1,3 @@
-# utils/tiktok.py
-
 import os
 import time  # Para delays
 from datetime import datetime, timedelta
@@ -37,10 +35,11 @@ def obter_ultimo_video(pasta=PASTA_VIDEOS):
         logger.error("❌ Erro ao buscar último vídeo: %s", str(e))
         return None
 
-def postar_no_tiktok_e_renomear(descricao_personalizada=None, imagem_base=None, imagem_final=None, video_final=None, agendar=False):
+def postar_no_tiktok_e_renomear(descricao_personalizada=None, imagem_base=None, imagem_final=None, video_final=None, agendar=False, idioma='en'):
     """
     Busca o último vídeo gerado, posta no TikTok e limpa os arquivos gerados após sucesso.
-    Parâmetros: descricao_personalizada (str) para legenda dinâmica, caminhos dos arquivos gerados, agendar (bool) para post futuro.
+    Parâmetros: descricao_personalizada (str) para legenda dinâmica, caminhos dos arquivos gerados,
+                agendar (bool) para post futuro, idioma (str) para definir hashtags.
     """
     video_path = video_final if video_final else obter_ultimo_video()
     if not video_path:
@@ -51,8 +50,16 @@ def postar_no_tiktok_e_renomear(descricao_personalizada=None, imagem_base=None, 
         return
 
     try:
-        # Constrói a descrição usando descricao_personalizada, com hashtags fixas
-        description = descricao_personalizada + " #Motivacao #Inspiracao #TikTokMotivacional" if descricao_personalizada else "Conteúdo motivacional do dia! #Motivacao #Inspiracao #TikTokMotivacional"
+        # Determina as hashtags com base no idioma
+        hashtags_en = " #Motivation #Inspiration #TikTokMotivational"
+        hashtags_pt = " #Motivacao #Inspiracao #TikTokMotivacional"
+        hashtags = hashtags_pt if idioma == 'pt-br' else hashtags_en
+
+        if descricao_personalizada:
+            description = descricao_personalizada + hashtags
+        else:
+            description = "Motivational content of the day!" + hashtags_en if idioma == 'en' else "Conteúdo motivacional do dia!" + hashtags_pt
+
         schedule = None
         if agendar:
             schedule = datetime.now() + timedelta(minutes=20)

@@ -60,14 +60,14 @@ def rotina():
         # Criar vídeo com música
         gerar_video(imagem_final, video_final)
 
-        # Postar no TikTok, passando os caminhos dos arquivos
-        postar_no_tiktok_e_renomear(descricao_personalizada=frase, imagem_base=imagem_base, imagem_final=imagem_final, video_final=video_final)
+        # Postar no TikTok, passando o idioma
+        postar_no_tiktok_e_renomear(descricao_personalizada=frase, imagem_base=imagem_base, imagem_final=imagem_final, video_final=video_final, idioma=idioma)
 
     else:
         # Para vídeos existentes, usar o último vídeo e uma descrição padrão
         video_path = obter_ultimo_video()
         if video_path:
-            postar_no_tiktok_e_renomear(descricao_personalizada="Conteúdo motivacional! #Motivacao #Inspiracao #TikTokMotivacional", video_final=video_path)
+            postar_no_tiktok_e_renomear(descricao_personalizada="Conteúdo motivacional pendente! #Motivacao #Inspiracao #TikTokMotivacional", video_final=video_path, idioma='pt-br')  # Assume pt-br como padrão para pendentes
 
     logger.info("✅ Tudo pronto!")
 
