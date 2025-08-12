@@ -42,23 +42,20 @@ def save_used_phrases(used_phrases):
     with open(PHRASES_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(list(used_phrases), f)
 
-def gerar_prompt_paisagem():
+def gerar_prompt_paisagem(idioma="en"):
     """
-    Gera uma descrição curta e aleatória de uma paisagem bonita.
+    Gera uma descrição curta e aleatória de uma paisagem bonita no idioma especificado.
     Escolhe uma entre 10 opções geradas pelo Gemini, evitando repetição.
     """
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ Chave API do Gemini (GEMINI_API_KEY) não configurada no .env.")
-        return "Montanhas ao nascer do sol"
+        return "Mountains at sunrise" if idioma == "en" else "Montanhas ao nascer do sol"
 
     used_phrases = load_used_phrases()
     try:
-        logger.info("Gerando prompt de paisagem com Gemini.")
-        prompt = (
-            "Crie 10 descrições curtas de paisagens bonitas, com até 7 palavras cada. "
-            "Liste cada uma em uma nova linha, sem numeração."
-        )
-        response = model.generate_content(prompt)
+        logger.info("Gerando prompt de paisagem com Gemini em %s.", idioma)
+        prompt_text = "Create 10 short descriptions of beautiful landscapes, with up to 7 words each." if idioma == "en" else "Crie 10 descrições curtas de paisagens bonitas, com até 7 palavras cada."
+        response = model.generate_content(prompt_text)
         texto = response.text.strip()
 
         descricoes = [linha.strip() for linha in texto.split("\n") if linha.strip() and len(linha.split()) <= 7]
@@ -69,8 +66,8 @@ def gerar_prompt_paisagem():
         # Filtra descrições já usadas
         novas_descricoes = [d for d in descricoes if hashlib.md5(d.encode()).hexdigest() not in used_phrases]
         if not novas_descricoes:
-            logger.warning("Nenhum novo prompt disponível. Reutilizando 'Montanhas ao nascer do sol'.")
-            return "Montanhas ao nascer do sol"
+            logger.warning("Nenhum novo prompt disponível. Reutilizando padrão.")
+            return "Mountains at sunrise" if idioma == "en" else "Montanhas ao nascer do sol"
 
         descricao_escolhida = random.choice(novas_descricoes)
         used_phrases.add(hashlib.md5(descricao_escolhida.encode()).hexdigest())
@@ -80,24 +77,21 @@ def gerar_prompt_paisagem():
 
     except Exception as e:
         logger.error("Erro ao gerar prompt da paisagem com Gemini: %s", str(e))
-        return "Montanhas ao nascer do sol"
+        return "Mountains at sunrise" if idioma == "en" else "Montanhas ao nascer do sol"
 
-def gerar_frase_motivacional():
+def gerar_frase_motivacional(idioma="en"):
     """
-    Gera uma frase motivacional curta em português, escolhida aleatoriamente entre 10 opções, evitando repetição.
+    Gera uma frase motivacional curta no idioma especificado, escolhida aleatoriamente entre 10 opções, evitando repetição.
     """
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ Chave API do Gemini (GEMINI_API_KEY) não configurada no .env.")
-        return "Você é mais forte do que imagina."
+        return "You are stronger than you think." if idioma == "en" else "Você é mais forte do que imagina."
 
     used_phrases = load_used_phrases()
     try:
-        logger.info("Gerando frase motivacional com Gemini.")
-        prompt = (
-            "Crie 10 frases motivacionais em português, com no máximo 15 palavras cada. "
-            "Liste cada frase em uma nova linha, sem numeração."
-        )
-        response = model.generate_content(prompt)
+        logger.info("Gerando frase motivacional com Gemini em %s.", idioma)
+        prompt_text = "Create 10 motivational phrases in English, with a maximum of 15 words each." if idioma == "en" else "Crie 10 frases motivacionais em português, com no máximo 15 palavras cada."
+        response = model.generate_content(prompt_text)
         texto = response.text.strip()
 
         # Divide as frases por linha e remove vazios, validando comprimento
@@ -109,8 +103,8 @@ def gerar_frase_motivacional():
         # Filtra frases já usadas
         novas_frases = [f for f in frases if hashlib.md5(f.encode()).hexdigest() not in used_phrases]
         if not novas_frases:
-            logger.warning("Nenhuma nova frase disponível. Reutilizando 'Você é mais forte do que imagina.'")
-            return "Você é mais forte do que imagina."
+            logger.warning("Nenhuma nova frase disponível. Reutilizando padrão.")
+            return "You are stronger than you think." if idioma == "en" else "Você é mais forte do que imagina."
 
         frase_escolhida = random.choice(novas_frases)
         used_phrases.add(hashlib.md5(frase_escolhida.encode()).hexdigest())
@@ -120,7 +114,7 @@ def gerar_frase_motivacional():
 
     except Exception as e:
         logger.error("Erro ao gerar frase motivacional com Gemini: %s", str(e))
-        return "Você é mais forte do que imagina."
+        return "You are stronger than you think." if idioma == "en" else "Você é mais forte do que imagina."
     
 def quebrar_em_duas_linhas(frase: str) -> str:
     """
