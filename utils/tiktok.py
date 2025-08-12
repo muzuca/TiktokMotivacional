@@ -39,7 +39,7 @@ def postar_no_tiktok_e_renomear(descricao_personalizada=None, imagem_base=None, 
     """
     Busca o último vídeo gerado, posta no TikTok e limpa os arquivos gerados após sucesso.
     Parâmetros: descricao_personalizada (str) para legenda dinâmica, caminhos dos arquivos gerados,
-                agendar (bool) para post futuro, idioma (str) para definir hashtags.
+                agendar (bool) para post futuro, idioma (str) para definir hashtags e proxy.
     """
     video_path = video_final if video_final else obter_ultimo_video()
     if not video_path:
@@ -76,7 +76,8 @@ def postar_no_tiktok_e_renomear(descricao_personalizada=None, imagem_base=None, 
             stitch=True,
             duet=True,
             headless=False,  # Defina como False para ver o browser; mude para True se funcionar
-            schedule=schedule
+            schedule=schedule,
+            idioma=idioma  # Passa o idioma para upload_video
         )
         logger.info("✅ Vídeo postado com sucesso!")
 
@@ -85,7 +86,7 @@ def postar_no_tiktok_e_renomear(descricao_personalizada=None, imagem_base=None, 
             os.remove(imagem_base)
             logger.info("🗑️ Imagem base removida: %s", imagem_base)
         if imagem_final and os.path.exists(imagem_final):
-            os.remove(imagem_final)
+            #os.remove(imagem_final)
             logger.info("🗑️ Imagem final removida: %s", imagem_final)
         if video_final and os.path.exists(video_final):
             os.remove(video_final)
