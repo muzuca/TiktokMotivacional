@@ -90,7 +90,7 @@ def gerar_frase_motivacional(idioma="en"):
     used_phrases = load_used_phrases()
     try:
         logger.info("Gerando frase motivacional com Gemini em %s.", idioma)
-        prompt_text = "Create 10 motivational phrases in English, with a maximum of 15 words each." if idioma == "en" else "Crie 10 frases motivacionais em português, com no máximo 15 palavras cada."
+        prompt_text = "Create 10 motivational phrases in English, with a maximum of 15 words each. List each phrase on a new line, without numbering." if idioma == "en" else "Crie 10 frases motivacionais em português, com no máximo 15 palavras cada. Liste cada frase em uma nova linha, sem numeração."
         response = model.generate_content(prompt_text)
         texto = response.text.strip()
 

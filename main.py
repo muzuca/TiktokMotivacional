@@ -1,11 +1,19 @@
-# main.py
-
 import os
 from utils.frase import gerar_prompt_paisagem, gerar_frase_motivacional, gerar_slug
 from utils.imagem import gerar_imagem_com_frase, escrever_frase_na_imagem
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear  # Novo import para upload no TikTok
 import logging
+
+# Nova escolha de idioma/país no início
+print("\nEscolha o país para referência da língua das mensagens:")
+print("1. EUA (Inglês) *padrão")
+print("2. Brasil (pt-br)")
+idioma = input("Digite o número da opção (1 ou 2): ")
+if idioma not in ['1', '2']:
+    print("Opção inválida! Usando EUA (Inglês) como padrão.")
+    idioma = '1'
+idioma = 'en' if idioma == '1' else 'pt-br'
 
 def verificar_videos_pendentes(pasta="videos"):
     """
@@ -33,8 +41,8 @@ def rotina():
         os.makedirs("audios", exist_ok=True)  # Garantir que a pasta de áudios exista
 
         # Gerar prompt e frase
-        prompt_imagem = gerar_prompt_paisagem()
-        frase = gerar_frase_motivacional()
+        prompt_imagem = gerar_prompt_paisagem(idioma)
+        frase = gerar_frase_motivacional(idioma)
 
         # Slugs para nome de arquivos
         slug_imagem = gerar_slug(prompt_imagem)
