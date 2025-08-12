@@ -3,3 +3,7 @@ __pycache__/
 .env
 cookies.txt
 *.TEMP_MPY_wvf_snd
+audios/
+videos/
+imagens/
+venv/
