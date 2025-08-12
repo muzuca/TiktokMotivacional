@@ -1,0 +1,12 @@
+requests
+Pillow
+moviepy
+python-dotenv
+google-generativeai
+diffusers
+torch
+selenium
+pyautogui
+pytz
+toml
+webdriver-manager
