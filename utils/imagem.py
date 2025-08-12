@@ -222,7 +222,7 @@ def gerar_imagem_com_frase(
                 raise Exception("URL da API Colab não encontrada.")
             url = f"{base_url}/gerar-imagem"
 
-            # Usa argumentos se vierem; senão os defaults do .env
+            # Usa argumentos se vieram; senão os defaults do .env
             payload = {
                 "prompt": prompt,
                 "width": int(width or COLAB_WIDTH),
@@ -302,3 +302,22 @@ def escrever_frase_na_imagem(imagem_path, frase, saida_path):
 
     except Exception as e:
         logger.error("❌ Erro ao escrever a frase na imagem: %s", str(e))
+
+def gerar_imagem(prompt, slug_paisagem, frase, slug_frase):
+    """
+    Gera uma imagem com base no modo configurado e adiciona a frase.
+    """
+    os.makedirs("imagens", exist_ok=True)
+    imagem_path = os.path.join("imagens", f"{slug_paisagem}.jpg")
+    saida_path = os.path.join("imagens", f"{slug_frase}.jpg")
+
+    # Gera a imagem com base no modo
+    if IMAGE_MODE == "pexels" or IMAGE_MODE == "local" or IMAGE_MODE == "colab":
+        gerar_imagem_com_frase(prompt, imagem_path)
+    else:
+        raise ValueError(f"Modo de imagem inválido: {IMAGE_MODE}")
+
+    # Adiciona a frase à imagem
+    escrever_frase_na_imagem(imagem_path, frase, saida_path)
+
+    return saida_path
