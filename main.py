@@ -32,42 +32,34 @@ def verificar_videos_pendentes(pasta="videos"):
         return False
 
 def rotina():
-    pendentes = verificar_videos_pendentes()
 
-    if not pendentes:
-        # Garantir que as pastas existam
-        os.makedirs("imagens", exist_ok=True)
-        os.makedirs("videos", exist_ok=True)
-        os.makedirs("audios", exist_ok=True)  # Garantir que a pasta de áudios exista
+    # Garantir que as pastas existam
+    os.makedirs("imagens", exist_ok=True)
+    os.makedirs("videos", exist_ok=True)
+    os.makedirs("audios", exist_ok=True)  # Garantir que a pasta de áudios exista
 
-        # Gerar prompt e frase
-        prompt_imagem = gerar_prompt_paisagem(idioma)
-        frase = gerar_frase_motivacional(idioma)
+    # Gerar prompt e frase
+    prompt_imagem = gerar_prompt_paisagem(idioma)
+    frase = gerar_frase_motivacional(idioma)
 
-        # Slugs para nome de arquivos
-        slug_imagem = gerar_slug(prompt_imagem)
-        slug_frase = gerar_slug(frase)
-        imagem_base = f"imagens/{slug_imagem}.jpg"
-        imagem_final = f"imagens/{slug_frase}.jpg"
-        video_final = f"videos/{slug_frase}.mp4"
+    # Slugs para nome de arquivos
+    slug_imagem = gerar_slug(prompt_imagem)
+    slug_frase = gerar_slug(frase)
+    imagem_base = f"imagens/{slug_imagem}.jpg"
+    imagem_final = f"imagens/{slug_frase}.jpg"
+    video_final = f"videos/{slug_frase}.mp4"
 
-        # Gerar imagem com IA ou Pexels (ver variável no imagem.py)
-        gerar_imagem_com_frase(prompt=prompt_imagem, arquivo_saida=imagem_base)
+    # Gerar imagem com IA ou Pexels (ver variável no imagem.py)
+    gerar_imagem_com_frase(prompt=prompt_imagem, arquivo_saida=imagem_base)
 
-        # Escrever frase na imagem
-        escrever_frase_na_imagem(imagem_base, frase, imagem_final)
+    # Escrever frase na imagem
+    escrever_frase_na_imagem(imagem_base, frase, imagem_final)
 
-        # Criar vídeo com música
-        gerar_video(imagem_final, video_final)
+    # Criar vídeo com música
+    gerar_video(imagem_final, video_final)
 
-        # Postar no TikTok, passando o idioma
-        postar_no_tiktok_e_renomear(descricao_personalizada=frase, imagem_base=imagem_base, imagem_final=imagem_final, video_final=video_final, idioma=idioma)
-
-    else:
-        # Para vídeos existentes, usar o último vídeo e uma descrição padrão
-        video_path = obter_ultimo_video()
-        if video_path:
-            postar_no_tiktok_e_renomear(descricao_personalizada="Conteúdo motivacional pendente! #Motivacao #Inspiracao #TikTokMotivacional", video_final=video_path, idioma='pt-br')  # Assume pt-br como padrão para pendentes
+    # Postar no TikTok, passando o idioma
+    postar_no_tiktok_e_renomear(descricao_personalizada=frase, imagem_base=imagem_base, imagem_final=imagem_final, video_final=video_final, idioma=idioma)
 
     logger.info("✅ Tudo pronto!")
 
