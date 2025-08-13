@@ -7,12 +7,11 @@ import datetime
 import shutil
 import subprocess
 from typing import Optional
-
 from dotenv import load_dotenv
+
 from .frase import gerar_frase_motivacional_longa
 from .audio import obter_caminho_audio, gerar_narracao_tts
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -32,10 +31,6 @@ DURACAO_MAXIMA_VIDEO = 20.0
 FPS = 30
 AUDIO_SR = 44100
 
-# volume relativo da música de fundo (0.10 ≈ -20 dB)
-BG_MIX_VOLUME = float(os.getenv("BG_MIX_VOLUME", "0.10"))
-
-# ----------------- helpers -----------------
 def _nome_limpo(base: str) -> str:
     base = (base or "video").strip().lower()
     base = re.sub(r"\s+", "-", base)
@@ -52,14 +47,17 @@ def _idioma_norm(idioma: str) -> str:
     s = (idioma or "en").lower()
     return "pt" if s.startswith("pt") else "en"
 
-# --------------- principal -----------------
-def gerar_video(imagem_path: str, saida_path: str, preset: str = "hd", idioma: str = "auto"):
+def gerar_video(imagem_path: str,
+                saida_path: str,
+                preset: str = "hd",
+                idioma: str = "auto",
+                tts_engine: str = "gemini"):
     """
-    Gera MP4 vertical (TikTok/Android) rápido via FFmpeg:
-    - Resol. por preset (sd/hd/fullhd), 30fps, H.264 yuv420p, AAC 44.1kHz
-    - +faststart; keyframe a cada 2s
-    - Duração máx. 20s
-    - Narração TTS (ElevenLabs) + música de fundo (Freesound/local)
+    Gera MP4 vertical (TikTok/Android) via FFmpeg:
+      - 30fps, H.264 yuv420p, AAC 44.1kHz
+      - +faststart; keyframe a cada 2s
+      - Duração máx. 20s
+      - Narração TTS (Gemini/ElevenLabs) + música de fundo
     """
     if preset not in PRESETS:
         logger.warning("Preset '%s' inválido. Usando 'hd'.", preset)
@@ -70,24 +68,21 @@ def gerar_video(imagem_path: str, saida_path: str, preset: str = "hd", idioma: s
         return
 
     ffmpeg = _ffmpeg_or_die()
-
     conf = PRESETS[preset]
     W, H = conf["w"], conf["h"]
     BR_V, BR_A, LEVEL = conf["br_v"], conf["br_a"], conf["level"]
 
-    # Nome de saída automático se 'saida_path' for diretório
+    # Nome de saída automático (se diretório)
     if os.path.isdir(saida_path):
         base = _nome_limpo(os.path.splitext(os.path.basename(imagem_path))[0])
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         saida_path = os.path.join(saida_path, f"{base}-{ts}.mp4")
     os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
 
-    # Texto longo
+    # Texto longo + TTS
     long_text = gerar_frase_motivacional_longa(idioma)
     lang_norm = _idioma_norm(idioma)
-
-    # TTS (narração)
-    voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm)
+    voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
 
     # Música de fundo
     background_audio_path: Optional[str] = None
@@ -110,23 +105,17 @@ def gerar_video(imagem_path: str, saida_path: str, preset: str = "hd", idioma: s
     cmd = [
         ffmpeg, "-y",
         "-loglevel", "error", "-stats",
-        "-loop", "1", "-i", imagem_path,  # 0: vídeo (imagem)
+        "-loop", "1", "-i", imagem_path,  # 0:v
     ]
-
-    # ordem: 1 = voz (se existir), 2 = bg (se existir)
     if has_voice:
-        cmd.extend(["-i", voice_audio_path])      # 1
+        cmd.extend(["-i", voice_audio_path])      # 1:a
     if has_bg:
-        cmd.extend(["-i", background_audio_path]) # 2
-
+        cmd.extend(["-i", background_audio_path]) # 2:a
     if not has_voice and not has_bg:
-        # gera silêncio (estéreo) como input 1
-        cmd.extend([
-            "-f", "lavfi", "-t", str(DURACAO_MAXIMA_VIDEO),
-            "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}"
-        ])
+        cmd.extend(["-f", "lavfi", "-t", str(DURACAO_MAXIMA_VIDEO),
+                    "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}"])  # 1:a
 
-    # Parâmetros comuns de encodes
+    # Encode comum
     cmd.extend([
         "-t", str(DURACAO_MAXIMA_VIDEO),
         "-r", str(FPS),
@@ -147,39 +136,24 @@ def gerar_video(imagem_path: str, saida_path: str, preset: str = "hd", idioma: s
         "-map_metadata", "-1",
     ])
 
-    # Mapeamento/Mixagem
+    # Mixagem — música mais baixa (0.15)
     if has_voice and has_bg:
-        # 0:v = vídeo; 1:a = voz; 2:a = bg
-        # trim em ambas as faixas e volumes (narração 1.0, bg BG_MIX_VOLUME)
         cmd.extend([
             "-filter_complex",
-            (
-                f"[1:a]atrim=0:{DURACAO_MAXIMA_VIDEO},asetpts=N/SR/TB,volume=1.0[narr];"
-                f"[2:a]atrim=0:{DURACAO_MAXIMA_VIDEO},asetpts=N/SR/TB,volume={BG_MIX_VOLUME}[bg];"
-                f"[narr][bg]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
-            ),
+            "[1:a]volume=1.0[va];[2:a]volume=0.15[ba];[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
             "-map", "0:v",
             "-map", "[aout]",
         ])
     else:
-        # quando há 1 único áudio (narração OU música) ou silêncio (input 1)
-        cmd.extend([
-            "-map", "0:v",
-            "-map", "1:a"
-        ])
+        cmd.extend(["-map", "0:v", "-map", "1:a"])
 
     cmd.append(saida_path)
 
-    logger.info(
-        "🎬 FFmpeg gerando %s (%dx%d, %s/%s, %dfps) → %s | BG_MIX_VOLUME=%.2f",
-        preset.upper(), W, H, BR_V, BR_A, FPS, saida_path, BG_MIX_VOLUME
-    )
+    logger.info("🎬 FFmpeg gerando %s (%dx%d, %s/%s, %dfps) → %s",
+                preset.upper(), W, H, BR_V, BR_A, FPS, saida_path)
 
     try:
         subprocess.run(cmd, check=True)
-        logger.info("✅ Vídeo salvo com sucesso: %s", saida_path)
+        logger.info("✅ Vídeo salvo: %s", saida_path)
     except subprocess.CalledProcessError as e:
         logger.error("❌ FFmpeg falhou (%s).\nComando: %s", e, " ".join(cmd))
-    finally:
-        # Se quiser limpar TTS temporário (quando gravado fora de audios_tts)
-        pass
