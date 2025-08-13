@@ -38,8 +38,9 @@ def _lang_tag_and_header(idioma: Optional[str]) -> Tuple[str, str]:
     return "en-US", "en-US,en;q=0.9"
 
 
-def _silenciar_logs_proxy(nivel=logging.ERROR) -> None:
-    """Reduz verbosidade de Selenium-Wire/mitmproxy/urllib3/webdriver_manager."""
+def _silenciar_ruido(nivel_wire=logging.ERROR, nivel_net=logging.WARNING, nivel_wdm=logging.WARNING) -> None:
+    """Reduz verbosidade de libs ruidosas."""
+    # seleniumwire / mitmproxy
     for name in (
         "seleniumwire",
         "seleniumwire.server",
@@ -48,11 +49,21 @@ def _silenciar_logs_proxy(nivel=logging.ERROR) -> None:
         "seleniumwire.backend",
         "seleniumwire.thirdparty.mitmproxy",
         "mitmproxy",
-        "urllib3",
-        "webdriver_manager",
     ):
         lg = logging.getLogger(name)
-        lg.setLevel(nivel)
+        lg.setLevel(nivel_wire)
+        lg.propagate = False
+
+    # urllib3 / requests
+    for name in ("urllib3", "requests.packages.urllib3"):
+        lg = logging.getLogger(name)
+        lg.setLevel(nivel_net)
+        lg.propagate = False
+
+    # webdriver_manager
+    for name in ("webdriver_manager", "WDM"):
+        lg = logging.getLogger(name)
+        lg.setLevel(nivel_wdm)
         lg.propagate = False
 
 
@@ -63,13 +74,11 @@ def _mk_seleniumwire_options(
     user: Optional[str],
     pw: Optional[str],
 ):
-    """Monta seleniumwire_options com proxy autenticado quando solicitado + scopes."""
+    """Monta seleniumwire_options com proxy autenticado + scopes (menos ruído)."""
     opts = {
-        # armazena nada das requisições (menos memória e IO)
-        "request_storage": "none",
-        # evita problemas de cert com MITM local
-        "verify_ssl": False,
-        # captura só o que importa (reduz ruído/log)
+        "request_storage": "none",   # menos memória/IO
+        "verify_ssl": False,         # evita erros de cert no MITM local
+        # captura só o que interessa
         "scopes": [
             r".*\.tiktok\.com.*",
             r".*\.tiktokcdn\.com.*",
@@ -106,8 +115,11 @@ def get_browser(
     - EUA/inglês => Selenium-Wire + proxy externo autenticado (se PROXY_* definidos)
     - PT-BR/others => Selenium "puro" (sem Selenium-Wire, sem MITM local)
     - Ajusta Accept-Language / --lang conforme idioma.
-    - Silencia logs ruidosos do Wire/mitmproxy.
+    - Silencia logs ruidosos (sempre).
     """
+    # Silencia ruído ANTES de instalar drivers/levantar proxy
+    _silenciar_ruido()
+
     load_dotenv()
     proxy_host = os.getenv("PROXY_HOST") or ""
     proxy_port = os.getenv("PROXY_PORT") or ""
@@ -139,10 +151,9 @@ def get_browser(
             options.add_argument("--ignore-certificate-errors")
 
         if want_proxy:
-            # Usa Selenium-Wire somente quando precisa do upstream proxy
-            _silenciar_logs_proxy(logging.ERROR)
+            # Import tardio do Selenium-Wire só quando necessário
             try:
-                from seleniumwire import webdriver as wire_webdriver  # import tardio
+                from seleniumwire import webdriver as wire_webdriver  # type: ignore
             except Exception as e:
                 raise RuntimeError(f"Selenium-Wire não instalado, mas proxy foi solicitado: {e}")
 
@@ -159,7 +170,7 @@ def get_browser(
                 options=options,
             )
 
-        # Cabeçalhos + anti-webdriver (Chromium)
+        # Cabeçalhos + anti-webdriver (Chromium/CDP)
         try:
             driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
                 "headers": {"Accept-Language": accept_lang, "Upgrade-Insecure-Requests": "1"}
@@ -183,9 +194,8 @@ def get_browser(
             pass
 
         if want_proxy:
-            _silenciar_logs_proxy(logging.ERROR)
             try:
-                from seleniumwire import webdriver as wire_webdriver
+                from seleniumwire import webdriver as wire_webdriver  # type: ignore
             except Exception as e:
                 raise RuntimeError(f"Selenium-Wire não instalado, mas proxy foi solicitado: {e}")
 
@@ -212,9 +222,8 @@ def get_browser(
             options.add_argument("--ignore-certificate-errors")
 
         if want_proxy:
-            _silenciar_logs_proxy(logging.ERROR)
             try:
-                from seleniumwire import webdriver as wire_webdriver
+                from seleniumwire import webdriver as wire_webdriver  # type: ignore
             except Exception as e:
                 raise RuntimeError(f"Selenium-Wire não instalado, mas proxy foi solicitado: {e}")
 
@@ -231,7 +240,7 @@ def get_browser(
                 options=options,
             )
 
-        # Edge também suporta CDP
+        # Edge também via CDP
         try:
             driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
                 "headers": {"Accept-Language": accept_lang, "Upgrade-Insecure-Requests": "1"}

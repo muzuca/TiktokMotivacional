@@ -115,7 +115,46 @@ def gerar_frase_motivacional(idioma="en"):
     except Exception as e:
         logger.error("Erro ao gerar frase motivacional com Gemini: %s", str(e))
         return "You are stronger than you think." if idioma == "en" else "Você é mais forte do que imagina."
-    
+
+def gerar_frase_motivacional_longa(idioma="en"):
+    """
+    Gera uma frase motivacional longa (cerca de 40-50 palavras para 20s) no idioma especificado,
+    evitando repetição.
+    """
+    if not os.getenv("GEMINI_API_KEY"):
+        logger.error("❌ Chave API do Gemini (GEMINI_API_KEY) não configurada no .env.")
+        return ("You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams.") if idioma == "en" else (
+            "Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos.")
+
+    used_phrases = load_used_phrases()
+    try:
+        logger.info("Gerando frase motivacional longa com Gemini em %s.", idioma)
+        prompt_text = "Create a single motivational speech in English with fifth words." if idioma == "en" else "Crie um único discurso motivacional em português com até cinquenta palavras."
+        response = model.generate_content(prompt_text)
+        texto = response.text.strip()
+
+        if not texto or len(texto.split()) < 30:  # Tolerância mínima de 30 palavras
+            raise ValueError("Texto retornado muito curto ou inválido.")
+
+        # Usa o texto completo como única frase
+        frase = texto.strip()
+        frase_hash = hashlib.md5(frase.encode()).hexdigest()
+
+        if frase_hash in used_phrases:
+            logger.warning("Frase longa já usada. Reutilizando padrão.")
+            return ("You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams.") if idioma == "en" else (
+                "Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos.")
+
+        used_phrases.add(frase_hash)
+        save_used_phrases(used_phrases)
+        logger.info("🧠 Frase motivacional longa escolhida: %s", frase[:100] + "..." if len(frase) > 100 else frase)
+        return frase
+
+    except Exception as e:
+        logger.error("Erro ao gerar frase motivacional longa com Gemini: %s", str(e))
+        return ("You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams.") if idioma == "en" else (
+            "Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos.")
+
 def quebrar_em_duas_linhas(frase: str) -> str:
     """
     Quebra a frase em duas linhas balanceando por caracteres,

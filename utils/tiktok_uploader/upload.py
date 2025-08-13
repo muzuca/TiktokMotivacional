@@ -234,15 +234,6 @@ def upload_videos(
     want_proxy = _use_proxy_from_idioma(idioma)
     logger.info("upload_videos: idioma=%s | want_proxy=%s", idioma, want_proxy)
 
-    # (Opcional) teste de proxy só quando realmente for usar
-    if want_proxy:
-        try:
-            from proxy_check import quick_proxy_test  # opcional
-            info = quick_proxy_test()
-            logger.info("Proxy OK. Resposta do IP: %s", info)
-        except Exception:
-            logger.warning("Falha no teste de proxy, mas prosseguindo: %s")
-
     # Se vier um browser_agent incompatível com a decisão de proxy, recria
     if browser_agent is not None:
         if want_proxy and not _is_seleniumwire_driver(browser_agent):
