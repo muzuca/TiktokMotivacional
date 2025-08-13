@@ -56,7 +56,7 @@ def rotina():
     escrever_frase_na_imagem(imagem_base, frase, imagem_final)
 
     # Criar vídeo com música
-    gerar_video(imagem_final, video_final)
+    gerar_video(imagem_final, video_final, preset="hd")
 
     # Postar no TikTok, passando o idioma
     postar_no_tiktok_e_renomear(descricao_personalizada=frase, imagem_base=imagem_base, imagem_final=imagem_final, video_final=video_final, idioma=idioma)

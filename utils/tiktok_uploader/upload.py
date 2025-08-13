@@ -17,9 +17,9 @@ import threading
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from typing import Any, Callable, Literal, Optional, List, Dict
 
-# ===== Selenium e WebDriver-Manager =====
-from selenium import webdriver  # usado só por tipos; driver real vem do browsers.get_browser
+# ===== Selenium =====
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -32,65 +32,63 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.firefox.options import Options as FirefoxOptions
-from selenium.webdriver.edge.options import Options as EdgeOptions
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.firefox import GeckoDriverManager
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.edge.service import Service as EdgeService
 
 # ===== App modules =====
 from .auth import AuthBackend
 from . import config
 
-# Tenta importar get_browser do módulo browsers (selenium-wire).
+# Preferimos o get_browser (com Selenium-Wire) do módulo browsers.
 try:
     from .browsers import get_browser  # preferencial
 except ImportError:
-    # Fallback com Selenium-Wire embutido
+    # Fallback minimalista com Selenium-Wire embutido (mantém compat)
     from dotenv import load_dotenv
     from seleniumwire import webdriver as wire_webdriver  # type: ignore
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from webdriver_manager.chrome import ChromeDriverManager
     from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    from selenium.webdriver.firefox.service import Service as FirefoxService
+    from webdriver_manager.firefox import GeckoDriverManager
     from selenium.webdriver.edge.options import Options as EdgeOptions
+    from selenium.webdriver.edge.service import Service as EdgeService
+    from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
-    def _mk_sw_opts(use_proxy: bool, host: str, port: str, user: str | None, pw: str | None):
+    def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
+        if not idioma:
+            return False
+        s = idioma.strip().lower()
+        logging.info(f"_use_proxy_from_idioma: idioma={s}")
+        return s in ("en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english")
+
+    def _mk_sw_opts(use_proxy: bool, host: str, port: str, user: Optional[str], pw: Optional[str]):
         opts = {'request_storage': 'none', 'verify_ssl': False}
-        if use_proxy:
+        if use_proxy and host and port:
             if user and pw:
                 proxy_uri = f"http://{user}:{pw}@{host}:{port}"
+                opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
+                logging.info("Selenium-Wire proxy configurado: %s", proxy_uri)
             else:
-                proxy_uri = f"http://{host}:{port}"
-            opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
-            logging.info("Selenium-Wire proxy configurado (fallback): %s", proxy_uri)
+                logging.warning("Proxy configurado sem usuário ou senha. Verifique .env.")
+        else:
+            logging.info("Proxy desativado (idioma ou configuração inválida)")
         return opts
 
-    def get_browser(name="chrome", options=None, proxy=None, idioma='en', headless=False, *args, **kwargs):
+    def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto", headless: bool = False, *args, **kwargs):
         load_dotenv()
-        proxy_host = os.getenv("PROXY_HOST")
-        proxy_port = os.getenv("PROXY_PORT")
+        proxy_host = os.getenv("PROXY_HOST") or ""
+        proxy_port = os.getenv("PROXY_PORT") or ""
         proxy_user = os.getenv("PROXY_USER")
         proxy_pass = os.getenv("PROXY_PASS")
-        use_proxy = (idioma == 'en') and proxy_host and proxy_port
+        use_proxy = _use_proxy_from_idioma(idioma)
+        logging.info(f"get_browser: idioma={idioma} | use_proxy={use_proxy}")
 
         if name == "chrome":
             if options is None:
                 options = ChromeOptions()
-            options.add_argument("--disable-gpu")
-            options.add_argument("--disable-logging")
-            options.add_argument("--log-level=3")
-            options.add_experimental_option("excludeSwitches", ["enable-logging"])
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-popup-blocking")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
             if headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--ignore-certificate-errors")
-
-            sw_opts = _mk_sw_opts(bool(use_proxy), proxy_host or "", proxy_port or "", proxy_user, proxy_pass)
+            sw_opts = _mk_sw_opts(use_proxy, proxy_host, proxy_port, proxy_user, proxy_pass)
             driver = wire_webdriver.Chrome(
                 service=ChromeService(ChromeDriverManager().install()),
                 options=options,
@@ -100,8 +98,8 @@ except ImportError:
                 driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                     "source": "try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}"
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error(f"Erro ao configurar CDP: {e}")
             return driver
 
         elif name == "firefox":
@@ -109,7 +107,7 @@ except ImportError:
                 options = FirefoxOptions()
             if headless:
                 options.add_argument("-headless")
-            sw_opts = _mk_sw_opts(bool(use_proxy), proxy_host or "", proxy_port or "", proxy_user, proxy_pass)
+            sw_opts = _mk_sw_opts(use_proxy, proxy_host, proxy_port, proxy_user, proxy_pass)
             return wire_webdriver.Firefox(
                 service=FirefoxService(GeckoDriverManager().install()),
                 options=options,
@@ -121,7 +119,7 @@ except ImportError:
                 options = EdgeOptions()
             if headless:
                 options.add_argument("--headless=new")
-            sw_opts = _mk_sw_opts(bool(use_proxy), proxy_host or "", proxy_port or "", proxy_user, proxy_pass)
+            sw_opts = _mk_sw_opts(use_proxy, proxy_host, proxy_port, proxy_user, proxy_pass)
             return wire_webdriver.Edge(
                 service=EdgeService(EdgeChromiumDriverManager().install()),
                 options=options,
@@ -131,7 +129,7 @@ except ImportError:
         else:
             raise ValueError(f"Navegador {name} não suportado")
 
-# Configuração do logging
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -140,39 +138,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("webdriver_manager").setLevel(logging.INFO)
 
-from .utils import bold, green, red
-# Mantido apenas como referência; não usamos extensão agora
-# from .proxy_auth_extension.proxy_auth_extension import proxy_is_working
-
+from .utils import bold
 from .types import VideoDict, ProxyDict, Cookie
-from typing import Any, Callable, Literal
 
-# Configura sessão HTTP para desativar retries (para evitar engasgos durante o upload)
+# HTTP session sem retries automáticos
 session = requests.Session()
 retries = Retry(total=0)
 session.mount("http://", HTTPAdapter(max_retries=retries))
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
 
+# --------------------------- helpers de proxy/idioma ---------------------------
+def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
+    """Liga o proxy só para EUA/inglês (aliases)."""
+    if not idioma:
+        return False
+    s = idioma.strip().lower()
+    logging.info(f"_use_proxy_from_idioma: idioma={s}")
+    return s in ("en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english")
+
+
+def _is_seleniumwire_driver(driver) -> bool:
+    """Detecta driver do Selenium-Wire (para saber se tem proxy interceptando)."""
+    try:
+        return driver.__class__.__module__.startswith("seleniumwire")
+    except Exception:
+        return False
+
+
+# --------------------------------- API ----------------------------------------
 def upload_video(
     filename: str,
-    description: str | None = None,
+    description: Optional[str] = None,
     cookies: str = "",
-    schedule: datetime.datetime | None = None,
+    schedule: Optional[datetime.datetime] = None,
     username: str = "",
     password: str = "",
-    sessionid: str | None = None,
-    cookies_list: list[Cookie] = [],
-    cookies_str: str | None = None,
-    proxy: ProxyDict | None = None,
-    product_id: str | None = None,
-    idioma='en',
+    sessionid: Optional[str] = None,
+    cookies_list: List[Cookie] = [],
+    cookies_str: Optional[str] = None,
+    proxy: Optional[ProxyDict] = None,
+    product_id: Optional[str] = None,
+    idioma: str = "auto",
     *args,
     **kwargs,
-) -> list[VideoDict]:
-    """
-    Faz o upload de um único vídeo no TikTok.
-    """
+) -> List[VideoDict]:
+    """Faz o upload de um único vídeo no TikTok."""
     auth = AuthBackend(
         username=username,
         password=password,
@@ -201,43 +212,60 @@ def upload_video(
 
 
 def upload_videos(
-    videos: list[VideoDict],
+    videos: List[VideoDict],
     auth: AuthBackend,
-    proxy: ProxyDict | None = None,
+    proxy: Optional[ProxyDict] = None,
     browser: Literal["chrome", "safari", "chromium", "edge", "firefox"] = "chrome",
-    browser_agent: WebDriver | None = None,
-    on_complete: Callable[[VideoDict], None] | None = None,
+    browser_agent: Optional[WebDriver] = None,
+    on_complete: Optional[Callable[[VideoDict], None]] = None,
     headless: bool = False,
     num_retries: int = 1,
     skip_split_window: bool = False,
-    idioma='en',
+    idioma: str = "auto",
     *args,
     **kwargs,
-) -> list[VideoDict]:
-    """
-    Faz o upload de vários vídeos no TikTok.
-    """
+) -> List[VideoDict]:
+    """Faz o upload de vários vídeos no TikTok."""
     videos = _convert_videos_dict(videos)  # type: ignore
 
     if videos and len(videos) > 1:
         logger.info("Fazendo upload de %d vídeos", len(videos))
 
-    # (Opcional) teste rápido do proxy antes de abrir o browser
-    if idioma == 'en':
+    want_proxy = _use_proxy_from_idioma(idioma)
+    logger.info("upload_videos: idioma=%s | want_proxy=%s", idioma, want_proxy)
+
+    # (Opcional) teste de proxy só quando realmente for usar
+    if want_proxy:
         try:
-            from proxy_check import quick_proxy_test
+            from proxy_check import quick_proxy_test  # opcional
             info = quick_proxy_test()
             logger.info("Proxy OK. Resposta do IP: %s", info)
-        except Exception as e:
-            logger.warning("Falha no teste rápido do proxy (seguindo mesmo assim): %s", e)
+        except Exception:
+            logger.warning("Falha no teste de proxy, mas prosseguindo: %s")
 
-    if not browser_agent:  # agente de navegador não foi fornecido
-        logger.info("Criando uma instância de navegador %s %s", browser, "em modo headless" if headless else "")
+    # Se vier um browser_agent incompatível com a decisão de proxy, recria
+    if browser_agent is not None:
+        if want_proxy and not _is_seleniumwire_driver(browser_agent):
+            logger.info("Agent sem Selenium-Wire (sem proxy). Recriando com proxy.")
+            try: browser_agent.quit()
+            except Exception: pass
+            browser_agent = None
+        elif not want_proxy and _is_seleniumwire_driver(browser_agent):
+            logger.info("Agent Selenium-Wire detectado, mas não quero proxy. Recriando sem proxy.")
+            try: browser_agent.quit()
+            except Exception: pass
+            browser_agent = None
+
+    we_created_driver = False
+    if not browser_agent:
+        we_created_driver = True
+        logger.info("Criando uma instância de navegador %s %s", browser, "(headless)" if headless else "")
         chrome_options = ChromeOptions()
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--disable-logging")
         chrome_options.add_argument("--log-level=3")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
         chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--disable-popup-blocking")
         chrome_options.add_argument("--no-sandbox")
@@ -246,7 +274,7 @@ def upload_videos(
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--ignore-certificate-errors")
 
-        # IMPORTANTE: não adicionar --proxy-server. Selenium-Wire injeta o proxy.
+        # IMPORTANTE: não adicionar --proxy-server. Selenium-Wire injeta o proxy quando preciso.
         driver = get_browser(browser, headless=headless, proxy=proxy, idioma=idioma, options=chrome_options, *args, **kwargs)
     else:
         logger.info("Usando agente de navegador definido pelo usuário")
@@ -255,34 +283,34 @@ def upload_videos(
     # Autenticação (cookies/session)
     driver = auth.authenticate_agent(driver)
 
-    failed = []
-    # faz upload de cada vídeo
+    failed: List[VideoDict] = []
+
     for video in videos:
         try:
-            path = abspath(video.get("path", "."))
-            description = video.get("description", "")
-            schedule = video.get("schedule", None)
-            product_id = video.get("product_id", None)
+            path = abspath(video.get("path", "."))  # type: ignore
+            description = video.get("description", "")  # type: ignore
+            schedule = video.get("schedule", None)  # type: ignore
+            product_id = video.get("product_id", None)  # type: ignore
 
             logger.info("Postando %s%s", bold(video.get("path", "")), f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
 
-            # O vídeo deve ser de um tipo suportado
+            # Tipo de arquivo suportado
             if not _check_valid_path(path):
                 logger.warning("%s é inválido, pulando", path)
                 failed.append(video)
                 continue
 
-            # Validar/agendar
+            # Agendamento válido (naive -> UTC; aware deve ser UTC)
             if schedule:
-                timezone = pytz.UTC
                 if schedule.tzinfo is None:
-                    schedule = schedule.astimezone(timezone)
-                elif (utc_offset := schedule.utcoffset()) is not None and int(utc_offset.total_seconds()) == 0:
-                    schedule = timezone.localize(schedule)
+                    schedule = pytz.UTC.localize(schedule)
                 else:
-                    logger.warning("%s é inválido, o horário de agendamento deve ser ingênuo ou ciente do fuso UTC, pulando", schedule)
-                    failed.append(video)
-                    continue
+                    # exige estar em UTC (offset 0)
+                    utc_offset = schedule.utcoffset()
+                    if not (utc_offset and int(utc_offset.total_seconds()) == 0):
+                        logger.warning("%s é inválido, o horário de agendamento deve ser ingênuo (será tratado como UTC) ou ciente de UTC (offset 0). Pulando.", schedule)
+                        failed.append(video)
+                        continue
 
                 valid_tiktok_minute_multiple = 5
                 schedule = _get_valid_schedule_minute(schedule, valid_tiktok_minute_multiple)
@@ -292,6 +320,7 @@ def upload_videos(
                     continue
 
             complete_upload_form(driver, path, description, schedule, skip_split_window, product_id, num_retries, *args, **kwargs)
+
         except WebDriverException as e:
             logger.error("Falha ao fazer upload de %s devido a erro no WebDriver", path)
             logger.error("Detalhes: %s", str(e))
@@ -304,24 +333,41 @@ def upload_videos(
         if callable(on_complete):
             on_complete(video)
 
+    # Fecha o driver se fomos nós que criamos
+    if we_created_driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
     return failed
 
 
-def complete_upload_form(driver: WebDriver, path: str, description: str, schedule: datetime.datetime | None, skip_split_window: bool, product_id: str | None = None, num_retries: int = 1, headless: bool = False, *args, **kwargs) -> None:
-    """
-    Realiza o upload de cada vídeo
-    """
+# --------------------------- fluxo de upload UI ---------------------------
+def complete_upload_form(
+    driver: WebDriver,
+    path: str,
+    description: str,
+    schedule: Optional[datetime.datetime],
+    skip_split_window: bool,
+    product_id: Optional[str] = None,
+    num_retries: int = 1,
+    headless: bool = False,
+    *args,
+    **kwargs
+) -> None:
+    """Realiza o upload de um vídeo."""
     logger.info(f"Navegando para a página de upload: {config['paths']['upload']}")
     _go_to_upload(driver)
 
     upload_complete_event = threading.Event()
 
-    def upload_video():
+    def _uploader():
         logger.info("Fazendo upload do arquivo de vídeo")
         _set_video(driver, path=path, **kwargs)
         upload_complete_event.set()
 
-    upload_thread = threading.Thread(target=upload_video)
+    upload_thread = threading.Thread(target=_uploader, daemon=True)
     upload_thread.start()
 
     upload_complete_event.wait()
@@ -339,25 +385,16 @@ def complete_upload_form(driver: WebDriver, path: str, description: str, schedul
     logger.info("Clicando no botão de postagem")
     _post_video(driver)
 
-    closed_successfully = False
+    # pequeno grace period
     try:
-        time.sleep(10)
-        driver.quit()
-        closed_successfully = True
-        logger.info("Navegador fechado com sucesso após 10 segundos")
-    except WebDriverException as e:
-        logger.error("Falha ao fechar o navegador: %s", str(e))
-    finally:
-        if not closed_successfully:
-            try:
-                driver.quit()
-                logger.info("Processo do navegador forçado a fechar")
-            except WebDriverException as e:
-                logger.warning("Falha ao forçar fechamento do navegador, ignorando: %s", str(e))
+        time.sleep(6)
+        driver.delete_all_cookies()
+    except Exception:
+        pass
 
 
 def _go_to_upload(driver: WebDriver) -> None:
-    """ Navega para a página de upload. """
+    """Navega para a página de upload."""
     if driver.current_url != config["paths"]["upload"]:
         driver.get(config["paths"]["upload"])
         logger.info(f"Navegou para: {driver.current_url}")
@@ -370,18 +407,18 @@ def _go_to_upload(driver: WebDriver) -> None:
 
 
 def _change_to_upload_iframe(driver: WebDriver) -> None:
-    """ Alterna para o iframe da página de upload. """
+    """Alterna para o iframe da página de upload."""
     iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
     iframe = WebDriverWait(driver, config["explicit_wait"]).until(iframe_selector)
     driver.switch_to.frame(iframe)
 
 
 def _set_description(driver: WebDriver, description: str) -> None:
-    """ Define a descrição do vídeo """
+    """Define a descrição do vídeo."""
     if description is None:
         return
 
-    description = description.encode("utf-8", "ignore").decode("utf-8")
+    description = (description or "").encode("utf-8", "ignore").decode("utf-8")
     saved_description = description
 
     WebDriverWait(driver, config["implicit_wait"]).until(
@@ -391,11 +428,11 @@ def _set_description(driver: WebDriver, description: str) -> None:
     desc = driver.find_element(By.XPATH, config["selectors"]["upload"]["description"])
 
     desc.click()
-    WebDriverWait(driver, config["explicit_wait"]).until(lambda driver: desc.text != "")
+    WebDriverWait(driver, config["explicit_wait"]).until(lambda d: desc.text != "")
 
     desc.send_keys(Keys.END)
     _clear(desc)
-    WebDriverWait(driver, config["explicit_wait"]).until(lambda driver: desc.text == "")
+    WebDriverWait(driver, config["explicit_wait"]).until(lambda d: desc.text == "")
 
     desc.click()
     time.sleep(1)
@@ -434,11 +471,11 @@ def _set_description(driver: WebDriver, description: str) -> None:
                     for i in range(len(user_id_elements)):
                         user_id_element = user_id_elements[i]
                         if user_id_element and user_id_element.is_enabled():
-                            username = user_id_element.text.split(" ")[0]
+                            username = (user_id_element.text or "").split(" ")[0]
                             if username.lower() == word[1:].lower():
                                 found = True
                                 logger.info("Usuário correspondente encontrado: Clicando no %s", username)
-                                for j in range(i):
+                                for _ in range(i):
                                     desc.send_keys(Keys.DOWN)
                                 desc.send_keys(Keys.ENTER)
                                 break
@@ -457,12 +494,15 @@ def _set_description(driver: WebDriver, description: str) -> None:
 
 
 def _clear(element) -> None:
-    """ Limpa o texto do elemento (hack para o site do TikTok) """
-    element.send_keys(2 * len(element.text) * Keys.BACKSPACE)
+    """Limpa o texto do elemento (hack para o site do TikTok)."""
+    try:
+        element.send_keys(2 * len(element.text) * Keys.BACKSPACE)
+    except Exception:
+        pass
 
 
 def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs) -> None:
-    """ Define o vídeo para upload """
+    """Define o vídeo para upload."""
     for _ in range(num_retries):
         try:
             driverWait = WebDriverWait(driver, config["explicit_wait"])
@@ -482,7 +522,7 @@ def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs
 
 
 def _remove_cookies_window(driver) -> None:
-    """ Remove a janela de cookies se estiver aberta """
+    """Remove a janela de cookies se estiver aberta."""
     logger.info("Removendo janela de cookies")
     cookies_banner = WebDriverWait(driver, config["implicit_wait"]).until(
         EC.presence_of_element_located((By.TAG_NAME, config["selectors"]["upload"]["cookies_banner"]["banner"]))
@@ -500,7 +540,7 @@ def _remove_cookies_window(driver) -> None:
 
 
 def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = True, duet: bool = True, *args, **kwargs) -> None:
-    """ Define as configurações de interatividade do vídeo """
+    """Define as configurações de interatividade do vídeo."""
     try:
         logger.info("Definindo configurações de interatividade")
 
@@ -510,10 +550,8 @@ def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = T
 
         if comment ^ comment_box.is_selected():
             comment_box.click()
-
         if stitch ^ stitch_box.is_selected():
             stitch_box.click()
-
         if duet ^ duet_box.is_selected():
             duet_box.click()
 
@@ -524,7 +562,7 @@ def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = T
 
 
 def _set_schedule_video(driver: WebDriver, schedule: datetime.datetime) -> None:
-    """ Define o agendamento do vídeo """
+    """Define o agendamento do vídeo."""
     logger.info("Definindo agendamento")
 
     driver_timezone = __get_driver_timezone(driver)
@@ -567,7 +605,8 @@ def __date_picker(driver: WebDriver, month: int, day: int) -> None:
 
     day_to_click = None
     for day_option in valid_days:
-        if day_option.text.isdigit() and int(day_option.text) == day:
+        txt = (day_option.text or "").strip()
+        if txt.isdigit() and int(txt) == day:
             day_to_click = day_option
             break
     if day_to_click:
@@ -638,7 +677,7 @@ def __verify_time_picked_is_correct(driver: WebDriver, hour: int, minute: int) -
 
 
 def _post_video(driver: WebDriver) -> None:
-    """ Clica no botão de postagem """
+    """Clica no botão de postagem."""
     logger.info("Clicando no botão de postagem")
 
     try:
@@ -668,31 +707,34 @@ def _post_video(driver: WebDriver) -> None:
         raise FailedToUpload("Postagem não confirmada devido a erro no WebDriver")
 
 
+# --------------------------- validações/utilitários ---------------------------
 def _check_valid_path(path: str) -> bool:
-    """ Retorna se o tipo de arquivo é suportado pelo TikTok """
-    return exists(path) and path.split(".")[-1] in config["supported_file_types"]
+    """Retorna se o tipo de arquivo é suportado pelo TikTok."""
+    return exists(path) and path.split(".")[-1].lower() in config["supported_file_types"]
 
 
-def _get_valid_schedule_minute(schedule: datetime.datetime, valid_multiple) -> datetime.datetime:
-    """ Ajusta minuto para múltiplos aceitos pelo TikTok """
+def _get_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
+    """Ajusta o minuto para múltiplos aceitos pelo TikTok."""
     if _is_valid_schedule_minute(schedule.minute, valid_multiple):
         return schedule
     return _set_valid_schedule_minute(schedule, valid_multiple)
 
 
-def _is_valid_schedule_minute(minute: int, valid_multiple) -> bool:
+def _is_valid_schedule_minute(minute: int, valid_multiple: int) -> bool:
     return minute % valid_multiple == 0
 
 
 def _set_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
     minute = schedule.minute
     remainder = minute % valid_multiple
-    integers_to_valid_multiple = valid_multiple - remainder
-    return schedule + datetime.timedelta(minutes=integers_to_valid_multiple)
+    add = (valid_multiple - remainder) % valid_multiple
+    if add == 0:
+        return schedule
+    return schedule + datetime.timedelta(minutes=add)
 
 
 def _check_valid_schedule(schedule: datetime.datetime) -> bool:
-    """ Retorna se o agendamento é suportado pelo TikTok """
+    """Retorna se o agendamento é suportado pelo TikTok."""
     valid_tiktok_minute_multiple = 5
     margin_to_complete_upload_form = 5
 
@@ -703,7 +745,7 @@ def _check_valid_schedule(schedule: datetime.datetime) -> bool:
 
 
 def _get_splice_index(nearest_mention: int, nearest_hashtag: int, description: str) -> int:
-    """ Retorna o índice para dividir a descrição """
+    """Retorna o índice para dividir a descrição."""
     if nearest_mention == -1 and nearest_hashtag == -1:
         return len(description)
     elif nearest_hashtag == -1:
@@ -713,8 +755,8 @@ def _get_splice_index(nearest_mention: int, nearest_hashtag: int, description: s
     return min(nearest_mention, nearest_hashtag)
 
 
-def _convert_videos_dict(videos_list_of_dictionaries: list[dict[str, Any]]) -> list[VideoDict]:
-    """ Converte lista de dicionários de vídeos para formato interno. """
+def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> List[VideoDict]:
+    """Converte lista de dicionários de vídeos para formato interno."""
     if not videos_list_of_dictionaries:
         raise RuntimeError("Nenhum vídeo para upload")
 
@@ -726,7 +768,7 @@ def _convert_videos_dict(videos_list_of_dictionaries: list[dict[str, Any]]) -> l
     def intersection(lst1, lst2):
         return list(set(lst1) & set(lst2))
 
-    return_list: list[VideoDict] = []
+    return_list: List[VideoDict] = []
     for elem in videos_list_of_dictionaries:
         elem = {k.strip().lower(): v for k, v in elem.items()}
         keys = elem.keys()
@@ -734,13 +776,14 @@ def _convert_videos_dict(videos_list_of_dictionaries: list[dict[str, Any]]) -> l
         description_intersection = intersection(valid_description, keys)
 
         if path_intersection:
-            path = elem[path_intersection.pop()]
+            path_key = path_intersection.pop()
+            path = elem[path_key]
             if not _check_valid_path(path):
                 raise RuntimeError("Caminho inválido: " + path)
             elem[correct_path] = path
         else:
             for _, value in elem.items():
-                if _check_valid_path(value):
+                if isinstance(value, str) and _check_valid_path(value):
                     elem[correct_path] = value
                     break
             else:
@@ -750,17 +793,19 @@ def _convert_videos_dict(videos_list_of_dictionaries: list[dict[str, Any]]) -> l
             elem[correct_description] = elem[description_intersection.pop()]
         else:
             for _, value in elem.items():
-                if not _check_valid_path(value):
+                if isinstance(value, str) and not _check_valid_path(value):
                     elem[correct_description] = value
                     break
             else:
                 elem[correct_description] = ""
-        return_list.append(elem)
+
+        return_list.append(elem)  # type: ignore
+
     return return_list
 
 
 def __get_driver_timezone(driver: WebDriver) -> Any:
-    """ Retorna o fuso horário do driver """
+    """Retorna o fuso horário do driver."""
     timezone_str = driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone")
     return pytz.timezone(timezone_str)
 
@@ -774,20 +819,22 @@ def _refresh_with_alert(driver: WebDriver) -> None:
         logger.warning("Exceção ao atualizar alerta: %s", str(e))
 
 
+# -------------------------------- exceções ------------------------------------
 class DescriptionTooLong(Exception):
-    """ Descrição excede o máximo suportado pelo uploader web do TikTok """
-    def __init__(self, message: str | None = None):
+    """Descrição excede o máximo suportado pelo uploader web do TikTok"""
+    def __init__(self, message: Optional[str] = None):
         super().__init__(message or self.__doc__)
 
 
 class FailedToUpload(Exception):
-    """ Um vídeo falhou ao fazer upload """
-    def __init__(self, message=None):
+    """Um vídeo falhou ao fazer upload"""
+    def __init__(self, message: Optional[str] = None):
         super().__init__(message or self.__doc__)
 
 
+# -------------------------- link de produto (opcional) ------------------------
 def _add_product_link(driver: WebDriver, product_id: str) -> None:
-    """ Adiciona o link do produto ao vídeo usando o ID fornecido. """
+    """Adiciona o link do produto ao vídeo usando o ID fornecido."""
     logger.info(f"Tentando adicionar link de produto para ID: {product_id}")
     try:
         wait = WebDriverWait(driver, 20)
@@ -837,11 +884,8 @@ def _add_product_link(driver: WebDriver, product_id: str) -> None:
         logger.info("Modal de link de produto fechado")
 
     except TimeoutException:
-        logger.error("Erro: Tempo esgotado ao esperar por elemento durante a adição do link de produto. O XPath pode estar errado ou o elemento não apareceu")
         logger.info(f"Aviso: Falha ao adicionar link de produto {product_id} devido a tempo esgotado. Continuando o upload sem link")
     except NoSuchElementException:
-        logger.error("Erro: Não foi possível encontrar elemento durante a adição do link de produto. O XPath pode estar errado")
         logger.info(f"Aviso: Falha ao adicionar link de produto {product_id} porque um elemento não foi encontrado. Continuando o upload sem link")
     except Exception as e:
-        logger.error(f"Ocorreu um erro inesperado ao adicionar link de produto: {e}")
-        logger.info(f"Aviso: Ocorreu um erro inesperado ao adicionar link de produto {product_id}. Continuando o upload sem link")
+        logger.info(f"Aviso: Ocorreu um erro inesperado ao adicionar link de produto {product_id}. Continuando o upload sem link ({e})")
