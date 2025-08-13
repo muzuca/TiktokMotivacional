@@ -32,6 +32,9 @@ DURACAO_MAXIMA_VIDEO = 20.0
 FPS = 30
 AUDIO_SR = 44100
 
+# volume relativo da música de fundo (0.10 ≈ -20 dB)
+BG_MIX_VOLUME = float(os.getenv("BG_MIX_VOLUME", "0.10"))
+
 # ----------------- helpers -----------------
 def _nome_limpo(base: str) -> str:
     base = (base or "video").strip().lower()
@@ -118,8 +121,10 @@ def gerar_video(imagem_path: str, saida_path: str, preset: str = "hd", idioma: s
 
     if not has_voice and not has_bg:
         # gera silêncio (estéreo) como input 1
-        cmd.extend(["-f", "lavfi", "-t", str(DURACAO_MAXIMA_VIDEO),
-                    "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}"])
+        cmd.extend([
+            "-f", "lavfi", "-t", str(DURACAO_MAXIMA_VIDEO),
+            "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}"
+        ])
 
     # Parâmetros comuns de encodes
     cmd.extend([
@@ -140,26 +145,35 @@ def gerar_video(imagem_path: str, saida_path: str, preset: str = "hd", idioma: s
         "-movflags", "+faststart",
         "-x264-params", f"keyint={FPS*2}:min-keyint={FPS*2}:scenecut=0",
         "-map_metadata", "-1",
-        # "-shortest",  # opcional se quiser terminar no stream mais curto
     ])
 
     # Mapeamento/Mixagem
     if has_voice and has_bg:
         # 0:v = vídeo; 1:a = voz; 2:a = bg
+        # trim em ambas as faixas e volumes (narração 1.0, bg BG_MIX_VOLUME)
         cmd.extend([
             "-filter_complex",
-            "[1:a]volume=1.0[va];[2:a]volume=0.20[ba];[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
+            (
+                f"[1:a]atrim=0:{DURACAO_MAXIMA_VIDEO},asetpts=N/SR/TB,volume=1.0[narr];"
+                f"[2:a]atrim=0:{DURACAO_MAXIMA_VIDEO},asetpts=N/SR/TB,volume={BG_MIX_VOLUME}[bg];"
+                f"[narr][bg]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+            ),
             "-map", "0:v",
             "-map", "[aout]",
         ])
     else:
-        # quando há 1 único áudio ou silêncio (input 1)
-        cmd.extend(["-map", "0:v", "-map", "1:a"])
+        # quando há 1 único áudio (narração OU música) ou silêncio (input 1)
+        cmd.extend([
+            "-map", "0:v",
+            "-map", "1:a"
+        ])
 
     cmd.append(saida_path)
 
-    logger.info("🎬 FFmpeg gerando %s (%dx%d, %s/%s, %dfps) → %s",
-                preset.upper(), W, H, BR_V, BR_A, FPS, saida_path)
+    logger.info(
+        "🎬 FFmpeg gerando %s (%dx%d, %s/%s, %dfps) → %s | BG_MIX_VOLUME=%.2f",
+        preset.upper(), W, H, BR_V, BR_A, FPS, saida_path, BG_MIX_VOLUME
+    )
 
     try:
         subprocess.run(cmd, check=True)
