@@ -3,6 +3,7 @@
 import os
 import re
 import math
+import glob
 import logging
 import datetime
 import shutil
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# =============================================================================
+# Presets de encode
+# =============================================================================
 PRESETS = {
     "sd":     {"w": 540,  "h": 960,  "br_v": "1400k", "br_a": "128k", "level": "3.1"},
     "hd":     {"w": 720,  "h": 1280, "br_v": "2200k", "br_a": "128k", "level": "3.1"},
@@ -37,7 +41,9 @@ FONTS_DIR = "fonts"
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ---------------- helpers ----------------
+# =============================================================================
+# Utilidades gerais
+# =============================================================================
 def _nome_limpo(base: str) -> str:
     base = (base or "video").strip().lower()
     base = re.sub(r"\s+", "-", base)
@@ -75,75 +81,25 @@ def _duracao_audio_segundos(audio_path: str) -> Optional[float]:
     except Exception:
         return None
 
-# ---------- Segmentação das legendas (2–3 palavras por bloco, 1 linha) ----------
-def _tokenize_words(text: str) -> List[str]:
-    # preserva acentos; remove quebras de linha; mantém apóstrofo como parte da palavra
-    text = re.sub(r"[\r\n]+", " ", text).strip()
-    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text)
-    return [t for t in tokens if t]
+def _ff_normpath(path: str) -> str:
+    """Gera caminho RELATIVO com '/' (estável no Windows para filtergraph)."""
+    try:
+        rel = os.path.relpath(path)
+    except Exception:
+        rel = path
+    return rel.replace("\\", "/")
 
-def _chunk_words(tokens: List[str]) -> List[List[str]]:
-    """
-    Quebra em blocos de 2 ou 3 palavras.
-    Se houver palavra longa (>=10 chars) no bloco, limita a 2.
-    """
-    chunks: List[List[str]] = []
-    i = 0
-    n = len(tokens)
-    while i < n:
-        # tenta 3
-        take = 3
-        long_word = any(len(tokens[j]) >= 10 for j in range(i, min(i + 3, n)))
-        if long_word:
-            take = 2
-        # evita ultrapassar fim
-        if i + take > n:
-            take = max(1, n - i)
-        chunk = tokens[i:i + take]
-        chunks.append(chunk)
-        i += take
-    return chunks
+def _clear_drawtext_cache():
+    """Remove cache/drawtext_*.txt antigos para evitar lixo."""
+    for f in glob.glob(os.path.join(CACHE_DIR, "drawtext_*.txt")):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
 
-def _distribuir_duracoes_por_palavra(frases: List[str], total_disp: float) -> List[float]:
-    """
-    Duração proporcional à contagem de palavras, clamp 0.7–3.0s (para blocos curtíssimos),
-    normalizada ao total disponível.
-    """
-    if not frases:
-        return []
-    min_seg, max_seg = 0.7, 3.0
-    pesos = [max(1, len(f.split())) for f in frases]
-    soma = sum(pesos)
-    brutas = [(p / soma) * total_disp for p in pesos]
-    clamped = [min(max(b, min_seg), max_seg) for b in brutas]
-    fator = min(1.0, (total_disp / sum(clamped))) if sum(clamped) > 0 else 1.0
-    return [d * fator for d in clamped]
-
-def _segmentos_legenda_palavras(texto: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
-    """
-    Constrói segmentos 1-linha com 2–3 palavras em CAIXA ALTA.
-    """
-    tokens = _tokenize_words(texto)
-    if not tokens:
-        return []
-
-    chunks = _chunk_words(tokens)
-    lines = [" ".join(ch).upper() for ch in chunks]
-
-    alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
-    gap = 0.10  # troca rápida entre blocos
-    duracoes = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
-
-    t = 0.25
-    segs: List[Tuple[float, float, str]] = []
-    for line, d in zip(lines, duracoes):
-        ini = t
-        fim = t + d
-        segs.append((ini, fim, line))
-        t = fim + gap
-    return segs
-
-# ---------------- estilos de vídeo (legendas) ----------------
+# =============================================================================
+# Tipografia / estilos
+# =============================================================================
 VIDEO_STYLES = {
     "1": {"key": "minimal_compact", "label": "Compact (sem caixa, contorno fino)"},
     "2": {"key": "clean_outline",   "label": "Clean (um pouco maior)"},
@@ -173,13 +129,15 @@ def _first_existing_font(*names: str) -> Optional[str]:
     return None
 
 def _pick_drawtext_font(style_key: str) -> Optional[str]:
+    """
+    classic/1: Montserrat-Regular → fallback BebasNeue-Regular (pedido seu)
+    """
     s = (style_key or "").lower()
     if s in ("classic", "1", "clean", "5"):
-        # Montserrat primeiro; se faltar, cai para Bebas; depois tenta variações.
         return _first_existing_font(
             "Montserrat-Regular.ttf",
-            "BebasNeue-Regular.ttf",
-            "Montserrat-Reegular.ttf",   # (corrige nomes “typo”)
+            "BebasNeue-Regular.ttf",      # fallback direto
+            "Montserrat-Reegular.ttf",    # tolera typo
             "Inter-Bold.ttf"
         )
     if s in ("modern", "2"):
@@ -190,14 +148,211 @@ def _pick_drawtext_font(style_key: str) -> Optional[str]:
         return _first_existing_font("Inter-Bold.ttf", "Montserrat-Regular.ttf")
     return _first_existing_font("Montserrat-Regular.ttf", "BebasNeue-Regular.ttf", "Inter-Bold.ttf")
 
-
-def _ff_normpath(path: str) -> str:
+# =============================================================================
+# Legendas sincronizadas — via faster-whisper (ASR no TTS)
+# =============================================================================
+_ASR_MODEL = None
+def _load_asr_model():
+    global _ASR_MODEL
+    if _ASR_MODEL is not None:
+        return _ASR_MODEL
     try:
-        rel = os.path.relpath(path)
-    except Exception:
-        rel = path
-    return rel.replace("\\", "/")
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        logger.warning("faster-whisper não disponível: %s", e)
+        _ASR_MODEL = False
+        return _ASR_MODEL
 
+    model_size = os.getenv("WHISPER_MODEL", "base")
+    device = os.getenv("WHISPER_DEVICE", None)
+    if not device:
+        # usa CUDA se disponível
+        device = "cuda" if shutil.which("nvidia-smi") else "cpu"
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16" if device == "cuda" else "int8")
+
+    try:
+        _ASR_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
+        logger.info("🗣️ faster-whisper carregado: model=%s device=%s compute=%s", model_size, device, compute_type)
+    except Exception as e:
+        logger.warning("Falha ao carregar faster-whisper (%s). Usando fallback simples.", e)
+        _ASR_MODEL = False
+    return _ASR_MODEL
+
+def _clean_token(tok: str) -> str:
+    # mantém letras, números e apóstrofo; remove pontuação solta
+    t = re.sub(r"[^\w'’\-]+", "", tok, flags=re.UNICODE)
+    return t
+
+def _asr_word_segments(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]:
+    """
+    Retorna [(start, end, word), ...] em CAIXA ALTA usando faster-whisper.
+    Se indisponível/falha, retorna lista vazia (caller faz fallback).
+    """
+    model = _load_asr_model()
+    if not model:
+        return []
+
+    lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
+
+    try:
+        # Config: word timestamps e VAD ajudam a segmentar melhor
+        segments, info = model.transcribe(
+            audio_path,
+            language=lang,
+            beam_size=5,
+            vad_filter=True,
+            word_timestamps=True
+        )
+        words: List[Tuple[float, float, str]] = []
+        for seg in segments:
+            if not getattr(seg, "words", None):
+                continue
+            for w in seg.words:
+                if w.start is None or w.end is None:
+                    continue
+                token = _clean_token(getattr(w, "word", "") or "")
+                if not token:
+                    continue
+                words.append((float(w.start), float(w.end), token.upper()))
+        return words
+    except Exception as e:
+        logger.warning("ASR (faster-whisper) falhou: %s", e)
+        return []
+
+def _chunk_asr_words(words: List[Tuple[float, float, str]]) -> List[Tuple[float, float, str]]:
+    """
+    Junta palavras ASR em blocos de 2–3 palavras com tempos reais.
+    Regras:
+      - Se houver palavra longa (>=10 chars) no trio, usa 2 em vez de 3.
+      - Garante duração mínima ~0.55s (merge simples com próximo).
+    """
+    if not words:
+        return []
+
+    chunks: List[Tuple[float, float, str]] = []
+    i = 0
+    n = len(words)
+    while i < n:
+        take = 3
+        # se houver palavra muito longa no próximo trio, reduz
+        has_long = any(len(words[j][2]) >= 10 for j in range(i, min(i+3, n)))
+        if has_long:
+            take = 2
+        if i + take > n:
+            take = max(1, n - i)
+
+        group = words[i:i+take]
+        start = group[0][0]
+        end = group[-1][1]
+        text = " ".join(w[2] for w in group)
+        chunks.append((start, end, text))
+        i += take
+
+    # saneia durações muito curtas juntando com próximo
+    j = 0
+    MIN_DUR = 0.55
+    while j < len(chunks) - 1:
+        s, e, t = chunks[j]
+        if (e - s) < MIN_DUR:
+            s2, e2, t2 = chunks[j+1]
+            # tenta expandir até o início do próximo bloco
+            if s2 - e > 0.05:
+                e = min(e + 0.05, s2 - 0.02)
+            # se ainda curto, faz merge
+            if (e - s) < MIN_DUR:
+                chunks[j] = (s, e2, f"{t} {t2}")
+                del chunks[j+1]
+                continue
+            else:
+                chunks[j] = (s, e, t)
+        j += 1
+
+    return chunks
+
+# ---------- Fallback (sem ASR): proporcional por palavras ----------
+def _tokenize_words(text: str) -> List[str]:
+    text = re.sub(r"[\r\n]+", " ", text).strip()
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text)
+    return [t for t in tokens if t]
+
+def _chunk_words_simple(tokens: List[str]) -> List[str]:
+    lines: List[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        take = 3
+        if any(len(tokens[j]) >= 10 for j in range(i, min(i + 3, n))):
+            take = 2
+        if i + take > n:
+            take = max(1, n - i)
+        lines.append(" ".join(tokens[i:i+take]).upper())
+        i += take
+    return lines
+
+def _distribuir_duracoes_por_palavra(blocos: List[str], total_disp: float) -> List[float]:
+    if not blocos:
+        return []
+    min_seg, max_seg = 0.7, 3.0
+    pesos = [max(1, len(b.split())) for b in blocos]
+    soma = sum(pesos)
+    brutas = [(p / soma) * total_disp for p in pesos]
+    clamped = [min(max(b, min_seg), max_seg) for b in brutas]
+    fator = min(1.0, (total_disp / sum(clamped))) if sum(clamped) > 0 else 1.0
+    return [d * fator for d in clamped]
+
+def _segmentos_fallback_por_palavras(texto: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
+    tokens = _tokenize_words(texto)
+    if not tokens:
+        return []
+    lines = _chunk_words_simple(tokens)
+    alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
+    gap = 0.10
+    durs = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
+    t = 0.25
+    segs: List[Tuple[float, float, str]] = []
+    for line, d in zip(lines, durs):
+        ini = t
+        fim = t + d
+        segs.append((ini, fim, line))
+        t = fim + gap
+    return segs
+
+def _segmentos_legenda_sincronizados(audio_path: str, texto: str, idioma: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
+    """
+    Usa faster-whisper (se disponível) para sincronizar em 2–3 palavras por bloco.
+    Cai no fallback proporcional se falhar.
+    """
+    words = _asr_word_segments(audio_path, idioma)
+    if not words:
+        logger.info("⚠️ ASR indisponível/falhou — usando fallback proporcional por palavras.")
+        return _segmentos_fallback_por_palavras(texto, duracao_audio)
+
+    chunks = _chunk_asr_words(words)
+
+    # recorta/limita ao intervalo útil do vídeo
+    MAX_END = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.2, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.1))
+    t0 = 0.25  # desloca levemente para evitar aparecer no frame 0
+    segs: List[Tuple[float, float, str]] = []
+    for (s, e, txt) in chunks:
+        ini = max(t0, float(s) + 0.0)
+        fim = float(e) + 0.02
+        if fim <= t0 or ini >= MAX_END:
+            continue
+        ini = max(ini, t0)
+        fim = min(fim, MAX_END)
+        if fim - ini >= 0.45:  # descarta restos muito curtos
+            segs.append((ini, fim, txt.upper()))
+
+    # Se por algum motivo ficou vazio após cortes, volta ao fallback
+    if not segs:
+        logger.info("⚠️ Nenhum segmento útil após corte — usando fallback proporcional.")
+        return _segmentos_fallback_por_palavras(texto, duracao_audio)
+
+    return segs
+
+# =============================================================================
+# Montagem do filtergraph (drawtext)
+# =============================================================================
 def _write_textfile(content: str, idx: int) -> str:
     path = os.path.join(CACHE_DIR, f"drawtext_{idx:02d}.txt")
     with open(path, "w", encoding="utf-8") as f:
@@ -209,8 +364,8 @@ def _build_drawtext_chain(H: int,
                           segments: List[Tuple[float, float, str]],
                           font_path: Optional[str]) -> str:
     """
-    Monta a cadeia de drawtext usando textfile= (estável no Windows).
-    Segmentos são 1 linha; centralizados no rodapé.
+    Cadeia drawtext usando textfile= (estável no Windows).
+    Segmentos 1 linha; centralizados no rodapé; sem box; contorno fino.
     """
     sid = _normalize_style(style_id)
 
@@ -247,7 +402,7 @@ def _build_drawtext_chain(H: int,
             f":fontcolor=white"
             f":borderw={borderw}:bordercolor=black"
             f":box=0"
-            f":line_spacing=0"
+            f":line_spacing=0"            # colado, sem espaço extra
             f":x=(w-text_w)/2"
             f":y=h-(text_h+{margin})"
             f":enable='between(t,{ini:.3f},{fim:.3f})'"
@@ -255,7 +410,9 @@ def _build_drawtext_chain(H: int,
         blocks.append(block)
     return ",".join(blocks)
 
-# --------------- principal ----------------
+# =============================================================================
+# Pipeline principal
+# =============================================================================
 def gerar_video(imagem_path: str,
                 saida_path: str,
                 preset: str = "hd",
@@ -269,7 +426,7 @@ def gerar_video(imagem_path: str,
       - +faststart; keyframe a cada 2s
       - Duração máx. 20s
       - Narração TTS (Gemini/ElevenLabs) + música de fundo
-      - (opcional) Legendas em blocos de 2–3 palavras (1 linha) via drawtext+textfile
+      - (opcional) Legendas sincronizadas (ASR) em blocos de 2–3 palavras
     """
     if preset not in PRESETS:
         logger.warning("Preset '%s' inválido. Usando 'hd'.", preset)
@@ -310,11 +467,12 @@ def gerar_video(imagem_path: str,
     has_voice = bool(voice_audio_path)
     has_bg = bool(background_audio_path)
 
-    # Segmentos de legenda – blocos de 2–3 palavras
+    # Segmentos de legenda
     segments: List[Tuple[float, float, str]] = []
+    _clear_drawtext_cache()
     if legendas and has_voice:
-        segments = _segmentos_legenda_palavras(long_text, dur_voz or DURACAO_MAXIMA_VIDEO)
-        logger.info("📝 %d segmentos de legenda (word-chunks).", len(segments))
+        segments = _segmentos_legenda_sincronizados(voice_audio_path, long_text, lang_norm, dur_voz or DURACAO_MAXIMA_VIDEO)
+        logger.info("📝 %d segmentos de legenda (sincronizados).", len(segments))
 
     # Filtro de vídeo base
     vf_base = (
@@ -372,6 +530,7 @@ def gerar_video(imagem_path: str,
 
         # Cadeia de áudio (mix ou direto)
         if has_voice and has_bg:
+            # mix simples; se quiser ducking, podemos trocar por sidechaincompressor depois
             achain = "[1:a]volume=1.0[va];[2:a]volume=0.15[ba];[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
         else:
             achain = "[1:a]anull[aout]"
