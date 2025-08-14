@@ -8,10 +8,17 @@ import wave
 import datetime
 import logging
 import requests
-from typing import Optional
-from dotenv import load_dotenv
-from moviepy import AudioFileClip  # editor-safe
+import time
 import json
+from typing import Optional, Callable, TypeVar, Tuple
+
+# moviepy: tentar import "editor-safe" primeiro e cair pro clássico se necessário
+try:
+    from moviepy import AudioFileClip  # type: ignore
+except Exception:  # pragma: no cover
+    from moviepy.editor import AudioFileClip  # type: ignore
+
+from dotenv import load_dotenv
 
 # ====== .env / logging ======
 load_dotenv()
@@ -46,9 +53,42 @@ def save_used_audios(used_audios):
     with open(AUDIOS_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(list(used_audios), f)
 
+# ====== Helpers de retry/backoff ======
+T = TypeVar("T")
+MAX_RETRIES_DEFAULT = 3
+
+def _retry(fn: Callable[[], T],
+           *,
+           tries: int = MAX_RETRIES_DEFAULT,
+           base_sleep: float = 0.8,
+           jitter: float = 0.35,
+           on_error_msg: str | None = None) -> T | None:
+    """
+    Executa fn() com até 'tries' tentativas. Em erro, faz backoff exponencial + jitter.
+    Retorna o resultado de fn() ou None se falhar todas.
+    """
+    for attempt in range(1, max(1, tries) + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if on_error_msg:
+                logger.warning("%s (tentativa %d/%d): %s", on_error_msg, attempt, tries, e)
+            if attempt >= tries:
+                break
+            sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter)
+            time.sleep(sleep_s)
+    return None
+
 # =============================================================================
 # ÁUDIO DE FUNDO (local + Freesound)
 # =============================================================================
+
+def _duracao_arquivo(path: str) -> float:
+    try:
+        with AudioFileClip(path) as clip:
+            return float(clip.duration or 0.0)
+    except Exception:
+        return 0.0
 
 def escolher_audio_local(diretorio=PASTA_PADRAO):
     try:
@@ -57,13 +97,9 @@ def escolher_audio_local(diretorio=PASTA_PADRAO):
         for f in os.listdir(diretorio):
             if f.lower().endswith(formatos):
                 caminho = os.path.join(diretorio, f)
-                try:
-                    with AudioFileClip(caminho) as clip:
-                        dur = clip.duration
-                    if dur >= DURACAO_MINIMA:
-                        musicas_validas.append((caminho, dur))
-                except Exception as e:
-                    logger.warning("Erro ao ler duração de %s: %s", f, e)
+                dur = _duracao_arquivo(caminho)
+                if dur >= DURACAO_MINIMA:
+                    musicas_validas.append((caminho, dur))
 
         if not musicas_validas:
             raise FileNotFoundError(f"Nenhum áudio >= {DURACAO_MINIMA}s em {diretorio}")
@@ -83,121 +119,142 @@ def escolher_audio_local(diretorio=PASTA_PADRAO):
         logger.error("Falha ao escolher áudio local: %s", e)
         raise
 
+def _freesound_busca_lote(query: str,
+                          sort: str,
+                          filters: str,
+                          page_size: int = 20) -> dict:
+    url = "https://freesound.org/apiv2/search/text/"
+    headers = {"Authorization": f"Token {FREESOUND_API_KEY}"}
+    params = {
+        "query": query,
+        "filter": filters,
+        "sort": sort,
+        "fields": "id,name,duration,tags,license,previews",
+        "page_size": page_size,
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def _baixar_preview(audio_meta: dict, destino: str) -> float:
+    os.makedirs(os.path.dirname(destino) or ".", exist_ok=True)
+    preview_url = audio_meta["previews"]["preview-hq-mp3"]
+    with requests.get(preview_url, stream=True, timeout=30) as resp:
+        resp.raise_for_status()
+        with open(destino, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+    dur = _duracao_arquivo(destino)
+    if dur < DURACAO_MINIMA:
+        try:
+            os.remove(destino)
+        except Exception:
+            pass
+        raise ValueError(f"Áudio baixado curto ({dur:.0f}s).")
+    return dur
+
 def buscar_audio_freesound(
     query="inspirational",
     output_dir=PASTA_PADRAO,
     sort="rating_desc",
-    additional_filters='tag:music tag:instrumental -tag:speech -tag:voice'
+    additional_filters='tag:music tag:instrumental -tag:speech -tag:voice',
+    *,
+    max_retries: int = MAX_RETRIES_DEFAULT
 ):
+    """
+    Busca e baixa um áudio do Freesound com retries.
+    Prioriza itens ainda não usados no cache.
+    """
     if not FREESOUND_API_KEY:
         raise ValueError("FREESOUND_API_KEY não configurada no .env.")
 
-    try:
+    def tentar() -> str:
         logger.info("🔍 Freesound: query='%s', sort='%s', filtros='%s'", query, sort, additional_filters)
-        url = "https://freesound.org/apiv2/search/text/"
-        headers = {"Authorization": f"Token {FREESOUND_API_KEY}"}
+        # 1) busca com filtros "fortes"
         filters = f"duration:[{DURACAO_MINIMA} TO 300] {additional_filters}".strip()
-        params = {
-            "query": query,
-            "filter": filters,
-            "sort": sort,
-            "fields": "id,name,duration,tags,license,previews",
-            "page_size": 20,
-        }
+        data = _freesound_busca_lote(query, sort, filters)
 
-        r = requests.get(url, headers=headers, params=params)
-        r.raise_for_status()
-        data = r.json()
-
+        # 2) afrouxa se vazio
         if not data.get("results"):
             logger.warning("Sem resultados; relaxando filtros…")
-            params["filter"] = f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech"
-            r = requests.get(url, headers=headers, params=params)
-            r.raise_for_status()
-            data = r.json()
+            filters2 = f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech"
+            data = _freesound_busca_lote(query, sort, filters2)
 
+        # 3) fallback de query
         if not data.get("results"):
             logger.warning("Ainda sem resultados; fallback amplo…")
-            params["query"] = "uplifting music"
-            params["filter"] = f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech"
-            r = requests.get(url, headers=headers, params=params)
-            r.raise_for_status()
-            data = r.json()
+            data = _freesound_busca_lote("uplifting music", sort, f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech")
 
+        # 4) último recurso – só duração
         if not data.get("results"):
             logger.warning("Removendo filtros de tag…")
-            params["filter"] = f"duration:[{DURACAO_MINIMA} TO 300]"
-            r = requests.get(url, headers=headers, params=params)
-            r.raise_for_status()
-            data = r.json()
+            data = _freesound_busca_lote(query, sort, f"duration:[{DURACAO_MINIMA} TO 300]")
             if not data.get("results"):
-                raise Exception("Nenhum áudio encontrado no Freesound.")
+                raise RuntimeError("Nenhum áudio encontrado no Freesound.")
 
+        # Escolher um que não esteja no cache
         used = load_used_audios()
-        nao_usados = [a for a in data["results"] if str(a["id"]) not in used]
-        if not nao_usados:
-            logger.warning("Sem áudio novo no Freesound; reutilizando aleatório.")
-            nao_usados = data["results"]
+        resultados = data["results"]
+        candidatos = [a for a in resultados if str(a["id"]) not in used] or resultados
 
-        audio = random.choice(nao_usados)
+        audio = random.choice(candidatos)
         audio_id = audio["id"]
         nome = re.sub(r"\W+", "_", audio["name"].split(".")[0])
         caminho = os.path.join(output_dir, f"{audio_id}_{nome}.mp3")
 
-        os.makedirs(output_dir, exist_ok=True)
-
         if os.path.exists(caminho):
             logger.info("✅ Já existe: %s", caminho)
-            with AudioFileClip(caminho) as clip:
-                dur = clip.duration
+            dur = _duracao_arquivo(caminho)
             if dur < DURACAO_MINIMA:
                 os.remove(caminho)
                 raise ValueError(f"Áudio existente curto ({dur:.0f}s).")
-            used.add(str(audio_id))
-            save_used_audios(used)
-            return caminho
-
-        preview_url = audio["previews"]["preview-hq-mp3"]
-        resp = requests.get(preview_url, stream=True)
-        resp.raise_for_status()
-        with open(caminho, "wb") as f:
-            for chunk in resp.iter_content(8192):
-                f.write(chunk)
-
-        with AudioFileClip(caminho) as clip:
-            dur = clip.duration
-        if dur < DURACAO_MINIMA:
-            os.remove(caminho)
-            raise ValueError(f"Áudio baixado curto ({dur:.0f}s).")
+        else:
+            dur = _baixar_preview(audio, caminho)
 
         used.add(str(audio_id))
         save_used_audios(used)
-        logger.info("✅ Baixado: %s (%.0fs, lic: %s)", caminho, dur, audio.get('license', 'N/A'))
+        logger.info("✅ Pronto: %s (%.0fs, lic: %s)", caminho, dur, audio.get('license', 'N/A'))
         return caminho
 
-    except requests.RequestException as e:
-        logger.error("Erro de rede Freesound: %s", e)
-        raise
-    except Exception as e:
-        logger.error("Erro Freesound: %s", e)
-        raise
+    # retry com backoff
+    caminho = _retry(tentar, tries=max_retries, on_error_msg="Erro Freesound")
+    if caminho is None:
+        raise RuntimeError("Falha ao obter áudio do Freesound após múltiplas tentativas.")
+    return caminho
 
 def obter_caminho_audio(query="inspirational", diretorio=PASTA_PADRAO,
                         sort="rating_desc",
                         additional_filters='tag:music tag:instrumental -tag:speech -tag:voice'):
-    try:
-        if USE_REMOTE_AUDIO:
-            logger.info("Tentando áudio remoto: %s", query)
-            return buscar_audio_freesound(query, diretorio, sort, additional_filters)
-        else:
-            logger.info("Usando áudio local (USE_REMOTE_AUDIO=False)")
+    """
+    Tenta áudio remoto com retry; se tudo falhar, cai para áudio local.
+    """
+    if USE_REMOTE_AUDIO:
+        logger.info("Tentando áudio remoto: %s", query)
+
+        def tentar_remoto():
+            return buscar_audio_freesound(query, diretorio, sort, additional_filters, max_retries=1)
+
+        # fazemos 3 rodadas "externas" para variar um pouco a seleção
+        for i in range(MAX_RETRIES_DEFAULT):
+            caminho = _retry(tentar_remoto, tries=1, on_error_msg=f"Rodada remota {i+1}")
+            if caminho:
+                return caminho
+            # pequeno atraso entre rodadas
+            time.sleep(0.5 + random.random() * 0.5)
+
+        logger.warning("Falha no remoto após retries; tentando áudio local…")
+        try:
             return escolher_audio_local(diretorio)
-    except Exception as e:
-        logger.warning("Falha no remoto; fallback local: %s", e)
+        except Exception as e:
+            logger.error("Sem áudio local disponível: %s", e)
+            raise
+    else:
+        logger.info("Usando áudio local (USE_REMOTE_AUDIO=False)")
         return escolher_audio_local(diretorio)
 
 # =============================================================================
-# TTS (Gemini = padrão) + ElevenLabs como alternativa
+# TTS (Gemini = padrão) + ElevenLabs como alternativa (com retries)
 # =============================================================================
 
 # ---- Gemini TTS (novo SDK google-genai) ----
@@ -209,17 +266,24 @@ except Exception:
     _HAS_GOOGLE_GENAI = False
 
 def _wav_write(filename: str, pcm_bytes: bytes, channels=1, rate=24000, sample_width=2):
+    os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
     with wave.open(filename, "wb") as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(sample_width)
         wf.setframerate(rate)
         wf.writeframes(pcm_bytes)
 
+def _tts_filename(lang: str, ext: str = "wav") -> str:
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(PASTA_TTS, f"tts_{lang}_{ts}.{ext}")
+
 def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
                               voice_name: Optional[str] = None,
-                              model: Optional[str] = None) -> Optional[str]:
+                              model: Optional[str] = None,
+                              *,
+                              max_retries: int = MAX_RETRIES_DEFAULT) -> Optional[str]:
     """
-    Gera WAV (PCM 24 kHz, mono) via Gemini TTS.
+    Gera WAV (PCM 24 kHz, mono) via Gemini TTS com retries.
     Requer biblioteca 'google-genai' e GEMINI_API_KEY.
     """
     if not _HAS_GOOGLE_GENAI:
@@ -232,14 +296,13 @@ def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
         return None
 
     model = model or os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
-
-    # Voz padrão (pode ajustar via env GEMINI_TTS_VOICE)
     default_voice_map = {"en": "Kore", "pt": "Sadaltager"}
     lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
     voice_name = voice_name or os.getenv("GEMINI_TTS_VOICE") or default_voice_map.get(lang, "Kore")
 
-    try:
-        client = genai_new.Client(api_key=api_key)
+    client = genai_new.Client(api_key=api_key)
+
+    def tentar() -> str:
         resp = client.models.generate_content(
             model=model,
             contents=texto,
@@ -255,21 +318,16 @@ def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
             ),
         )
 
-        # Bytes PCM (a SDK Python já retorna bytes, mas tratamos caso venha base64)
         data = resp.candidates[0].content.parts[0].inline_data.data
-        if isinstance(data, str):
-            pcm_bytes = base64.b64decode(data)
-        else:
-            pcm_bytes = data
+        pcm_bytes = base64.b64decode(data) if isinstance(data, str) else data
+        out_path = _tts_filename(lang, "wav")
+        _wav_write(out_path, pcm_bytes, channels=1, rate=24000, sample_width=2)
+        return out_path
 
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = os.path.join(PASTA_TTS, f"tts_{lang}_{ts}.wav")
-        _wav_write(path, pcm_bytes, channels=1, rate=24000, sample_width=2)
+    path = _retry(tentar, tries=max_retries, on_error_msg="Falha no TTS Gemini")
+    if path:
         logger.info("🎧 TTS (Gemini) gerado: %s", path)
-        return path
-    except Exception as e:
-        logger.warning("Falha no TTS Gemini: %s", e)
-        return None
+    return path
 
 # ---- ElevenLabs (SDK oficial) ----
 _HAS_ELEVENLABS = True
@@ -278,9 +336,11 @@ try:
 except Exception:
     _HAS_ELEVENLABS = False
 
-def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en") -> Optional[str]:
+def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en",
+                                  *,
+                                  max_retries: int = MAX_RETRIES_DEFAULT) -> Optional[str]:
     """
-    Gera MP3 via ElevenLabs. Requer ELEVENLABS_API_KEY.
+    Gera MP3 via ElevenLabs com retries. Requer ELEVENLABS_API_KEY.
     """
     if not _HAS_ELEVENLABS:
         logger.warning("Pacote 'elevenlabs' não instalado. pip install elevenlabs")
@@ -291,7 +351,6 @@ def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en") -> Optional[st
         logger.warning("ELEVENLABS_API_KEY ausente.")
         return None
 
-    # IDs de voz exemplo (troque pelos seus)
     voice_ids = {
         "en": os.getenv("ELEVENLABS_VOICE_EN", "y2Y5MeVPm6ZQXK64WUui"),
         "pt": os.getenv("ELEVENLABS_VOICE_PT", "rnJZLKxtlBZt77uIED10"),
@@ -299,43 +358,42 @@ def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en") -> Optional[st
     lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
     voice_id = voice_ids.get(lang, voice_ids["en"])
 
-    try:
-        client = ElevenLabs(api_key=api_key)
-        stream = client.text_to_speech.stream(text=texto, voice_id=voice_id, model_id="eleven_multilingual_v2")
+    client = ElevenLabs(api_key=api_key)
 
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = os.path.join(PASTA_TTS, f"tts_{lang}_{ts}.mp3")
-        with open(path, "wb") as f:
+    def tentar() -> str:
+        stream = client.text_to_speech.stream(text=texto, voice_id=voice_id, model_id="eleven_multilingual_v2")
+        out_path = _tts_filename(lang, "mp3")
+        with open(out_path, "wb") as f:
             for chunk in stream:
                 if isinstance(chunk, bytes) and chunk:
                     f.write(chunk)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+            raise RuntimeError("Arquivo MP3 inválido/pequeno.")
+        return out_path
 
-        if os.path.exists(path):
-            logger.info("🎧 TTS (ElevenLabs) gerado: %s", path)
-            return path
-        logger.warning("Falha ao salvar TTS ElevenLabs.")
-        return None
-    except Exception as e:
-        logger.warning("Erro ElevenLabs: %s", e)
-        return None
+    path = _retry(tentar, tries=max_retries, on_error_msg="Erro ElevenLabs")
+    if path:
+        logger.info("🎧 TTS (ElevenLabs) gerado: %s", path)
+    return path
 
 # ---- Facade para escolher motor TTS ----
 def gerar_narracao_tts(texto: str, idioma: str = "en", engine: str = "gemini") -> Optional[str]:
     """
     Gera narração TTS com o motor escolhido.
       engine = "gemini" (padrão) | "elevenlabs"
-    Tenta fallback para o outro motor caso o escolhido falhe.
+    Tenta retries no motor escolhido e, se falhar, faz fallback para o outro (também com retries).
     """
     engine = (engine or "gemini").strip().lower()
+
     if engine == "gemini":
-        path = gerar_narracao_tts_gemini(texto, idioma=idioma)
+        path = gerar_narracao_tts_gemini(texto, idioma=idioma, max_retries=MAX_RETRIES_DEFAULT)
         if path:
             return path
         logger.info("Fallback: tentando ElevenLabs…")
-        return gerar_narracao_tts_elevenlabs(texto, idioma=idioma)
+        return gerar_narracao_tts_elevenlabs(texto, idioma=idioma, max_retries=MAX_RETRIES_DEFAULT)
     else:
-        path = gerar_narracao_tts_elevenlabs(texto, idioma=idioma)
+        path = gerar_narracao_tts_elevenlabs(texto, idioma=idioma, max_retries=MAX_RETRIES_DEFAULT)
         if path:
             return path
         logger.info("Fallback: tentando Gemini…")
-        return gerar_narracao_tts_gemini(texto, idioma=idioma)
+        return gerar_narracao_tts_gemini(texto, idioma=idioma, max_retries=MAX_RETRIES_DEFAULT)

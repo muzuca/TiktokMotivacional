@@ -10,7 +10,7 @@ import subprocess
 from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 
-from .frase import gerar_frase_motivacional_longa, quebrar_em_duas_linhas
+from .frase import gerar_frase_motivacional_longa
 from .audio import obter_caminho_audio, gerar_narracao_tts
 
 logging.basicConfig(
@@ -31,6 +31,11 @@ PRESETS = {
 DURACAO_MAXIMA_VIDEO = 20.0
 FPS = 30
 AUDIO_SR = 44100
+
+# Caminhos RELATIVOS simples
+FONTS_DIR = "fonts"
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ---------------- helpers ----------------
 def _nome_limpo(base: str) -> str:
@@ -56,7 +61,6 @@ def _idioma_norm(idioma: str) -> str:
     return "pt" if s.startswith("pt") else "en"
 
 def _duracao_audio_segundos(audio_path: str) -> Optional[float]:
-    """Obtém duração do áudio via ffprobe (segundos)."""
     try:
         ffprobe = _ffprobe_or_die()
         out = subprocess.check_output(
@@ -71,41 +75,43 @@ def _duracao_audio_segundos(audio_path: str) -> Optional[float]:
     except Exception:
         return None
 
-def _split_em_frases(texto: str) -> List[str]:
-    """
-    Divide por pontuação forte. Se vier uma frase única, quebra em blocos de ~12 palavras.
-    """
-    texto = (texto or "").strip()
-    if not texto:
-        return []
-    partes = re.split(r'(?<=[\.\!\?\:;])\s+', texto)
-    partes = [p.strip() for p in partes if p.strip()]
-    if len(partes) <= 1:
-        # fallback por palavras
-        palavras = texto.split()
-        if not palavras:
-            return []
-        blocos, passo = [], 12
-        for i in range(0, len(palavras), passo):
-            blocos.append(" ".join(palavras[i:i+passo]))
-        return blocos
-    return partes
+# ---------- Segmentação das legendas (2–3 palavras por bloco, 1 linha) ----------
+def _tokenize_words(text: str) -> List[str]:
+    # preserva acentos; remove quebras de linha; mantém apóstrofo como parte da palavra
+    text = re.sub(r"[\r\n]+", " ", text).strip()
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text)
+    return [t for t in tokens if t]
 
-def _tempo_srt(seg: float) -> str:
-    if seg < 0: seg = 0
-    h = int(seg // 3600)
-    m = int((seg % 3600) // 60)
-    s = int(seg % 60)
-    ms = int((seg - math.floor(seg)) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def _chunk_words(tokens: List[str]) -> List[List[str]]:
+    """
+    Quebra em blocos de 2 ou 3 palavras.
+    Se houver palavra longa (>=10 chars) no bloco, limita a 2.
+    """
+    chunks: List[List[str]] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        # tenta 3
+        take = 3
+        long_word = any(len(tokens[j]) >= 10 for j in range(i, min(i + 3, n)))
+        if long_word:
+            take = 2
+        # evita ultrapassar fim
+        if i + take > n:
+            take = max(1, n - i)
+        chunk = tokens[i:i + take]
+        chunks.append(chunk)
+        i += take
+    return chunks
 
 def _distribuir_duracoes_por_palavra(frases: List[str], total_disp: float) -> List[float]:
     """
-    Duração proporcional à contagem de palavras, com clamp de 1.2–5.5s, normalizada ao total.
+    Duração proporcional à contagem de palavras, clamp 0.7–3.0s (para blocos curtíssimos),
+    normalizada ao total disponível.
     """
     if not frases:
         return []
-    min_seg, max_seg = 1.2, 5.5
+    min_seg, max_seg = 0.7, 3.0
     pesos = [max(1, len(f.split())) for f in frases]
     soma = sum(pesos)
     brutas = [(p / soma) * total_disp for p in pesos]
@@ -113,40 +119,141 @@ def _distribuir_duracoes_por_palavra(frases: List[str], total_disp: float) -> Li
     fator = min(1.0, (total_disp / sum(clamped))) if sum(clamped) > 0 else 1.0
     return [d * fator for d in clamped]
 
-def _gerar_srt(texto: str, duracao_audio: float, saida_dir: str, base_nome: str) -> Optional[str]:
+def _segmentos_legenda_palavras(texto: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
     """
-    Gera um .srt com janelas distribuídas ao longo da duração da narração.
-    Retorna o caminho do .srt ou None.
+    Constrói segmentos 1-linha com 2–3 palavras em CAIXA ALTA.
     """
+    tokens = _tokenize_words(texto)
+    if not tokens:
+        return []
+
+    chunks = _chunk_words(tokens)
+    lines = [" ".join(ch).upper() for ch in chunks]
+
+    alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
+    gap = 0.10  # troca rápida entre blocos
+    duracoes = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
+
+    t = 0.25
+    segs: List[Tuple[float, float, str]] = []
+    for line, d in zip(lines, duracoes):
+        ini = t
+        fim = t + d
+        segs.append((ini, fim, line))
+        t = fim + gap
+    return segs
+
+# ---------------- estilos de vídeo (legendas) ----------------
+VIDEO_STYLES = {
+    "1": {"key": "minimal_compact", "label": "Compact (sem caixa, contorno fino)"},
+    "2": {"key": "clean_outline",   "label": "Clean (um pouco maior)"},
+    "3": {"key": "tiny_outline",    "label": "Tiny (bem pequeno)"},
+    # apelidos aceitos
+    "classic": "1",
+    "modern":  "2",
+    "serif":   "2",
+    "clean":   "2",
+    "mono":    "3",
+}
+
+def _normalize_style(style: str) -> str:
+    s = (style or "1").strip().lower()
+    if s in ("1", "2", "3"):
+        return s
+    return str(VIDEO_STYLES.get(s, "1"))
+
+def listar_estilos_video() -> List[Tuple[str, str]]:
+    return [(k, v["label"]) for k, v in VIDEO_STYLES.items() if k in ("1","2","3")]
+
+def _first_existing_font(*names: str) -> Optional[str]:
+    for n in names:
+        p = os.path.join(FONTS_DIR, n)
+        if os.path.isfile(p):
+            return p
+    return None
+
+def _pick_drawtext_font(style_key: str) -> Optional[str]:
+    s = (style_key or "").lower()
+    if s in ("classic", "1", "clean", "5"):
+        # Montserrat primeiro; se faltar, cai para Bebas; depois tenta variações.
+        return _first_existing_font(
+            "Montserrat-Regular.ttf",
+            "BebasNeue-Regular.ttf",
+            "Montserrat-Reegular.ttf",   # (corrige nomes “typo”)
+            "Inter-Bold.ttf"
+        )
+    if s in ("modern", "2"):
+        return _first_existing_font("BebasNeue-Regular.ttf", "Inter-Bold.ttf", "Montserrat-ExtraBold.ttf")
+    if s in ("serif", "3"):
+        return _first_existing_font("PlayfairDisplay-Regular.ttf", "Cinzel-Bold.ttf")
+    if s in ("mono", "4"):
+        return _first_existing_font("Inter-Bold.ttf", "Montserrat-Regular.ttf")
+    return _first_existing_font("Montserrat-Regular.ttf", "BebasNeue-Regular.ttf", "Inter-Bold.ttf")
+
+
+def _ff_normpath(path: str) -> str:
     try:
-        frases = _split_em_frases(texto)
-        if not frases:
-            return None
+        rel = os.path.relpath(path)
+    except Exception:
+        rel = path
+    return rel.replace("\\", "/")
 
-        # reserva respiro no início/fim
-        alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
-        gap = 0.15
-        duracoes = _distribuir_duracoes_por_palavra(frases, alvo - gap * (len(frases) - 1))
+def _write_textfile(content: str, idx: int) -> str:
+    path = os.path.join(CACHE_DIR, f"drawtext_{idx:02d}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
 
-        t = 0.25  # leve atraso antes da 1ª legenda
-        blocos: List[Tuple[str, str, str]] = []
-        for frase, d in zip(frases, duracoes):
-            ini = t
-            fim = t + d
-            t = fim + gap
-            # quebra em duas linhas legíveis
-            frase2l = quebrar_em_duas_linhas(frase)
-            blocos.append((_tempo_srt(ini), _tempo_srt(fim), frase2l))
+def _build_drawtext_chain(H: int,
+                          style_id: str,
+                          segments: List[Tuple[float, float, str]],
+                          font_path: Optional[str]) -> str:
+    """
+    Monta a cadeia de drawtext usando textfile= (estável no Windows).
+    Segmentos são 1 linha; centralizados no rodapé.
+    """
+    sid = _normalize_style(style_id)
 
-        os.makedirs(saida_dir, exist_ok=True)
-        srt_path = os.path.join(saida_dir, f"{base_nome}.srt")
-        with open(srt_path, "w", encoding="utf-8") as srt:
-            for idx, (ini, fim, txt) in enumerate(blocos, start=1):
-                srt.write(f"{idx}\n{ini} --> {fim}\n{txt}\n\n")
-        return srt_path
-    except Exception as e:
-        logger.warning("Falha ao gerar SRT: %s", e)
-        return None
+    if sid == "1":       # compacto
+        fs = max(18, int(H * 0.024))
+        borderw = 1
+        margin = max(48, int(H * 0.10))
+    elif sid == "2":     # um pouco maior
+        fs = max(18, int(H * 0.030))
+        borderw = 2
+        margin = max(54, int(H * 0.115))
+    else:                # tiny
+        fs = max(16, int(H * 0.023))
+        borderw = 1
+        margin = max(56, int(H * 0.12))
+
+    use_fontfile = (font_path and os.path.isfile(font_path))
+    if use_fontfile:
+        font_opt = f":fontfile={_ff_normpath(font_path)}"
+        logger.info("🔤 drawtext usando fonte: %s", font_path)
+    else:
+        font_opt = ""
+        logger.info("🔤 drawtext sem fontfile explícito (usando fonte do sistema).")
+
+    blocks = []
+    for idx, (ini, fim, txt) in enumerate(segments, start=1):
+        tf_path = _write_textfile(txt, idx)
+        tf_posix = _ff_normpath(tf_path)
+        block = (
+            "drawtext="
+            f"textfile={tf_posix}"
+            f"{font_opt}"
+            f":fontsize={fs}"
+            f":fontcolor=white"
+            f":borderw={borderw}:bordercolor=black"
+            f":box=0"
+            f":line_spacing=0"
+            f":x=(w-text_w)/2"
+            f":y=h-(text_h+{margin})"
+            f":enable='between(t,{ini:.3f},{fim:.3f})'"
+        )
+        blocks.append(block)
+    return ",".join(blocks)
 
 # --------------- principal ----------------
 def gerar_video(imagem_path: str,
@@ -154,14 +261,15 @@ def gerar_video(imagem_path: str,
                 preset: str = "hd",
                 idioma: str = "auto",
                 tts_engine: str = "gemini",
-                legendas: bool = True):
+                legendas: bool = True,
+                video_style: str = "1"):
     """
-    Gera MP4 vertical (TikTok/Android) via FFmpeg:
+    Gera MP4 vertical:
       - 30fps, H.264 yuv420p, AAC 44.1kHz
       - +faststart; keyframe a cada 2s
       - Duração máx. 20s
       - Narração TTS (Gemini/ElevenLabs) + música de fundo
-      - (opcional) Legendas queimadas sincronizadas com a narração
+      - (opcional) Legendas em blocos de 2–3 palavras (1 linha) via drawtext+textfile
     """
     if preset not in PRESETS:
         logger.warning("Preset '%s' inválido. Usando 'hd'.", preset)
@@ -186,6 +294,9 @@ def gerar_video(imagem_path: str,
     # Texto longo + TTS
     long_text = gerar_frase_motivacional_longa(idioma)
     lang_norm = _idioma_norm(idioma)
+    style_norm = _normalize_style(video_style)
+    logger.info("⚙️ Opções: legendas=%s | video_style='%s' (norm=%s)", legendas, video_style, style_norm)
+
     voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
     dur_voz = _duracao_audio_segundos(voice_audio_path) if voice_audio_path else None
 
@@ -199,12 +310,11 @@ def gerar_video(imagem_path: str,
     has_voice = bool(voice_audio_path)
     has_bg = bool(background_audio_path)
 
-    # Gerar SRT (se narração + legendas ativadas)
-    srt_path: Optional[str] = None
+    # Segmentos de legenda – blocos de 2–3 palavras
+    segments: List[Tuple[float, float, str]] = []
     if legendas and has_voice:
-        base_nome = os.path.splitext(os.path.basename(saida_path))[0]
-        out_dir = os.path.dirname(saida_path) or "."
-        srt_path = _gerar_srt(long_text, dur_voz or DURACAO_MAXIMA_VIDEO, out_dir, base_nome)
+        segments = _segmentos_legenda_palavras(long_text, dur_voz or DURACAO_MAXIMA_VIDEO)
+        logger.info("📝 %d segmentos de legenda (word-chunks).", len(segments))
 
     # Filtro de vídeo base
     vf_base = (
@@ -229,7 +339,7 @@ def gerar_video(imagem_path: str,
             "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}"
         ])  # 1:a (silêncio)
 
-    # Encode comum
+    # Parâmetros comuns de encode
     common_out = [
         "-t", str(DURACAO_MAXIMA_VIDEO),
         "-r", str(FPS),
@@ -249,24 +359,21 @@ def gerar_video(imagem_path: str,
         "-map_metadata", "-1",
     ]
 
-    # Precisamos de filter_complex se houver SRT (subtitles) ou mix (voz+bg).
-    need_fc = bool(srt_path) or (has_voice and has_bg)
+    # Precisamos de filter_complex se houver drawtext (legendas) ou mix (voz+bg).
+    need_fc = bool(segments) or (has_voice and has_bg)
 
     if need_fc:
         # Cadeia de vídeo
         vchain = f"[0:v]{vf_base}"
-        if srt_path:
-            # Use caminho relativo com barras / para evitar problemas no Windows
-            srt_rel = os.path.relpath(srt_path).replace("\\", "/")
-            vchain += f",subtitles={srt_rel}"
+        if segments:
+            font_for_sub = _pick_drawtext_font(video_style)
+            vchain += "," + _build_drawtext_chain(H, style_norm, segments, font_for_sub)
         vchain += "[vout]"
 
-        # Cadeia de áudio
+        # Cadeia de áudio (mix ou direto)
         if has_voice and has_bg:
             achain = "[1:a]volume=1.0[va];[2:a]volume=0.15[ba];[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
         else:
-            # Há somente 1 fonte de áudio (voz OU bg OU silêncio)
-            # O índice 1 é sempre o primeiro áudio adicionado ao cmd
             achain = "[1:a]anull[aout]"
 
         cmd.extend([
@@ -275,12 +382,13 @@ def gerar_video(imagem_path: str,
         ])
         cmd.extend(common_out)
     else:
-        # Sem subtitles e sem mix — podemos usar -vf e mapear 1:a direto
+        # Sem legendas e sem mix — usa -vf direto e mapeia 1:a
         cmd.extend(["-vf", vf_base, "-map", "0:v", "-map", "1:a"])
         cmd.extend(common_out)
 
     cmd.append(saida_path)
 
+    logger.info("📂 CWD no momento do ffmpeg: %s", os.getcwd())
     logger.info("🎬 FFmpeg gerando %s (%dx%d, %s/%s, %dfps) → %s",
                 preset.upper(), W, H, BR_V, BR_A, FPS, saida_path)
 

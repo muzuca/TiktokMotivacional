@@ -9,4 +9,5 @@ audios/
 videos/
 imagens/
 cache/
+audio_tts/
 venv/

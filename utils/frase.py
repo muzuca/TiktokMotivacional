@@ -7,10 +7,11 @@ import random
 import json
 import hashlib
 import time
+from typing import List, Set, Tuple, Optional
+
 from dotenv import load_dotenv
 import google.generativeai as genai
 import logging
-from typing import List, Set, Tuple, Optional
 
 # -----------------------------------------------------------------------------
 # Config & logging
@@ -18,7 +19,7 @@ from typing import List, Set, Tuple, Optional
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Modelo (mantenha o mesmo que você já usa)
+# Modelo (mantém o mesmo nome que você já usa)
 model = genai.GenerativeModel("models/gemini-1.5-pro-latest")
 
 logging.basicConfig(
@@ -28,12 +29,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Timeout (em segundos) para cada chamada ao Gemini
+GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "45"))
+
 # -----------------------------------------------------------------------------
 # Cache de frases usadas
 # -----------------------------------------------------------------------------
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_phrases.json")
+
 
 def load_used_phrases() -> Set[str]:
     """Carrega hashes de frases já usadas (curtas, prompts e longas)."""
@@ -47,6 +52,7 @@ def load_used_phrases() -> Set[str]:
             pass
     return set()
 
+
 def save_used_phrases(used_phrases: Set[str]) -> None:
     """Salva hashes de frases já usadas."""
     try:
@@ -54,6 +60,7 @@ def save_used_phrases(used_phrases: Set[str]) -> None:
             json.dump(sorted(list(used_phrases)), f, ensure_ascii=False)
     except Exception as e:
         logger.warning("Não foi possível salvar cache de frases: %s", e)
+
 
 # -----------------------------------------------------------------------------
 # Helpers genéricos
@@ -64,25 +71,26 @@ def _lang_tag(idioma: Optional[str]) -> str:
         return "pt"
     return "en"
 
+
 def _md5(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
+
 
 def _hash_key(s: str, prefix: str = "") -> str:
     """Cria uma chave de cache (com prefixo opcional) para evitar colisões entre tipos."""
     return f"{prefix}{_md5(s)}" if prefix else _md5(s)
+
 
 def _clean_line(s: str) -> str:
     """Normaliza uma linha: remove bullets/numeração e aspas redundantes."""
     if not s:
         return ""
     line = s.strip()
-    # remove numeração/bullet no começo: "1. foo", "- bar", "* baz"
     line = re.sub(r'^\s*(?:\d+[\).\s-]+|[-*•]\s+)', '', line).strip()
-    # remove aspas duplas simples isoladas
     line = line.strip(' "\'')
-    # normaliza espaços
     line = re.sub(r'\s+', ' ', line)
     return line
+
 
 def _parse_json_list(text: str) -> List[str]:
     """Tenta interpretar o texto como um array JSON de strings."""
@@ -100,56 +108,99 @@ def _parse_json_list(text: str) -> List[str]:
         pass
     return []
 
-def _ask_gemini_list(prompt: str, temperature: float = 1.05, tries: int = 2, sleep_base: float = 1.0) -> List[str]:
-    """Pede ao Gemini uma lista (idealmente JSON). Usa fallback por linhas e retry com backoff."""
+
+def _gen_call(prompt: str, generation_config: dict) -> Optional[str]:
+    """
+    Chamada ao Gemini com suporte a timeout (quando disponível).
+    Retorna o .text ou None em caso de falha.
+    """
+    try:
+        # Algumas versões aceitam request_options; se não aceitar, caímos no except.
+        resp = model.generate_content(
+            prompt,
+            generation_config=generation_config,
+            request_options={"timeout": GEMINI_TIMEOUT_SEC},
+        )
+        return getattr(resp, "text", None)
+    except TypeError:
+        # Sem suporte a request_options nesta versão
+        try:
+            resp = model.generate_content(prompt, generation_config=generation_config)
+            return getattr(resp, "text", None)
+        except Exception as e2:
+            logger.debug("Falha generate_content (sem timeout): %s", e2)
+            return None
+    except Exception as e:
+        logger.debug("Falha generate_content: %s", e)
+        return None
+
+
+def _ask_gemini_list(
+    prompt: str,
+    temperature: float = 1.05,
+    tries: int = 3,
+    sleep_base: float = 1.0
+) -> List[str]:
+    """
+    Pede ao Gemini uma lista (idealmente JSON).
+    - 1ª tentativa: força JSON (response_mime_type).
+    - Fallback: retorna por linhas.
+    - Até `tries` tentativas com backoff exponencial leve.
+    """
     for attempt in range(tries):
         try:
             # Tentativa 1: exigir JSON
-            resp = model.generate_content(
+            raw = _gen_call(
                 prompt,
-                generation_config={
+                {
                     "response_mime_type": "application/json",
                     "temperature": temperature,
                     "top_p": 0.95,
                 },
-            )
-            raw = (getattr(resp, "text", "") or "").strip()
-            lst = _parse_json_list(raw)
+            ) or ""
+            lst = _parse_json_list(raw.strip())
             if lst:
                 return lst
 
             # Tentativa 2: texto livre por linhas
-            resp2 = model.generate_content(
+            txt = _gen_call(
                 prompt,
-                generation_config={
+                {
                     "temperature": temperature,
                     "top_p": 0.95,
                 },
-            )
-            txt = (getattr(resp2, "text", "") or "").strip()
+            ) or ""
+            txt = txt.strip()
             if txt:
                 lines = [_clean_line(l) for l in txt.split("\n") if _clean_line(l)]
                 if lines:
                     return lines
 
         except Exception:
-            # backoff leve e segue
-            time.sleep(sleep_base * (2 ** attempt))
+            pass
+
+        time.sleep(sleep_base * (2 ** attempt))
     return []
 
-def _collect_long_candidates(lang: str, target_total: int = 12, batch_size: int = 4, max_calls: int = 4) -> List[str]:
+
+def _collect_long_candidates(
+    lang: str,
+    target_total: int = 12,
+    batch_size: int = 4,
+    max_calls: int = 4
+) -> List[str]:
     """Coleta mini-discursos longos em chamadas menores para aumentar diversidade e confiabilidade."""
     prompts = {
         "en": (
             "Write {n} distinct motivational mini-speeches in English. "
             "Each MUST have 40–55 words (~20 seconds narration). "
-            "Vary tone and content (no paraphrases). "
+            "Avoid clichés and previous phrasing; vary imagery, rhythm, and structure. "
             "Return ONLY a JSON array of strings."
         ),
         "pt": (
             "Escreva {n} mini-discursos motivacionais em português. "
             "Cada um DEVE ter entre 40 e 55 palavras (~20 segundos de narração). "
-            "Varie o tom e o conteúdo (sem paráfrases). "
+            "Evite clichês e repetições; varie imagens, ritmo e estrutura. "
             "Retorne APENAS um array JSON de strings."
         ),
     }
@@ -159,7 +210,7 @@ def _collect_long_candidates(lang: str, target_total: int = 12, batch_size: int 
     calls = min(max_calls, max(1, (target_total + batch_size - 1) // batch_size))
     for _ in range(calls):
         prompt = prompt_tpl.format(n=batch_size)
-        items = _ask_gemini_list(prompt, temperature=1.05, tries=2)
+        items = _ask_gemini_list(prompt, temperature=1.05, tries=3)
         for it in items:
             itc = _clean_line(it)
             if itc and itc not in all_items:
@@ -167,6 +218,7 @@ def _collect_long_candidates(lang: str, target_total: int = 12, batch_size: int 
         if len(all_items) >= target_total:
             break
     return all_items
+
 
 def _pick_new(pool: List[str], used: Set[str], prefix: str, min_words: int, max_words: int) -> Optional[str]:
     """Escolhe aleatoriamente uma frase do pool que ainda não foi usada e está no range de palavras."""
@@ -178,105 +230,115 @@ def _pick_new(pool: List[str], used: Set[str], prefix: str, min_words: int, max_
             return c
     return None
 
+
 # -----------------------------------------------------------------------------
-# Geradores pedidos
+# Geradores principais (com retries para garantir novidade)
 # -----------------------------------------------------------------------------
-def gerar_prompt_paisagem(idioma="en") -> str:
+def gerar_prompt_paisagem(idioma: str = "en") -> str:
     """
     Gera uma descrição curta de paisagem (≤7 palavras), evitando repetição via cache.
+    Faz até 3 tentativas para conseguir **algo novo**; se não, usa fallback.
     """
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ Chave API do Gemini (GEMINI_API_KEY) não configurada no .env.")
         return "Mountains at sunrise" if _lang_tag(idioma) == "en" else "Montanhas ao nascer do sol"
 
     used_phrases = load_used_phrases()
-    try:
-        logger.info("Gerando prompt de paisagem com Gemini em %s.", idioma)
-        if _lang_tag(idioma) == "en":
-            prompt_text = (
-                "Create 10 short descriptions of beautiful landscapes. "
-                "Each line ≤ 7 words. Return a JSON array of strings."
-            )
-        else:
-            prompt_text = (
-                "Crie 10 descrições curtas de paisagens bonitas. "
-                "Cada linha ≤ 7 palavras. Retorne um array JSON de strings."
-            )
+    lang = _lang_tag(idioma)
 
-        descricoes = _ask_gemini_list(prompt_text, temperature=0.9, tries=2)
-        # Filtro de tamanho
-        descricoes = [d for d in descricoes if len(d.split()) <= 7]
+    for attempt in range(3):
+        try:
+            logger.info("Gerando prompt de paisagem com Gemini em %s. (tentativa %d/3)", idioma, attempt + 1)
+            if lang == "en":
+                prompt_text = (
+                    "Create 10 short descriptions of beautiful landscapes. "
+                    "Each line ≤ 7 words. Return a JSON array of strings."
+                )
+            else:
+                prompt_text = (
+                    "Crie 10 descrições curtas de paisagens bonitas. "
+                    "Cada linha ≤ 7 palavras. Retorne um array JSON de strings."
+                )
 
-        if not descricoes:
-            raise ValueError("Nenhuma descrição válida retornada.")
+            descricoes = _ask_gemini_list(prompt_text, temperature=0.9, tries=3)
+            descricoes = [d for d in descricoes if len(d.split()) <= 7]
 
-        # Dedup por cache (sem prefixo para manter compat)
-        novas_descricoes = [d for d in descricoes if _md5(d) not in used_phrases]
-        if not novas_descricoes:
-            logger.warning("Nenhum novo prompt disponível. Reutilizando padrão.")
-            return "Mountains at sunrise" if _lang_tag(idioma) == "en" else "Montanhas ao nascer do sol"
+            if descricoes:
+                novas_descricoes = [d for d in descricoes if _md5(d) not in used_phrases]
+                if novas_descricoes:
+                    descricao_escolhida = random.choice(novas_descricoes)
+                    used_phrases.add(_md5(descricao_escolhida))
+                    save_used_phrases(used_phrases)
+                    logger.info("📷 Prompt gerado para imagem: %s", descricao_escolhida)
+                    return descricao_escolhida
 
-        descricao_escolhida = random.choice(novas_descricoes)
-        used_phrases.add(_md5(descricao_escolhida))
-        save_used_phrases(used_phrases)
-        logger.info("📷 Prompt gerado para imagem: %s", descricao_escolhida)
-        return descricao_escolhida
+            time.sleep(0.6 * (attempt + 1))
 
-    except Exception as e:
-        logger.error("Erro ao gerar prompt da paisagem com Gemini: %s", str(e))
-        return "Mountains at sunrise" if _lang_tag(idioma) == "en" else "Montanhas ao nascer do sol"
+        except Exception as e:
+            logger.warning("Falha ao gerar prompt de paisagem (tentativa %d): %s", attempt + 1, e)
+            time.sleep(0.6 * (attempt + 1))
 
-def gerar_frase_motivacional(idioma="en") -> str:
+    logger.warning("Nenhum novo prompt disponível. Reutilizando padrão.")
+    return "Mountains at sunrise" if lang == "en" else "Montanhas ao nascer do sol"
+
+
+def gerar_frase_motivacional(idioma: str = "en") -> str:
     """
     Gera uma frase motivacional curta (≤15 palavras), evitando repetição.
+    Faz até 3 tentativas para conseguir **algo novo**; se não, usa fallback.
     """
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ Chave API do Gemini (GEMINI_API_KEY) não configurada no .env.")
         return "You are stronger than you think." if _lang_tag(idioma) == "en" else "Você é mais forte do que imagina."
 
     used_phrases = load_used_phrases()
-    try:
-        logger.info("Gerando frase motivacional com Gemini em %s.", idioma)
-        if _lang_tag(idioma) == "en":
-            prompt_text = (
-                "Create 10 motivational phrases in English, each ≤ 15 words. "
-                "Return a JSON array of strings."
-            )
-        else:
-            prompt_text = (
-                "Crie 10 frases motivacionais em português, cada uma com ≤ 15 palavras. "
-                "Retorne um array JSON de strings."
-            )
+    lang = _lang_tag(idioma)
 
-        frases = _ask_gemini_list(prompt_text, temperature=0.95, tries=2)
-        # valida tamanho
-        frases = [f for f in frases if len(f.split()) <= 15]
+    for attempt in range(3):
+        try:
+            logger.info("Gerando frase motivacional com Gemini em %s. (tentativa %d/3)", idioma, attempt + 1)
+            if lang == "en":
+                prompt_text = (
+                    "Create 10 motivational phrases in English, each ≤ 15 words. "
+                    "Return a JSON array of strings."
+                )
+            else:
+                prompt_text = (
+                    "Crie 10 frases motivacionais em português, cada uma com ≤ 15 palavras. "
+                    "Retorne um array JSON de strings."
+                )
 
-        if not frases:
-            raise ValueError("Nenhuma frase válida retornada.")
+            frases = _ask_gemini_list(prompt_text, temperature=0.95, tries=3)
+            frases = [f for f in frases if len(f.split()) <= 15]
 
-        novas_frases = [f for f in frases if _md5(f) not in used_phrases]
-        if not novas_frases:
-            logger.warning("Nenhuma nova frase disponível. Reutilizando padrão.")
-            return "You are stronger than you think." if _lang_tag(idioma) == "en" else "Você é mais forte do que imagina."
+            if frases:
+                novas_frases = [f for f in frases if _md5(f) not in used_phrases]
+                if novas_frases:
+                    frase_escolhida = random.choice(novas_frases)
+                    used_phrases.add(_md5(frase_escolhida))
+                    save_used_phrases(used_phrases)
+                    logger.info("🧠 Frase motivacional escolhida: %s", frase_escolhida)
+                    return frase_escolhida
 
-        frase_escolhida = random.choice(novas_frases)
-        used_phrases.add(_md5(frase_escolhida))
-        save_used_phrases(used_phrases)
-        logger.info("🧠 Frase motivacional escolhida: %s", frase_escolhida)
-        return frase_escolhida
+            time.sleep(0.6 * (attempt + 1))
 
-    except Exception as e:
-        logger.error("Erro ao gerar frase motivacional com Gemini: %s", str(e))
-        return "You are stronger than you think." if _lang_tag(idioma) == "en" else "Você é mais forte do que imagina."
+        except Exception as e:
+            logger.warning("Falha ao gerar frase curta (tentativa %d): %s", attempt + 1, e)
+            time.sleep(0.6 * (attempt + 1))
 
-def gerar_frase_motivacional_longa(idioma="en") -> str:
+    logger.warning("Nenhuma nova frase disponível. Reutilizando padrão.")
+    return "You are stronger than you think." if lang == "en" else "Você é mais forte do que imagina."
+
+
+def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
     """
     Gera um mini-discurso motivacional (~40–55 palavras) evitando repetição.
-    Estratégia:
-      - Coleta em lotes pequenos (4 por chamada), até 16 opções.
+    Estratégia com retries:
+      - Até 3 RODADAS; em cada rodada coletamos lotes pequenos (4 por chamada),
+        buscando 12 opções (com variação).
       - Filtra por tamanho (preferido 40–55; tolerância 35–65).
       - Escolhe uma ainda não usada (cache prefixado LONG::).
+      - Backoff leve entre rodadas.
     """
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ Chave API do Gemini (GEMINI_API_KEY) não configurada no .env.")
@@ -290,48 +352,51 @@ def gerar_frase_motivacional_longa(idioma="en") -> str:
     prefix = "LONG::"
     lang = _lang_tag(idioma)
 
-    try:
-        logger.info("Gerando frases motivacionais longas (%s).", "EN" if lang == "en" else "PT-BR")
-        # 1) Coletar candidatos em múltiplas chamadas curtas
-        candidates = _collect_long_candidates(lang=lang, target_total=12, batch_size=4, max_calls=4)
+    for round_idx in range(1, 4):  # até 3 rodadas completas
+        try:
+            logger.info("Gerando frases motivacionais longas (%s). Rodada %d/3", "EN" if lang == "en" else "PT-BR", round_idx)
+            candidates = _collect_long_candidates(lang=lang, target_total=12, batch_size=4, max_calls=4)
 
-        # 2) Normalizar e filtrar por tamanho
-        candidates = [_clean_line(c) for c in candidates if _clean_line(c)]
-        ideal = [c for c in candidates if 40 <= len(c.split()) <= 55]
-        tolerant = [c for c in candidates if 35 <= len(c.split()) <= 65]
+            candidates = [_clean_line(c) for c in candidates if _clean_line(c)]
+            ideal = [c for c in candidates if 40 <= len(c.split()) <= 55]
+            tolerant = [c for c in candidates if 35 <= len(c.split()) <= 65]
 
-        def pick(pool: List[str]) -> Optional[str]:
-            return _pick_new(pool, used, prefix=prefix, min_words=35, max_words=65)
+            def pick(pool: List[str]) -> Optional[str]:
+                return _pick_new(pool, used, prefix=prefix, min_words=35, max_words=65)
 
-        chosen = pick(ideal) or pick(tolerant)
+            chosen = pick(ideal) or pick(tolerant)
 
-        # 3) Segunda rodada extra se nada sobrou
-        if not chosen:
-            logger.info("Todas repetidas/inválidas. Tentando nova chamada ao modelo…")
-            extra = _collect_long_candidates(lang=lang, target_total=4, batch_size=4, max_calls=1)
-            extra = [_clean_line(c) for c in extra if _clean_line(c)]
-            extra_ideal = [c for c in extra if 40 <= len(c.split()) <= 55]
-            extra_tol = [c for c in extra if 35 <= len(c.split()) <= 65]
-            chosen = pick(extra_ideal) or pick(extra_tol)
+            if not chosen:
+                logger.info("Todas repetidas/inválidas nesta rodada. Tentando coleta extra…")
+                extra = _collect_long_candidates(lang=lang, target_total=4, batch_size=4, max_calls=1)
+                extra = [_clean_line(c) for c in extra if _clean_line(c)]
+                extra_ideal = [c for c in extra if 40 <= len(c.split()) <= 55]
+                extra_tol = [c for c in extra if 35 <= len(c.split()) <= 65]
+                chosen = pick(extra_ideal) or pick(extra_tol)
 
-        if not chosen:
-            raise ValueError("Nenhuma frase longa nova adequada foi gerada.")
+            if chosen:
+                used.add(_hash_key(chosen, prefix=prefix))
+                save_used_phrases(used)
+                logger.info("🧠 Frase motivacional longa escolhida: %s", chosen[:100] + "..." if len(chosen) > 100 else chosen)
+                return chosen
 
-        used.add(_hash_key(chosen, prefix=prefix))
-        save_used_phrases(used)
-        logger.info("🧠 Frase motivacional longa escolhida: %s", chosen[:100] + "..." if len(chosen) > 100 else chosen)
-        return chosen
+            # backoff entre rodadas
+            time.sleep(1.2 * round_idx)
 
-    except Exception as e:
-        logger.error("Erro ao gerar frases longas com Gemini: %s", e)
-        return (
-            "You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams."
-            if lang == "en" else
-            "Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos."
-        )
+        except Exception as e:
+            logger.warning("Rodada %d falhou: %s", round_idx, e)
+            time.sleep(1.2 * round_idx)
+
+    logger.error("Erro ao gerar frases longas com Gemini: esgotou retries.")
+    return (
+        "You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams."
+        if lang == "en" else
+        "Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos."
+    )
+
 
 # -----------------------------------------------------------------------------
-# Utilidades existentes
+# Utilidades existentes (mantidas)
 # -----------------------------------------------------------------------------
 def quebrar_em_duas_linhas(frase: str) -> str:
     """
@@ -367,13 +432,11 @@ def quebrar_em_duas_linhas(frase: str) -> str:
         len2 = comp_len(linha2)
         diferenca = abs(len1 - len2)
 
-        # Penaliza terminar/começar com palavras curtas
         if linha1[-1].lower().strip("".join(pontos)) in pequenos:
             diferenca += 8
         if linha2[0].lower().strip("".join(pontos)) in pequenos:
             diferenca += 10
 
-        # Recompensa quebra após pontuação
         if any(linha1[-1].endswith(p) for p in pontos):
             diferenca -= 5
 
@@ -385,6 +448,7 @@ def quebrar_em_duas_linhas(frase: str) -> str:
         return frase
 
     return f'{" ".join(palavras[:melhor_divisao])}\n{" ".join(palavras[melhor_divisao:])}'
+
 
 def gerar_slug(texto: str, limite: int = 30) -> str:
     """
@@ -399,5 +463,5 @@ def gerar_slug(texto: str, limite: int = 30) -> str:
         logger.info("🔗 Slug gerado: %s", slug)
         return slug
     except Exception as e:
-        logger.error("Erro ao gerar slug: %s", str(e))
+        logger.error("Erro ao gerar slug: %s", e)
         return "default_slug"
