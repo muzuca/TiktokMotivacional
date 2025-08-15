@@ -1,18 +1,18 @@
 # utils/video.py
-
 import os
 import re
-import math
-import glob
 import logging
 import datetime
 import shutil
 import subprocess
+import uuid
 from typing import Optional, List, Tuple
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from .frase import gerar_frase_motivacional_longa
 from .audio import obter_caminho_audio, gerar_narracao_tts
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,11 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
-
-# =============================================================================
-# Presets de encode
-# =============================================================================
+# -------------------- Presets / Constantes --------------------
 PRESETS = {
     "sd":     {"w": 540,  "h": 960,  "br_v": "1400k", "br_a": "128k", "level": "3.1"},
     "hd":     {"w": 720,  "h": 1280, "br_v": "2200k", "br_a": "128k", "level": "3.1"},
@@ -33,33 +29,65 @@ PRESETS = {
 }
 
 DURACAO_MAXIMA_VIDEO = 20.0
-FPS = 30
+FPS_OUT = 30
 AUDIO_SR = 44100
 
-# Caminhos RELATIVOS simples
+IMAGES_DIR = os.getenv("IMAGES_DIR", "imagens")
+AUDIO_DIR  = os.getenv("AUDIO_DIR", "audios")
+AUDIO_TTS_DIR = os.path.join(AUDIO_DIR, "tts")
+
 FONTS_DIR = "fonts"
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(IMAGES_DIR, exist_ok=True)
+os.makedirs(AUDIO_TTS_DIR, exist_ok=True)
 
-# =============================================================================
-# Utilidades gerais
-# =============================================================================
-def _nome_limpo(base: str) -> str:
-    base = (base or "video").strip().lower()
-    base = re.sub(r"\s+", "-", base)
-    base = re.sub(r"[^a-z0-9\-_]", "", base)
-    return base or "video"
+# -------------------- ENV --------------------
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+BG_MIX_VOLUME      = _env_float("BG_MIX_VOLUME", 0.10)
+DEFAULT_TRANSITION = os.getenv("TRANSITION", "fade").strip().lower()
+
+# Intensidades de movimento
+KENBURNS_ZOOM_MAX = _env_float("KENBURNS_ZOOM_MAX", 1.22)  # 22%
+PAN_ZOOM          = _env_float("PAN_ZOOM", 1.18)
+
+# FPS interno do movimento (capado para não travar máquina)
+_MOTION_FPS_ENV = _env_int("MOTION_FPS", 45)
+MOTION_FPS = max(24, min(90, _MOTION_FPS_ENV))
+if MOTION_FPS != _MOTION_FPS_ENV:
+    logger.info("ℹ️ MOTION_FPS ajustado para %d (cap 24..90).", MOTION_FPS)
+
+# Whisper (opcional — só para sincronizar legendas com a fala)
+WHISPER_ENABLE = os.getenv("WHISPER_ENABLE", "0").strip().lower() in ("1", "true", "yes")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+WHISPER_VAD = os.getenv("WHISPER_VAD", "1").strip().lower() in ("1", "true", "yes")
+WHISPER_MODEL_CACHE = os.getenv("WHISPER_MODEL_CACHE", "./whisper_models")
+
+# -------------------- Helpers --------------------
 def _ffmpeg_or_die() -> str:
     path = shutil.which("ffmpeg")
     if not path:
-        raise RuntimeError("ffmpeg não encontrado no PATH. Instale o FFmpeg.")
+        raise RuntimeError("ffmpeg não encontrado no PATH.")
     return path
 
 def _ffprobe_or_die() -> str:
     path = shutil.which("ffprobe")
     if not path:
-        raise RuntimeError("ffprobe não encontrado no PATH. Instale o FFmpeg (inclui ffprobe).")
+        raise RuntimeError("ffprobe não encontrado no PATH.")
     return path
 
 def _idioma_norm(idioma: str) -> str:
@@ -67,6 +95,8 @@ def _idioma_norm(idioma: str) -> str:
     return "pt" if s.startswith("pt") else "en"
 
 def _duracao_audio_segundos(audio_path: str) -> Optional[float]:
+    if not audio_path or not os.path.isfile(audio_path):
+        return None
     try:
         ffprobe = _ffprobe_or_die()
         out = subprocess.check_output(
@@ -82,34 +112,133 @@ def _duracao_audio_segundos(audio_path: str) -> Optional[float]:
         return None
 
 def _ff_normpath(path: str) -> str:
-    """Gera caminho RELATIVO com '/' (estável no Windows para filtergraph)."""
     try:
         rel = os.path.relpath(path)
     except Exception:
         rel = path
     return rel.replace("\\", "/")
 
-def _clear_drawtext_cache():
-    """Remove cache/drawtext_*.txt antigos para evitar lixo."""
-    for f in glob.glob(os.path.join(CACHE_DIR, "drawtext_*.txt")):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
+def _uuid_suffix() -> str:
+    return uuid.uuid4().hex[:8]
 
-# =============================================================================
-# Tipografia / estilos
-# =============================================================================
+def _stage_to_dir(src_path: str, target_dir: str, prefix: str) -> str:
+    """
+    Copia o arquivo para 'target_dir' com um nome temporário seguro,
+    e retorna o caminho do arquivo encenado (staged).
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(src_path))
+    dst_name = f"{prefix}_{base}_{_uuid_suffix()}{ext or '.jpg'}"
+    dst_path = os.path.join(target_dir, dst_name)
+    shutil.copy2(src_path, dst_path)
+    return dst_path
+
+# ---------- Segmentação para legendas ----------
+import re as _re
+def _tokenize_words(text: str) -> List[str]:
+    text = _re.sub(r"[\r\n]+", " ", (text or "")).strip()
+    tokens = _re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text)
+    return [t for t in tokens if t]
+
+def _chunk_words(tokens: List[str]) -> List[List[str]]:
+    chunks: List[List[str]] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        take = 3
+        long_word = any(len(tokens[j]) >= 10 for j in range(i, min(i + 3, n)))
+        if long_word:
+            take = 2
+        if i + take > n:
+            take = max(1, n - i)
+        chunk = tokens[i:i + take]
+        chunks.append(chunk)
+        i += take
+    return chunks
+
+def _distribuir_duracoes_por_palavra(frases: List[str], total_disp: float) -> List[float]:
+    if not frases:
+        return []
+    min_seg, max_seg = 0.7, 3.0
+    pesos = [max(1, len(f.split())) for f in frases]
+    soma = sum(pesos)
+    brutas = [(p / soma) * total_disp for p in pesos]
+    clamped = [min(max(b, min_seg), max_seg) for b in brutas]
+    fator = min(1.0, (total_disp / sum(clamped))) if sum(clamped) > 0 else 1.0
+    return [d * fator for d in clamped]
+
+def _segmentos_legenda_palavras(texto: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
+    tokens = _tokenize_words(texto)
+    if not tokens:
+        return []
+    chunks = _chunk_words(tokens)
+    lines = [" ".join(ch).upper() for ch in chunks]
+    alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
+    gap = 0.10
+    duracoes = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
+    t = 0.25
+    segs: List[Tuple[float, float, str]] = []
+    for line, d in zip(lines, duracoes):
+        ini = t
+        fim = t + d
+        segs.append((ini, fim, line))
+        t = fim + gap
+    return segs
+
+def _segmentos_via_whisper(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]:
+    if not WHISPER_ENABLE:
+        return []
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        logger.warning("WHISPER_ENABLE=1 mas 'faster-whisper' não está disponível: %s", e)
+        return []
+    lang_code = "pt" if (idioma or "").lower().startswith("pt") else "en"
+    try:
+        logger.info("🧩 Whisper: carregando modelo '%s' (%s, %s) ...", WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
+        model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE, download_root=WHISPER_MODEL_CACHE)
+        segments, _info = model.transcribe(audio_path, language=lang_code, beam_size=WHISPER_BEAM_SIZE, vad_filter=WHISPER_VAD, word_timestamps=True)
+        words = []
+        for seg in segments:
+            if getattr(seg, "words", None):
+                for w in seg.words:
+                    if w.word and w.start is not None and w.end is not None:
+                        token = _re.sub(r"\s+", "", w.word)
+                        if token:
+                            words.append((float(w.start), float(w.end), token))
+        if not words:
+            logger.warning("Whisper não retornou palavras com timestamp. Usando heurística.")
+            return []
+        out: List[Tuple[float, float, str]] = []
+        i, n = 0, len(words)
+        while i < n:
+            take = 3
+            if any(len(words[j][2]) >= 10 for j in range(i, min(i + 3, n))):
+                take = 2
+            if i + take > n:
+                take = max(1, n - i)
+            chunk = words[i:i + take]
+            ini, fim = chunk[0][0], chunk[-1][1]
+            texto = " ".join([w[2] for w in chunk]).upper()
+            if ini < DURACAO_MAXIMA_VIDEO and fim > 0:
+                ini2 = max(0.20, ini)
+                fim2 = min(DURACAO_MAXIMA_VIDEO - 0.05, fim)
+                if fim2 > ini2 + 0.12:
+                    out.append((ini2, fim2, texto))
+            i += take
+        out = [(s, e, t) for (s, e, t) in out if s < DURACAO_MAXIMA_VIDEO]
+        logger.info("📝 %d segmentos via Whisper.", len(out))
+        return out
+    except Exception as e:
+        logger.warning("Falha na sincronia via Whisper: %s. Usando heurística.", e)
+        return []
+
+# ---------------- estilos de legenda ----------------
 VIDEO_STYLES = {
     "1": {"key": "minimal_compact", "label": "Compact (sem caixa, contorno fino)"},
     "2": {"key": "clean_outline",   "label": "Clean (um pouco maior)"},
     "3": {"key": "tiny_outline",    "label": "Tiny (bem pequeno)"},
-    # apelidos aceitos
-    "classic": "1",
-    "modern":  "2",
-    "serif":   "2",
-    "clean":   "2",
-    "mono":    "3",
+    "classic": "1", "modern": "2", "serif": "2", "clean": "2", "mono": "3",
 }
 
 def _normalize_style(style: str) -> str:
@@ -117,9 +246,6 @@ def _normalize_style(style: str) -> str:
     if s in ("1", "2", "3"):
         return s
     return str(VIDEO_STYLES.get(s, "1"))
-
-def listar_estilos_video() -> List[Tuple[str, str]]:
-    return [(k, v["label"]) for k, v in VIDEO_STYLES.items() if k in ("1","2","3")]
 
 def _first_existing_font(*names: str) -> Optional[str]:
     for n in names:
@@ -129,271 +255,42 @@ def _first_existing_font(*names: str) -> Optional[str]:
     return None
 
 def _pick_drawtext_font(style_key: str) -> Optional[str]:
-    """
-    classic/1: Montserrat-Regular → fallback BebasNeue-Regular (pedido seu)
-    """
     s = (style_key or "").lower()
     if s in ("classic", "1", "clean", "5"):
-        return _first_existing_font(
-            "Montserrat-Regular.ttf",
-            "BebasNeue-Regular.ttf",      # fallback direto
-            "Montserrat-Reegular.ttf",    # tolera typo
-            "Inter-Bold.ttf"
-        )
+        return _first_existing_font("Montserrat-Regular.ttf","Inter-Bold.ttf","BebasNeue-Regular.ttf")
     if s in ("modern", "2"):
-        return _first_existing_font("BebasNeue-Regular.ttf", "Inter-Bold.ttf", "Montserrat-ExtraBold.ttf")
+        return _first_existing_font("BebasNeue-Regular.ttf","Inter-Bold.ttf","Montserrat-ExtraBold.ttf")
     if s in ("serif", "3"):
-        return _first_existing_font("PlayfairDisplay-Regular.ttf", "Cinzel-Bold.ttf")
+        return _first_existing_font("PlayfairDisplay-Regular.ttf","Cinzel-Bold.ttf")
     if s in ("mono", "4"):
-        return _first_existing_font("Inter-Bold.ttf", "Montserrat-Regular.ttf")
-    return _first_existing_font("Montserrat-Regular.ttf", "BebasNeue-Regular.ttf", "Inter-Bold.ttf")
+        return _first_existing_font("Inter-Bold.ttf","Montserrat-Regular.ttf")
+    return _first_existing_font("Montserrat-Regular.ttf","Inter-Bold.ttf","BebasNeue-Regular.ttf")
 
-# =============================================================================
-# Legendas sincronizadas — via faster-whisper (ASR no TTS)
-# =============================================================================
-_ASR_MODEL = None
-def _load_asr_model():
-    global _ASR_MODEL
-    if _ASR_MODEL is not None:
-        return _ASR_MODEL
-    try:
-        from faster_whisper import WhisperModel
-    except Exception as e:
-        logger.warning("faster-whisper não disponível: %s", e)
-        _ASR_MODEL = False
-        return _ASR_MODEL
-
-    model_size = os.getenv("WHISPER_MODEL", "base")
-    device = os.getenv("WHISPER_DEVICE", None)
-    if not device:
-        # usa CUDA se disponível
-        device = "cuda" if shutil.which("nvidia-smi") else "cpu"
-    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16" if device == "cuda" else "int8")
-
-    try:
-        _ASR_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
-        logger.info("🗣️ faster-whisper carregado: model=%s device=%s compute=%s", model_size, device, compute_type)
-    except Exception as e:
-        logger.warning("Falha ao carregar faster-whisper (%s). Usando fallback simples.", e)
-        _ASR_MODEL = False
-    return _ASR_MODEL
-
-def _clean_token(tok: str) -> str:
-    # mantém letras, números e apóstrofo; remove pontuação solta
-    t = re.sub(r"[^\w'’\-]+", "", tok, flags=re.UNICODE)
-    return t
-
-def _asr_word_segments(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]:
-    """
-    Retorna [(start, end, word), ...] em CAIXA ALTA usando faster-whisper.
-    Se indisponível/falha, retorna lista vazia (caller faz fallback).
-    """
-    model = _load_asr_model()
-    if not model:
-        return []
-
-    lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
-
-    try:
-        # Config: word timestamps e VAD ajudam a segmentar melhor
-        segments, info = model.transcribe(
-            audio_path,
-            language=lang,
-            beam_size=5,
-            vad_filter=True,
-            word_timestamps=True
-        )
-        words: List[Tuple[float, float, str]] = []
-        for seg in segments:
-            if not getattr(seg, "words", None):
-                continue
-            for w in seg.words:
-                if w.start is None or w.end is None:
-                    continue
-                token = _clean_token(getattr(w, "word", "") or "")
-                if not token:
-                    continue
-                words.append((float(w.start), float(w.end), token.upper()))
-        return words
-    except Exception as e:
-        logger.warning("ASR (faster-whisper) falhou: %s", e)
-        return []
-
-def _chunk_asr_words(words: List[Tuple[float, float, str]]) -> List[Tuple[float, float, str]]:
-    """
-    Junta palavras ASR em blocos de 2–3 palavras com tempos reais.
-    Regras:
-      - Se houver palavra longa (>=10 chars) no trio, usa 2 em vez de 3.
-      - Garante duração mínima ~0.55s (merge simples com próximo).
-    """
-    if not words:
-        return []
-
-    chunks: List[Tuple[float, float, str]] = []
-    i = 0
-    n = len(words)
-    while i < n:
-        take = 3
-        # se houver palavra muito longa no próximo trio, reduz
-        has_long = any(len(words[j][2]) >= 10 for j in range(i, min(i+3, n)))
-        if has_long:
-            take = 2
-        if i + take > n:
-            take = max(1, n - i)
-
-        group = words[i:i+take]
-        start = group[0][0]
-        end = group[-1][1]
-        text = " ".join(w[2] for w in group)
-        chunks.append((start, end, text))
-        i += take
-
-    # saneia durações muito curtas juntando com próximo
-    j = 0
-    MIN_DUR = 0.55
-    while j < len(chunks) - 1:
-        s, e, t = chunks[j]
-        if (e - s) < MIN_DUR:
-            s2, e2, t2 = chunks[j+1]
-            # tenta expandir até o início do próximo bloco
-            if s2 - e > 0.05:
-                e = min(e + 0.05, s2 - 0.02)
-            # se ainda curto, faz merge
-            if (e - s) < MIN_DUR:
-                chunks[j] = (s, e2, f"{t} {t2}")
-                del chunks[j+1]
-                continue
-            else:
-                chunks[j] = (s, e, t)
-        j += 1
-
-    return chunks
-
-# ---------- Fallback (sem ASR): proporcional por palavras ----------
-def _tokenize_words(text: str) -> List[str]:
-    text = re.sub(r"[\r\n]+", " ", text).strip()
-    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text)
-    return [t for t in tokens if t]
-
-def _chunk_words_simple(tokens: List[str]) -> List[str]:
-    lines: List[str] = []
-    i = 0
-    n = len(tokens)
-    while i < n:
-        take = 3
-        if any(len(tokens[j]) >= 10 for j in range(i, min(i + 3, n))):
-            take = 2
-        if i + take > n:
-            take = max(1, n - i)
-        lines.append(" ".join(tokens[i:i+take]).upper())
-        i += take
-    return lines
-
-def _distribuir_duracoes_por_palavra(blocos: List[str], total_disp: float) -> List[float]:
-    if not blocos:
-        return []
-    min_seg, max_seg = 0.7, 3.0
-    pesos = [max(1, len(b.split())) for b in blocos]
-    soma = sum(pesos)
-    brutas = [(p / soma) * total_disp for p in pesos]
-    clamped = [min(max(b, min_seg), max_seg) for b in brutas]
-    fator = min(1.0, (total_disp / sum(clamped))) if sum(clamped) > 0 else 1.0
-    return [d * fator for d in clamped]
-
-def _segmentos_fallback_por_palavras(texto: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
-    tokens = _tokenize_words(texto)
-    if not tokens:
-        return []
-    lines = _chunk_words_simple(tokens)
-    alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
-    gap = 0.10
-    durs = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
-    t = 0.25
-    segs: List[Tuple[float, float, str]] = []
-    for line, d in zip(lines, durs):
-        ini = t
-        fim = t + d
-        segs.append((ini, fim, line))
-        t = fim + gap
-    return segs
-
-def _segmentos_legenda_sincronizados(audio_path: str, texto: str, idioma: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
-    """
-    Usa faster-whisper (se disponível) para sincronizar em 2–3 palavras por bloco.
-    Cai no fallback proporcional se falhar.
-    """
-    words = _asr_word_segments(audio_path, idioma)
-    if not words:
-        logger.info("⚠️ ASR indisponível/falhou — usando fallback proporcional por palavras.")
-        return _segmentos_fallback_por_palavras(texto, duracao_audio)
-
-    chunks = _chunk_asr_words(words)
-
-    # recorta/limita ao intervalo útil do vídeo
-    MAX_END = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.2, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.1))
-    t0 = 0.25  # desloca levemente para evitar aparecer no frame 0
-    segs: List[Tuple[float, float, str]] = []
-    for (s, e, txt) in chunks:
-        ini = max(t0, float(s) + 0.0)
-        fim = float(e) + 0.02
-        if fim <= t0 or ini >= MAX_END:
-            continue
-        ini = max(ini, t0)
-        fim = min(fim, MAX_END)
-        if fim - ini >= 0.45:  # descarta restos muito curtos
-            segs.append((ini, fim, txt.upper()))
-
-    # Se por algum motivo ficou vazio após cortes, volta ao fallback
-    if not segs:
-        logger.info("⚠️ Nenhum segmento útil após corte — usando fallback proporcional.")
-        return _segmentos_fallback_por_palavras(texto, duracao_audio)
-
-    return segs
-
-# =============================================================================
-# Montagem do filtergraph (drawtext)
-# =============================================================================
 def _write_textfile(content: str, idx: int) -> str:
     path = os.path.join(CACHE_DIR, f"drawtext_{idx:02d}.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return path
 
-def _build_drawtext_chain(H: int,
-                          style_id: str,
-                          segments: List[Tuple[float, float, str]],
-                          font_path: Optional[str]) -> str:
-    """
-    Cadeia drawtext usando textfile= (estável no Windows).
-    Segmentos 1 linha; centralizados no rodapé; sem box; contorno fino.
-    """
+def _build_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, float, str]], font_path: Optional[str]) -> str:
     sid = _normalize_style(style_id)
-
-    if sid == "1":       # compacto
-        fs = max(18, int(H * 0.024))
-        borderw = 1
-        margin = max(48, int(H * 0.10))
-    elif sid == "2":     # um pouco maior
-        fs = max(18, int(H * 0.030))
-        borderw = 2
-        margin = max(54, int(H * 0.115))
-    else:                # tiny
-        fs = max(16, int(H * 0.023))
-        borderw = 1
-        margin = max(56, int(H * 0.12))
+    if sid == "1":
+        fs = max(20, int(H * 0.026)); borderw = 1; margin = max(48, int(H * 0.10))
+    elif sid == "2":
+        fs = max(20, int(H * 0.032)); borderw = 2; margin = max(54, int(H * 0.115))
+    else:
+        fs = max(18, int(H * 0.024)); borderw = 1; margin = max(56, int(H * 0.12))
 
     use_fontfile = (font_path and os.path.isfile(font_path))
+    font_opt = f":fontfile={_ff_normpath(font_path)}" if use_fontfile else ""
     if use_fontfile:
-        font_opt = f":fontfile={_ff_normpath(font_path)}"
         logger.info("🔤 drawtext usando fonte: %s", font_path)
     else:
-        font_opt = ""
-        logger.info("🔤 drawtext sem fontfile explícito (usando fonte do sistema).")
+        logger.info("🔤 drawtext sem fontfile explícito (fonte do sistema).")
 
     blocks = []
     for idx, (ini, fim, txt) in enumerate(segments, start=1):
-        tf_path = _write_textfile(txt, idx)
-        tf_posix = _ff_normpath(tf_path)
+        tf_posix = _ff_normpath(_write_textfile(txt, idx))
         block = (
             "drawtext="
             f"textfile={tf_posix}"
@@ -402,7 +299,7 @@ def _build_drawtext_chain(H: int,
             f":fontcolor=white"
             f":borderw={borderw}:bordercolor=black"
             f":box=0"
-            f":line_spacing=0"            # colado, sem espaço extra
+            f":line_spacing=0"
             f":x=(w-text_w)/2"
             f":y=h-(text_h+{margin})"
             f":enable='between(t,{ini:.3f},{fim:.3f})'"
@@ -410,149 +307,350 @@ def _build_drawtext_chain(H: int,
         blocks.append(block)
     return ",".join(blocks)
 
-# =============================================================================
-# Pipeline principal
-# =============================================================================
-def gerar_video(imagem_path: str,
-                saida_path: str,
-                preset: str = "hd",
-                idioma: str = "auto",
-                tts_engine: str = "gemini",
-                legendas: bool = True,
-                video_style: str = "1"):
-    """
-    Gera MP4 vertical:
-      - 30fps, H.264 yuv420p, AAC 44.1kHz
-      - +faststart; keyframe a cada 2s
-      - Duração máx. 20s
-      - Narração TTS (Gemini/ElevenLabs) + música de fundo
-      - (opcional) Legendas sincronizadas (ASR) em blocos de 2–3 palavras
-    """
-    if preset not in PRESETS:
-        logger.warning("Preset '%s' inválido. Usando 'hd'.", preset)
-        preset = "hd"
+# -------------------- Movimento (zoom/pan) --------------------
+def _smoothstep_expr(p: str) -> str:
+    # smoothstep: p*p*(3-2*p)
+    return f"(({p})*({p})*(3-2*({p})))"
 
-    if not os.path.isfile(imagem_path):
-        logger.error("❌ Imagem não encontrada: %s", imagem_path)
-        return
-
-    ffmpeg = _ffmpeg_or_die()
-    conf = PRESETS[preset]
-    W, H = conf["w"], conf["h"]
-    BR_V, BR_A, LEVEL = conf["br_v"], conf["br_a"], conf["level"]
-
-    # Nome de saída automático (se diretório)
-    if os.path.isdir(saida_path):
-        base = _nome_limpo(os.path.splitext(os.path.basename(imagem_path))[0])
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        saida_path = os.path.join(saida_path, f"{base}-{ts}.mp4")
-    os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
-
-    # Texto longo + TTS
-    long_text = gerar_frase_motivacional_longa(idioma)
-    lang_norm = _idioma_norm(idioma)
-    style_norm = _normalize_style(video_style)
-    logger.info("⚙️ Opções: legendas=%s | video_style='%s' (norm=%s)", legendas, video_style, style_norm)
-
-    voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
-    dur_voz = _duracao_audio_segundos(voice_audio_path) if voice_audio_path else None
-
-    # Música de fundo
-    background_audio_path: Optional[str] = None
-    try:
-        background_audio_path = obter_caminho_audio()
-    except Exception as e:
-        logger.warning("Sem áudio de fundo válido: %s", e)
-
-    has_voice = bool(voice_audio_path)
-    has_bg = bool(background_audio_path)
-
-    # Segmentos de legenda
-    segments: List[Tuple[float, float, str]] = []
-    _clear_drawtext_cache()
-    if legendas and has_voice:
-        segments = _segmentos_legenda_sincronizados(voice_audio_path, long_text, lang_norm, dur_voz or DURACAO_MAXIMA_VIDEO)
-        logger.info("📝 %d segmentos de legenda (sincronizados).", len(segments))
-
-    # Filtro de vídeo base
-    vf_base = (
-        f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
-        f"fps={FPS},format=yuv420p"
+def _kb_in(W: int, H: int, frames_this_slide: int) -> str:
+    # z = 1 + (Zmax-1)*smoothstep(p)
+    p = f"(on/{frames_this_slide})"
+    ps = _smoothstep_expr(p)
+    z = f"(1+({KENBURNS_ZOOM_MAX:.3f}-1)*{ps})"
+    return (
+        "zoompan="
+        f"z='{z}':"
+        "x='iw/2-(iw/zoom/2)':"
+        "y='ih/2-(ih/zoom/2)':"
+        "d=1:"
+        f"s={W}x{H}"
     )
 
-    # Inputs
-    cmd = [
-        ffmpeg, "-y",
-        "-loglevel", "error", "-stats",
-        "-loop", "1", "-i", imagem_path,  # 0:v
-    ]
-    if has_voice:
-        cmd.extend(["-i", voice_audio_path])      # 1:a
-    if has_bg:
-        cmd.extend(["-i", background_audio_path]) # 2:a
-    if not has_voice and not has_bg:
-        cmd.extend([
-            "-f", "lavfi", "-t", str(DURACAO_MAXIMA_VIDEO),
-            "-i", f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}"
-        ])  # 1:a (silêncio)
+def _kb_out(W: int, H: int, frames_this_slide: int) -> str:
+    # z = Zmax + (1-Zmax)*smoothstep(p)  (vai diminuindo até ~1)
+    p = f"(on/{frames_this_slide})"
+    ps = _smoothstep_expr(p)
+    z = f"({KENBURNS_ZOOM_MAX:.3f} + (1-{KENBURNS_ZOOM_MAX:.3f})*{ps})"
+    return (
+        "zoompan="
+        f"z='{z}':"
+        "x='iw/2-(iw/zoom/2)':"
+        "y='ih/2-(ih/zoom/2)':"
+        "d=1:"
+        f"s={W}x{H}"
+    )
 
-    # Parâmetros comuns de encode
-    common_out = [
-        "-t", str(DURACAO_MAXIMA_VIDEO),
-        "-r", str(FPS),
-        "-c:v", "libx264",
-        "-preset", "superfast",
-        "-tune", "stillimage",
-        "-b:v", BR_V,
-        "-maxrate", BR_V, "-bufsize", "6M",
-        "-profile:v", "high",
-        "-level", LEVEL,
-        "-c:a", "aac",
-        "-b:a", BR_A,
-        "-ar", str(AUDIO_SR),
-        "-ac", "2",
-        "-movflags", "+faststart",
-        "-x264-params", f"keyint={FPS*2}:min-keyint={FPS*2}:scenecut=0",
-        "-map_metadata", "-1",
-    ]
+def _pan_lr(W: int, H: int, frames_this_slide: int) -> str:
+    p = f"(on/{frames_this_slide})"
+    ps = _smoothstep_expr(p)
+    return (
+        "zoompan="
+        f"z={PAN_ZOOM:.3f}:"
+        f"x='(iw/zoom-ow)*{ps}':"
+        "y='(ih/zoom-oh)/2':"
+        "d=1:"
+        f"s={W}x{H}"
+    )
 
-    # Precisamos de filter_complex se houver drawtext (legendas) ou mix (voz+bg).
-    need_fc = bool(segments) or (has_voice and has_bg)
+def _pan_ud(W: int, H: int, frames_this_slide: int) -> str:
+    p = f"(on/{frames_this_slide})"
+    ps = _smoothstep_expr(p)
+    return (
+        "zoompan="
+        f"z={PAN_ZOOM:.3f}:"
+        "x='(iw/zoom-ow)/2':"
+        f"y='(ih/zoom-oh)*{ps}':"
+        "d=1:"
+        f"s={W}x{H}"
+    )
 
-    if need_fc:
-        # Cadeia de vídeo
-        vchain = f"[0:v]{vf_base}"
-        if segments:
-            font_for_sub = _pick_drawtext_font(video_style)
-            vchain += "," + _build_drawtext_chain(H, style_norm, segments, font_for_sub)
-        vchain += "[vout]"
+def _build_slide_branch(idx: int, W: int, H: int, motion: str, per_slide: float) -> str:
+    """
+    Cada slide vira CFR estável:
+      [input] -> zoompan/scale -> format -> setsar -> trim -> setpts -> fps=MOTION_FPS -> [v{idx}]
+    """
+    frames_slide = max(1, int(per_slide * MOTION_FPS))
+    m = (motion or "none").lower()
 
-        # Cadeia de áudio (mix ou direto)
-        if has_voice and has_bg:
-            # mix simples; se quiser ducking, podemos trocar por sidechaincompressor depois
-            achain = "[1:a]volume=1.0[va];[2:a]volume=0.15[ba];[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
-        else:
-            achain = "[1:a]anull[aout]"
-
-        cmd.extend([
-            "-filter_complex", f"{vchain};{achain}",
-            "-map", "[vout]", "-map", "[aout]",
-        ])
-        cmd.extend(common_out)
+    if m in ("kenburns_in", "kenburns-in", "zoom_in", "zoom-in", "2"):
+        motion_expr = _kb_in(W, H, frames_slide)
+        chain = f"[{idx}:v]{motion_expr}"
+    elif m in ("kenburns_out", "kenburns-out", "zoom_out", "zoom-out", "3"):
+        motion_expr = _kb_out(W, H, frames_slide)
+        chain = f"[{idx}:v]{motion_expr}"
+    elif m in ("pan_lr", "pan-left-right", "4", "pan left→right", "pan left->right"):
+        motion_expr = _pan_lr(W, H, frames_slide)
+        chain = f"[{idx}:v]{motion_expr}"
+    elif m in ("pan_ud", "pan-up-down", "5", "pan up→down", "pan up->down"):
+        motion_expr = _pan_ud(W, H, frames_slide)
+        chain = f"[{idx}:v]{motion_expr}"
     else:
-        # Sem legendas e sem mix — usa -vf direto e mapeia 1:a
-        cmd.extend(["-vf", vf_base, "-map", "0:v", "-map", "1:a"])
-        cmd.extend(common_out)
+        chain = (
+            f"[{idx}:v]"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black"
+        )
 
-    cmd.append(saida_path)
+    chain += (
+        f",format=yuv420p,setsar=1/1,"
+        f"trim=duration={per_slide:.6f},"
+        f"setpts=PTS-STARTPTS,"
+        f"fps={MOTION_FPS}[v{idx}]"
+    )
+    return chain
 
-    logger.info("📂 CWD no momento do ffmpeg: %s", os.getcwd())
-    logger.info("🎬 FFmpeg gerando %s (%dx%d, %s/%s, %dfps) → %s",
-                preset.upper(), W, H, BR_V, BR_A, FPS, saida_path)
+# -------------------- principal --------------------
+def gerar_video(
+    imagem_path: str,             # imagem de capa (será encenada em IMAGES_DIR)
+    saida_path: str,
+    *,
+    preset: str = "hd",
+    idioma: str = "auto",
+    tts_engine: str = "gemini",
+    legendas: bool = True,
+    video_style: str = "1",
+    motion: str = "none",
+    slides_paths: Optional[List[str]] = None,   # lista de imagens extras (serão encenadas em IMAGES_DIR)
+    transition: Optional[str] = None
+):
+    # Coleta para cleanup
+    staged_images: List[str] = []
+    staged_tts: Optional[str] = None
+    extra_to_cleanup: List[str] = []  # ex.: original TTS fora de audios/tts
 
     try:
+        if preset not in PRESETS:
+            logger.warning("Preset '%s' inválido. Usando 'hd'.", preset)
+            preset = "hd"
+
+        conf = PRESETS[preset]
+        W, H = conf["w"], conf["h"]
+        BR_V, BR_A, LEVEL = conf["br_v"], conf["br_a"], conf["level"]
+
+        # Normaliza lista de slides (inclui a capa se necessário)
+        if not slides_paths or not isinstance(slides_paths, list) or not any(os.path.isfile(p) for p in slides_paths):
+            slides_paths = [imagem_path]
+        slides_paths = [p for p in slides_paths if os.path.isfile(p)]
+        n_slides = max(1, min(10, len(slides_paths)))
+
+        ffmpeg = _ffmpeg_or_die()
+
+        # Texto longo + TTS
+        long_text = gerar_frase_motivacional_longa(idioma)
+        lang_norm = _idioma_norm(idioma)
+        style_norm = _normalize_style(video_style)
+
+        voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
+        dur_voz = _duracao_audio_segundos(voice_audio_path) if voice_audio_path else None
+
+        # === Stage do TTS para audios/tts (e vamos limpar depois) ===
+        if voice_audio_path and os.path.isfile(voice_audio_path):
+            try:
+                base, ext = os.path.splitext(os.path.basename(voice_audio_path))
+                staged_tts = os.path.join(AUDIO_TTS_DIR, f"{base}_{_uuid_suffix()}{ext or '.wav'}")
+                shutil.copy2(voice_audio_path, staged_tts)
+                # se o original estava em audios_tts/ raiz antiga, vamos limpar também
+                old_parent = os.path.basename(os.path.dirname(voice_audio_path)).lower()
+                if old_parent in ("audios_tts", "audio_tts"):
+                    extra_to_cleanup.append(voice_audio_path)
+                voice_audio_path = staged_tts  # usar o staged
+            except Exception as e:
+                logger.warning("Falha ao mover/copiar TTS para %s: %s. Usando original.", AUDIO_TTS_DIR, e)
+
+        # Música de fundo (não limpar depois)
+        background_audio_path: Optional[str] = None
+        try:
+            background_audio_path = obter_caminho_audio()
+        except Exception as e:
+            logger.warning("Sem áudio de fundo válido: %s", e)
+
+        has_voice = bool(voice_audio_path)
+        has_bg = bool(background_audio_path)
+
+        # Segmentos de legenda
+        segments: List[Tuple[float, float, str]] = []
+        if legendas and has_voice:
+            seg_whisper = _segmentos_via_whisper(voice_audio_path, lang_norm) if WHISPER_ENABLE else []
+            segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or DURACAO_MAXIMA_VIDEO)
+            logger.info("📝 %d segmentos de legenda.", len(segments))
+
+        # Duração alvo do vídeo
+        if segments:
+            total_video = min(DURACAO_MAXIMA_VIDEO, max(8.0, segments[-1][1] + 0.45))
+        elif dur_voz:
+            total_video = min(DURACAO_MAXIMA_VIDEO, max(8.0, dur_voz + 0.25))
+        else:
+            total_video = min(DURACAO_MAXIMA_VIDEO, 12.0)
+
+        # Durations por slide e transição
+        trans = transition or DEFAULT_TRANSITION or "fade"
+        per_slide = total_video / n_slides
+        trans_dur = max(0.50, min(0.90, per_slide * 0.135)) if n_slides > 1 else 0.0
+
+        logger.info("⚙️ legendas=%s | style='%s'(=%s) | motion=%s | slides=%d | transition=%s",
+                    bool(segments), video_style, style_norm, motion, n_slides, trans)
+        logger.info("⏱️ Durations: total≈%.2fs | slide≈%.3fs | trans=%.2fs | motion_fps=%d", total_video, per_slide, trans_dur, MOTION_FPS)
+
+        # === Stage de TODAS as imagens para IMAGES_DIR e usar só esses caminhos >>> limpeza no final ===
+        staged_inputs: List[str] = []
+        for p in slides_paths:
+            try:
+                staged = _stage_to_dir(p, IMAGES_DIR, "stage")
+                staged_inputs.append(staged)
+                staged_images.append(staged)  # marcar para limpar
+            except Exception as e:
+                logger.warning("Falha ao encenar imagem '%s': %s (ignorando este slide)", p, e)
+        if not staged_inputs:
+            raise RuntimeError("Nenhuma imagem disponível para montar o vídeo.")
+
+        # -------- construir filter_complex --------
+        parts: List[str] = []
+
+        # 1) Branch por slide
+        for i in range(len(staged_inputs)):
+            parts.append(_build_slide_branch(i, W, H, motion, per_slide))
+
+        # 2) Transições xfade (streams já CFR e com PTS zerado)
+        last_label = "[v0]"
+        if len(staged_inputs) >= 2:
+            offset = per_slide - trans_dur
+            out_label = ""
+            for idx in range(1, len(staged_inputs)):
+                out_label = f"[x{idx}]"
+                parts.append(
+                    f"{last_label}[v{idx}]xfade=transition={trans}:duration={trans_dur:.3f}:offset={offset:.3f}{out_label}"
+                )
+                last_label = out_label
+                offset += (per_slide - trans_dur)
+            final_video_label = out_label
+        else:
+            final_video_label = last_label
+
+        # 3) Normalização final + drawtext
+        parts.append(f"{final_video_label}format=yuv420p,setsar=1/1,fps={FPS_OUT}[vf]")
+
+        draw_chain = ""
+        if segments:
+            font_for_sub = _pick_drawtext_font(video_style)
+            draw_chain = _build_drawtext_chain(H, style_norm, segments, font_for_sub)
+
+        if draw_chain:
+            parts.append(f"[vf]{draw_chain},format=yuv420p[vout]")
+        else:
+            parts.append(f"[vf]format=yuv420p[vout]")
+
+        # 4) Áudio
+        if has_voice and has_bg:
+            va_idx = len(staged_inputs)
+            ba_idx = len(staged_inputs) + 1
+            parts.append(f"[{va_idx}:a]aresample={AUDIO_SR}:async=1[va]")
+            parts.append(f"[{ba_idx}:a]volume={BG_MIX_VOLUME},aresample={AUDIO_SR}:async=1[ba]")
+            parts.append(f"[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]")
+        elif has_voice or has_bg:
+            a_idx = len(staged_inputs)
+            parts.append(f"[{a_idx}:a]aresample={AUDIO_SR}:async=1[aout]")
+        else:
+            parts.append(f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}:d={total_video:.3f}[aout]")
+
+        filter_complex = ";".join(parts)
+
+        # dump do filtergraph para debug
+        fc_path = os.path.join(CACHE_DIR, "last_filter.txt")
+        with open(fc_path, "w", encoding="utf-8") as f:
+            f.write(filter_complex)
+        logger.info("🧩 filter_complex salvo em %s", fc_path)
+
+        # --------- montar comando ffmpeg ----------
+        cmd = [ffmpeg := _ffmpeg_or_die(), "-y", "-loglevel", "error", "-stats"]
+
+        # inputs de vídeo (um por slide) — sempre a partir dos encenados em IMAGES_DIR
+        for sp in staged_inputs:
+            cmd += ["-loop", "1", "-i", sp]
+
+        # inputs de áudio
+        if has_voice and voice_audio_path:
+            cmd += ["-i", voice_audio_path]
+        if has_bg and background_audio_path:
+            cmd += ["-i", background_audio_path]
+
+        # Saída — usar poucas threads ajuda a não travar
+        common_out = [
+            "-t", f"{total_video:.3f}",
+            "-r", str(FPS_OUT),
+            "-vsync", "cfr",
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264",
+            "-preset", "superfast",
+            "-tune", "stillimage",
+            "-b:v", BR_V,
+            "-maxrate", BR_V, "-bufsize", "6M",
+            "-profile:v", "high",
+            "-level", LEVEL,
+            "-c:a", "aac",
+            "-b:a", conf["br_a"],
+            "-ar", str(AUDIO_SR),
+            "-ac", "2",
+            "-movflags", "+faststart",
+            "-x264-params", f"keyint={FPS_OUT*2}:min-keyint={FPS_OUT*2}:scenecut=0",
+            "-map_metadata", "-1",
+            "-threads", "2",
+        ]
+
+        cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]"]
+        cmd += common_out
+
+        # saída
+        if os.path.isdir(saida_path):
+            base = os.path.splitext(os.path.basename(imagem_path))[0]
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            saida_path = os.path.join(saida_path, f"{base}-{ts}.mp4")
+        os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
+        cmd.append(saida_path)
+
+        logger.info("📂 CWD: %s", os.getcwd())
+        logger.info("🎬 FFmpeg: %s", " ".join(cmd))
+
         subprocess.run(cmd, check=True)
         logger.info("✅ Vídeo salvo: %s", saida_path)
+
     except subprocess.CalledProcessError as e:
-        logger.error("❌ FFmpeg falhou (%s).\nComando: %s", e, " ".join(cmd))
+        logger.error("❌ FFmpeg falhou (%s).", e)
+        # salva .bat para facilitar teste manual
+        bat_path = os.path.join(CACHE_DIR, "replay_ffmpeg.bat")
+        try:
+            with open(bat_path, "w", encoding="utf-8") as f:
+                # reconstruo o último comando do log, se possível
+                pass
+        except Exception:
+            pass
+        logger.info("📝 Para depurar, rode: %s", bat_path)
+        raise
+    finally:
+        # -------- LIMPEZA: imagens encenadas + TTS copiado + resíduos antigos --------
+        for fp in staged_images:
+            try:
+                if fp and os.path.isfile(fp):
+                    os.remove(fp)
+            except Exception as e:
+                logger.debug("Não consegui apagar imagem staged '%s': %s", fp, e)
+
+        if staged_tts and os.path.isfile(staged_tts):
+            try:
+                os.remove(staged_tts)
+            except Exception as e:
+                logger.debug("Não consegui apagar TTS staged '%s': %s", staged_tts, e)
+
+        for old in extra_to_cleanup:
+            try:
+                if old and os.path.isfile(old):
+                    os.remove(old)
+            except Exception as e:
+                logger.debug("Não consegui apagar TTS antigo '%s': %s", old, e)
+
+        # remove diretórios vazios opcionais
+        for d in (AUDIO_TTS_DIR,):
+            try:
+                if os.path.isdir(d) and not os.listdir(d):
+                    os.rmdir(d)
+            except Exception:
+                pass
