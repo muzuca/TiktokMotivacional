@@ -7,6 +7,7 @@ import logging
 from typing import List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 from dotenv import load_dotenv
 
@@ -15,7 +16,7 @@ from utils.frase import quebrar_em_duas_linhas
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -31,6 +32,26 @@ IMAGES_CACHE_FILE = os.path.join(CACHE_DIR, "used_images.json")
 FONTS_DIR = "fonts"
 IMAGENS_DIR = "imagens"
 os.makedirs(IMAGENS_DIR, exist_ok=True)
+
+USER_AGENT = "TiktokMotivacional/1.0 (+https://local)"
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    ph = os.getenv("PROXY_HOST")
+    if ph:
+        user = os.getenv("PROXY_USER", "")
+        pw = os.getenv("PROXY_PASS", "")
+        port = os.getenv("PROXY_PORT", "")
+        auth = f"{user}:{pw}@" if (user or pw) else ""
+        url = f"http://{auth}{ph}:{port}"
+        s.proxies.update({"http": url, "https": url})
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+_SESSION = _make_session()
 
 def load_used_images():
     if os.path.exists(IMAGES_CACHE_FILE):
@@ -116,14 +137,16 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, max_retries: int 
                 raise RuntimeError("PEXELS_API_KEY ausente.")
             headers = {"Authorization": PEXELS_API_KEY}
             params = {"query": prompt, "orientation": "portrait", "size": "large", "per_page": 30, "page": random.randint(1, 10)}
-            r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
+            r = _SESSION.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
             r.raise_for_status()
             photos = r.json().get("photos") or []
             if not photos:
                 raise RuntimeError("Pexels sem fotos.")
             choice = random.choice(photos)
             url = choice["src"].get("large2x") or choice["src"].get("large") or choice["src"].get("portrait")
-            raw = requests.get(url, timeout=20).content
+            raw_resp = _SESSION.get(url, timeout=20)
+            raw_resp.raise_for_status()
+            raw = raw_resp.content
             with open(arquivo_saida, "wb") as f:
                 f.write(raw)
             img = Image.open(arquivo_saida)
@@ -247,7 +270,7 @@ def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[s
 
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "portrait", "size": "large", "per_page": 30, "page": 1}
-    r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
+    r = _SESSION.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     photos = r.json().get("photos") or []
 
@@ -264,7 +287,9 @@ def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[s
         if not url:
             continue
         try:
-            raw = requests.get(url, timeout=15).content
+            resp = _SESSION.get(url, timeout=15)
+            resp.raise_for_status()
+            raw = resp.content
             pid = photo.get("id") or random.randint(100000, 999999)
             name = f"{_slug(query)}_{pid}.jpg"
             out = os.path.join(IMAGENS_DIR, name)

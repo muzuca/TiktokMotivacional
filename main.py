@@ -4,6 +4,8 @@ import time
 import logging
 from datetime import datetime, timedelta
 import random
+import shutil
+from glob import glob
 from dotenv import load_dotenv
 
 from utils.frase import gerar_prompt_paisagem, gerar_frase_motivacional, gerar_slug
@@ -13,8 +15,9 @@ from utils.tiktok import postar_no_tiktok_e_renomear
 
 load_dotenv()
 
+# LOG_LEVEL do .env (INFO default)
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -39,6 +42,66 @@ MOTION_OPTIONS = {
 
 DEFAULT_SLIDES_COUNT = int(os.getenv("SLIDES_COUNT", "4"))
 
+IMAGENS_DIR = "imagens"
+IMAGENS_SLIDES_TXT = os.path.join(IMAGENS_DIR, "slides_txt")
+AUDIOS_DIR = "audios"
+AUDIOS_TTS_DIR = os.path.join(AUDIOS_DIR, "tts")
+CACHE_DIR = "cache"
+
+# --------------------- limpeza ---------------------
+def _safe_unlink(path: str):
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+            logger.debug("removido: %s", path)
+    except Exception as e:
+        logger.debug("não consegui remover '%s': %s", path, e)
+
+def _limpar_pre_post(imagem_base: str, imagem_capa: str):
+    """
+    Executa após gerar o vídeo e ANTES de postar:
+      - apaga audios/ (raiz) e audios/tts/
+      - apaga cache/*.txt (drawtext, etc.)
+      - apaga imagens/slides_txt/
+      - apaga imagens/* EXCETO imagem_base e imagem_capa (essas ainda serão usadas na postagem)
+    """
+    # 1) audios raiz e tts
+    for d in (AUDIOS_TTS_DIR, AUDIOS_DIR):
+        if os.path.isdir(d):
+            for nome in os.listdir(d):
+                p = os.path.join(d, nome)
+                if os.path.isfile(p):
+                    _safe_unlink(p)
+
+    # 2) cache/*.txt
+    if os.path.isdir(CACHE_DIR):
+        for txt in glob(os.path.join(CACHE_DIR, "*.txt")):
+            _safe_unlink(txt)
+
+    # 3) imagens/slides_txt (diretório inteiro)
+    shutil.rmtree(IMAGENS_SLIDES_TXT, ignore_errors=True)
+
+    # 4) imagens/* exceto capa e base
+    keep = {os.path.abspath(imagem_base), os.path.abspath(imagem_capa)}
+    if os.path.isdir(IMAGENS_DIR):
+        for nome in os.listdir(IMAGENS_DIR):
+            p = os.path.join(IMAGENS_DIR, nome)
+            if os.path.isdir(p):
+                # já tratamos slides_txt acima; outros diretórios não costumam existir
+                continue
+            if os.path.abspath(p) in keep:
+                continue
+            _safe_unlink(p)
+
+def _limpar_pos_post(imagem_base: str, imagem_capa: str):
+    """
+    Executa após postar:
+      - remove também imagem_base e imagem_capa
+    """
+    _safe_unlink(imagem_base)
+    _safe_unlink(imagem_capa)
+
+# --------------------- UI ---------------------
 def _selecionar_idioma() -> str:
     print("\nEscolha o país para referência da língua das mensagens:")
     print("1. EUA (Inglês) *padrão")
@@ -140,10 +203,11 @@ def _map_video_style_to_image_template(style_key: str) -> str:
         return "minimal_center"
     return "minimal_center"
 
+# --------------------- pipeline ---------------------
 def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
-    os.makedirs("imagens", exist_ok=True)
+    os.makedirs(IMAGENS_DIR, exist_ok=True)
     os.makedirs("videos", exist_ok=True)
-    os.makedirs("audios", exist_ok=True)
+    os.makedirs(AUDIOS_DIR, exist_ok=True)
 
     logger.info("Gerando conteúdos (%s)...", idioma)
     prompt_imagem = gerar_prompt_paisagem(idioma)
@@ -151,9 +215,9 @@ def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motio
 
     slug_img = gerar_slug(prompt_imagem)
     slug_frase = gerar_slug(frase)
-    imagem_base = f"imagens/{slug_img}.jpg"
-    imagem_capa = f"imagens/{slug_frase}.jpg"
-    video_final = f"videos/{slug_frase}.mp4"
+    imagem_base = os.path.join(IMAGENS_DIR, f"{slug_img}.jpg")
+    imagem_capa = os.path.join(IMAGENS_DIR, f"{slug_frase}.jpg")
+    video_final = os.path.join("videos", f"{slug_frase}.mp4")
 
     # 1) capa
     gerar_imagem_com_frase(prompt=prompt_imagem, arquivo_saida=imagem_base)
@@ -168,7 +232,7 @@ def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motio
         logger.warning("Falha ao montar slides: %s. Usando apenas a capa.", e)
         slides_raw = [imagem_capa]
 
-    slides_txt_dir = os.path.join("imagens", "slides_txt")
+    slides_txt_dir = IMAGENS_SLIDES_TXT
     os.makedirs(slides_txt_dir, exist_ok=True)
 
     slides_com_texto = []
@@ -202,14 +266,32 @@ def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motio
         transition=None  # usa TRANSITION do .env
     )
 
+    # >>> Limpeza PRÉ-POST (mantém capa e base para a função de postagem)
+    try:
+        _limpar_pre_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
+        logger.info("🧹 Limpeza pré-post concluída.")
+    except Exception as e:
+        logger.warning("Falha na limpeza pré-post: %s", e)
+
     # 4) TikTok
-    postar_no_tiktok_e_renomear(
-        descricao_personalizada=frase,
-        imagem_base=imagem_base,
-        imagem_final=imagem_capa,
-        video_final=video_final,
-        idioma=idioma
-    )
+    try:
+        postar_no_tiktok_e_renomear(
+            descricao_personalizada=frase,
+            imagem_base=imagem_base,
+            imagem_final=imagem_capa,
+            video_final=video_final,
+            idioma=idioma
+        )
+    except Exception as e:
+        logger.exception("❌ Falha ao postar no TikTok: %s", e)
+
+    # >>> Limpeza PÓS-POST (remove capa e base também)
+    try:
+        _limpar_pos_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
+        logger.info("🧹 Limpeza pós-post concluída.")
+    except Exception as e:
+        logger.warning("Falha na limpeza pós-post: %s", e)
+
     logger.info("✅ Execução concluída.")
 
 def postar_em_intervalo(cada_horas: float, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):

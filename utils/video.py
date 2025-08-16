@@ -15,7 +15,7 @@ from .audio import obter_caminho_audio, gerar_narracao_tts
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -57,6 +57,7 @@ def _env_int(name: str, default: int) -> int:
 
 BG_MIX_VOLUME      = _env_float("BG_MIX_VOLUME", 0.10)
 DEFAULT_TRANSITION = os.getenv("TRANSITION", "fade").strip().lower()
+VOICE_LOUDNORM     = os.getenv("VOICE_LOUDNORM", "1").strip().lower() in ("1", "true", "yes")
 
 # Intensidades de movimento
 KENBURNS_ZOOM_MAX = _env_float("KENBURNS_ZOOM_MAX", 1.22)  # 22%
@@ -400,6 +401,13 @@ def _build_slide_branch(idx: int, W: int, H: int, motion: str, per_slide: float)
     return chain
 
 # -------------------- principal --------------------
+def _quote(arg: str) -> str:
+    if not arg:
+        return '""'
+    if any(c in arg for c in ' \t"\''):
+        return f'"{arg.replace("\"", "\\\"")}"'
+    return arg
+
 def gerar_video(
     imagem_path: str,             # imagem de capa (será encenada em IMAGES_DIR)
     saida_path: str,
@@ -417,6 +425,7 @@ def gerar_video(
     staged_images: List[str] = []
     staged_tts: Optional[str] = None
     extra_to_cleanup: List[str] = []  # ex.: original TTS fora de audios/tts
+    last_cmd: List[str] = []
 
     try:
         if preset not in PRESETS:
@@ -543,12 +552,21 @@ def gerar_video(
         if has_voice and has_bg:
             va_idx = len(staged_inputs)
             ba_idx = len(staged_inputs) + 1
-            parts.append(f"[{va_idx}:a]aresample={AUDIO_SR}:async=1[va]")
+            voice_filters = []
+            if VOICE_LOUDNORM:
+                voice_filters.append("loudnorm=I=-15:TP=-1.0:LRA=11")
+            voice_filters.append(f"aresample={AUDIO_SR}:async=1")
+            vf_str = ",".join(voice_filters)
+
+            parts.append(f"[{va_idx}:a]{vf_str}[va]")
             parts.append(f"[{ba_idx}:a]volume={BG_MIX_VOLUME},aresample={AUDIO_SR}:async=1[ba]")
             parts.append(f"[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]")
         elif has_voice or has_bg:
             a_idx = len(staged_inputs)
-            parts.append(f"[{a_idx}:a]aresample={AUDIO_SR}:async=1[aout]")
+            if has_voice and VOICE_LOUDNORM:
+                parts.append(f"[{a_idx}:a]loudnorm=I=-15:TP=-1.0:LRA=11,aresample={AUDIO_SR}:async=1[aout]")
+            else:
+                parts.append(f"[{a_idx}:a]aresample={AUDIO_SR}:async=1[aout]")
         else:
             parts.append(f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}:d={total_video:.3f}[aout]")
 
@@ -607,23 +625,33 @@ def gerar_video(
         os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
         cmd.append(saida_path)
 
+        # salvar o comando para uso no except
+        last_cmd = cmd[:]
+
         logger.info("📂 CWD: %s", os.getcwd())
-        logger.info("🎬 FFmpeg: %s", " ".join(cmd))
+        logger.info("🎬 FFmpeg: %s", " ".join(_quote(a) for a in cmd))
 
         subprocess.run(cmd, check=True)
         logger.info("✅ Vídeo salvo: %s", saida_path)
 
     except subprocess.CalledProcessError as e:
         logger.error("❌ FFmpeg falhou (%s).", e)
-        # salva .bat para facilitar teste manual
-        bat_path = os.path.join(CACHE_DIR, "replay_ffmpeg.bat")
+        # salva scripts de replay para facilitar teste manual
         try:
-            with open(bat_path, "w", encoding="utf-8") as f:
-                # reconstruo o último comando do log, se possível
-                pass
-        except Exception:
-            pass
-        logger.info("📝 Para depurar, rode: %s", bat_path)
+            bat_path = os.path.join(CACHE_DIR, "replay_ffmpeg.bat")
+            sh_path  = os.path.join(CACHE_DIR, "replay_ffmpeg.sh")
+            if last_cmd:
+                with open(bat_path, "w", encoding="utf-8") as f:
+                    f.write("@echo off\n")
+                    f.write("REM Reexecuta o último comando FFmpeg\n")
+                    f.write(" ".join(_quote(a) for a in last_cmd) + "\n")
+                with open(sh_path, "w", encoding="utf-8") as f:
+                    f.write("#!/usr/bin/env bash\n")
+                    f.write("set -e\n")
+                    f.write(" ".join(_quote(a) for a in last_cmd) + "\n")
+            logger.info("📝 Scripts de replay salvos em: %s | %s", bat_path, sh_path)
+        except Exception as w:
+            logger.debug("Falha ao salvar scripts de replay: %s", w)
         raise
     finally:
         # -------- LIMPEZA: imagens encenadas + TTS copiado + resíduos antigos --------

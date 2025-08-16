@@ -22,14 +22,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
 # ====================== CONFIG ======================
-USE_REMOTE_AUDIO = True
+USE_REMOTE_AUDIO = os.getenv("USE_REMOTE_AUDIO", "1").strip() not in ("0", "false", "no")
 FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY")
 DURACAO_MINIMA = int(os.getenv("BG_MIN_SECONDS", "30"))
 
@@ -41,6 +41,8 @@ os.makedirs(TTS_DIR, exist_ok=True)
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 AUDIOS_CACHE_FILE = os.path.join(CACHE_DIR, "used_audios.json")
+
+USER_AGENT = "TiktokMotivacional/1.0 (+https://local)"
 
 # ================== utils de cache ==================
 def load_used_audios():
@@ -77,6 +79,27 @@ def _retry(fn: Callable[[], T],
             sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter)
             time.sleep(sleep_s)
     return None
+
+# ================== HTTP session (proxy + retries) ==================
+from requests.adapters import HTTPAdapter, Retry
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    ph = os.getenv("PROXY_HOST")
+    if ph:
+        user = os.getenv("PROXY_USER", "")
+        pw = os.getenv("PROXY_PASS", "")
+        port = os.getenv("PROXY_PORT", "")
+        auth = f"{user}:{pw}@" if (user or pw) else ""
+        url = f"http://{auth}{ph}:{port}"
+        s.proxies.update({"http": url, "https": url})
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+_SESSION = _make_session()
 
 # ================= ÁUDIO DE FUNDO ===================
 def _duracao_arquivo(path: str) -> float:
@@ -120,14 +143,14 @@ def _freesound_busca(query: str, sort: str, filters: str, page_size: int = 20) -
         "fields": "id,name,duration,tags,license,previews",
         "page_size": page_size,
     }
-    r = requests.get(url, headers=headers, params=params, timeout=15)
+    r = _SESSION.get(url, headers=headers, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
 def _baixar_preview(audio_meta: dict, destino: str) -> float:
     os.makedirs(os.path.dirname(destino) or ".", exist_ok=True)
     preview_url = audio_meta["previews"]["preview-hq-mp3"]
-    with requests.get(preview_url, stream=True, timeout=30) as resp:
+    with _SESSION.get(preview_url, stream=True, timeout=30) as resp:
         resp.raise_for_status()
         with open(destino, "wb") as f:
             for chunk in resp.iter_content(8192):
