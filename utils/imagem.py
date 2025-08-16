@@ -7,7 +7,6 @@ import logging
 from typing import List, Optional, Tuple, Iterable
 
 import requests
-# Retry pode estar no urllib3 nas versões recentes
 try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry  # type: ignore
@@ -77,32 +76,28 @@ def _env_color(name: str, default: str) -> Tuple[int, int, int]:
         r, g, b = [int(x) for x in s.split(",")]
         return (r, g, b)
     except Exception:
-        return (243, 179, 74)  # âmbar default
+        return (243, 179, 74)
 
 # -------------------- Parâmetros de imagem --------------------
 IMAGE_DARK_ENABLE = _env_bool("IMAGE_DARK_ENABLE", True)
 
-# Escurecimento base (0.0–1.0)
 IMAGE_DARK_MODERN  = _clamp(_env_float("IMAGE_DARK_MODERN", 0.14), 0.0, 0.95)
 IMAGE_DARK_CLASSIC = _clamp(_env_float("IMAGE_DARK_CLASSIC", 0.16), 0.0, 0.95)
 IMAGE_DARK_MINIMAL = _clamp(_env_float("IMAGE_DARK_MINIMAL", 0.15), 0.0, 0.95)
 
-# Vinheta
 IMAGE_VIGNETTE_STRENGTH   = _clamp(_env_float("IMAGE_VIGNETTE_STRENGTH", 0.06), 0.0, 0.95)
 IMAGE_VIGNETTE_SOFTNESS   = _clamp(_env_float("IMAGE_VIGNETTE_SOFTNESS", 0.72), 0.0, 1.0)
 IMAGE_DARK_CENTER_PROTECT = _clamp(_env_float("IMAGE_DARK_CENTER_PROTECT", 0.80), 0.0, 1.0)
 
-# Tipografia / destaque
 IMAGE_TEXT_SCALE   = _clamp(_env_float("IMAGE_TEXT_SCALE", 1.20), 0.5, 2.0)
 IMAGE_TEXT_UPPER   = _env_bool("IMAGE_TEXT_UPPER", True)
 IMAGE_HL_COLOR     = _env_color("IMAGE_HL_COLOR", "#F3B34A")
 IMAGE_HL_STROKE    = _env_bool("IMAGE_HL_STROKE", True)
 IMAGE_FORCE_EMPHASIS = _env_bool("IMAGE_FORCE_EMPHASIS", False)
 IMAGE_EMPHASIS_LAST_WORDS = max(1, _env_int("IMAGE_EMPHASIS_LAST_WORDS", 1))
-# Destacar SOMENTE quando houver **…** (default = True)
 IMAGE_EMPHASIS_ONLY_MARKUP = _env_bool("IMAGE_EMPHASIS_ONLY_MARKUP", True)
 
-# Aparência do contorno: "shadow" | "stroke" | "none"
+# Aparência do contorno
 IMAGE_TEXT_OUTLINE_STYLE = os.getenv("IMAGE_TEXT_OUTLINE_STYLE", "shadow").strip().lower()
 IMAGE_STROKE_WIDTH       = _env_int("IMAGE_STROKE_WIDTH", 2)
 try:
@@ -110,14 +105,13 @@ try:
     IMAGE_SHADOW_OFFSET = (_dx, _dy)
 except Exception:
     IMAGE_SHADOW_OFFSET = (2, 3)
-IMAGE_SHADOW_ALPHA = _env_int("IMAGE_SHADOW_ALPHA", 170)  # 0..255
+IMAGE_SHADOW_ALPHA = _env_int("IMAGE_SHADOW_ALPHA", 170)
 
-# Ajuste fino por template (opcionais; 1.0 = neutro)
+# Ajuste fino por template
 IMAGE_TEXT_SCALE_CLASSIC = _clamp(_env_float("IMAGE_TEXT_SCALE_CLASSIC", 1.0), 0.5, 2.0)
 IMAGE_TEXT_SCALE_MODERN  = _clamp(_env_float("IMAGE_TEXT_SCALE_MODERN",  1.0), 0.5, 2.0)
 IMAGE_TEXT_SCALE_MINIMAL = _clamp(_env_float("IMAGE_TEXT_SCALE_MINIMAL", 1.0), 0.5, 2.0)
 
-# Controle de log
 IMAGE_LOG_PROXY   = _env_bool("IMAGE_LOG_PROXY", False)
 IMAGE_VERBOSE_LOG = _env_bool("IMAGE_VERBOSE_LOG", False)
 
@@ -143,7 +137,7 @@ def _make_session() -> requests.Session:
         if IMAGE_LOG_PROXY:
             logger.info("🌐 Proxy habilitado (%s:%s) - auth=%s", ph, port or "-", "sim" if (user or pw) else "não")
         else:
-            logger.debug("🌐 Proxy habilitado (detalhes ocultos). Defina IMAGE_LOG_PROXY=1 para logar detalhes.")
+            logger.debug("🌐 Proxy habilitado (detalhes ocultos).")
     else:
         logger.debug("🌐 Proxy desabilitado")
 
@@ -255,7 +249,7 @@ def _draw_line_colored(
     style: Optional[str] = None,
     stroke_w: Optional[int] = None,
 ):
-    """Desenha a linha token a token, aplicando cor no highlight e contorno 'shadow' (padrão), 'stroke' ou 'none'."""
+    """Desenha token a token; highlight só nas palavras marcadas."""
     if style is None:
         style = IMAGE_TEXT_OUTLINE_STYLE
     if stroke_w is None:
@@ -275,28 +269,19 @@ def _draw_line_colored(
                                (stroke_w,-stroke_w),(stroke_w,stroke_w)]:
                     draw.text((cur_x+dx, y+dy), raw, font=font, fill=(0,0,0,200))
             draw.text((cur_x, y), raw, font=font, fill=color)
-
         elif style == "shadow":
             sx, sy = IMAGE_SHADOW_OFFSET
             shadow_col = (0, 0, 0, max(0, min(255, IMAGE_SHADOW_ALPHA)))
             draw.text((cur_x + sx, y + sy), raw, font=font, fill=shadow_col)
             draw.text((cur_x, y), raw, font=font, fill=color)
-
-        else:  # "none"
+        else:
             draw.text((cur_x, y), raw, font=font, fill=color)
 
-        # avança + espaço
         w = draw.textbbox((0,0), raw + (" " if i < len(tokens)-1 else ""), font=font)[2]
         cur_x += w
 
 # -------------------- Efeitos de fundo --------------------
 def _darken_and_vignette(img: Image.Image, base_dark_alpha: int, vig: float, softness: float, center_protect: float) -> Image.Image:
-    """
-    base_dark_alpha: 0..255
-    vig: 0..1  — força da vinheta nas bordas
-    softness: 0..1 — quão suave é a transição
-    center_protect: 0..1 — quanto maior, mais área central fica clara
-    """
     w, h = img.size
     out = img.convert("RGBA")
 
@@ -304,7 +289,6 @@ def _darken_and_vignette(img: Image.Image, base_dark_alpha: int, vig: float, sof
         out = Image.alpha_composite(out, Image.new("RGBA", (w, h), (0, 0, 0, int(base_dark_alpha))))
 
     if vig > 0:
-        # máscara branca nas bordas / preta no centro
         mask = Image.new("L", (w, h), 255)
         d = ImageDraw.Draw(mask)
         inner_scale = 0.72 + 0.16 * _clamp(softness, 0.0, 1.0) + 0.12 * _clamp(center_protect, 0.0, 1.0)
@@ -350,22 +334,19 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, max_retries: int 
             headers = {"Authorization": PEXELS_API_KEY}
             page = random.randint(1, 10)
             params = {"query": prompt, "orientation": "portrait", "size": "large", "per_page": 30, "page": page}
-            if IMAGE_VERBOSE_LOG: logger.info("📸 Pexels: query='%s' page=%s", prompt, page)
-            else:                  logger.debug("📸 Pexels: query='%s' page=%s", prompt, page)
+            logger.debug("📸 Pexels: query='%s' page=%s", prompt, page)
 
             r = _SESSION.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
             photos = data.get("photos") or []
-            if IMAGE_VERBOSE_LOG: logger.info("📸 Pexels: resultados=%d", len(photos))
-            else:                  logger.debug("📸 Pexels: resultados=%d", len(photos))
+            logger.debug("📸 Pexels: resultados=%d", len(photos))
             if not photos:
                 raise RuntimeError("Pexels sem fotos.")
             choice = random.choice(photos)
             src = choice.get("src") or {}
             url = src.get("large2x") or src.get("large") or src.get("portrait")
-            if IMAGE_VERBOSE_LOG: logger.info("📸 Pexels: escolhida id=%s", choice.get("id"))
-            else:                  logger.debug("📸 Pexels: escolhida id=%s", choice.get("id"))
+            logger.debug("📸 Pexels: escolhida id=%s", choice.get("id"))
 
             raw_resp = _SESSION.get(url, timeout=20)
             raw_resp.raise_for_status()
@@ -393,7 +374,6 @@ def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
     Remove **marcas** e retorna:
       clean: texto sem os **asteriscos**
       words: lista de PALAVRAS destacadas (sem pontuação, minúsculas)
-    Ex.: "**passion, and purpose**" -> ["passion","and","purpose"]
     """
     segs = re.findall(r"\*\*(.+?)\*\*", s, flags=re.S)
     clean = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
@@ -407,22 +387,15 @@ def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
 
 def _pick_highlights(line: str) -> List[str]:
     words = [re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", w).lower() for w in line.split()]
-    for w in words:  # preferir palavras "punch"
+    for w in words:
         if w in _PUNCH_WORDS:
             return [w]
-    for w in reversed(words):  # senão, a última palavra significativa
+    for w in reversed(words):
         if len(w) >= 3:
             return [w]
     return words[-1:] if words else []
 
 def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
-    """
-    Divide em (intro, punch) e escolhe palavras para destaque.
-    - Respeita **marcação**
-    - Tenta quebrar por pontuação; fallback: 1/2 da frase
-    - Se IMAGE_EMPHASIS_ONLY_MARKUP=1 e não houver marcação -> nenhum destaque
-    - Se não for ONLY_MARKUP, pode forçar últimas N palavras (IMAGE_FORCE_EMPHASIS)
-    """
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
     s = clean.strip()
     parts = re.split(r"(?:\.\.\.|[.!?:;—–-])", s)
@@ -456,14 +429,8 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
 def _prepare_bg(img: Image.Image, base_dark: float, template: str) -> Image.Image:
     base = _ensure_1080x1920(img)
     if not IMAGE_DARK_ENABLE:
-        if IMAGE_VERBOSE_LOG: logger.info("🎛️ prepare_bg (NO-DARK) | template=%s", template)
+        logger.debug("🎛️ prepare_bg (NO-DARK) | template=%s", template)
         return base
-    if IMAGE_VERBOSE_LOG:
-        alpha = int(255 * _clamp(base_dark, 0.0, 1.0))
-        logger.info(
-            "🎛️ prepare_bg | template=%s | DARK_ENABLE=%s | base_dark=%.3f (alpha=%d/255) | VIGNETTE=%.3f | SOFT=%.3f | CENTER=%.3f",
-            template, IMAGE_DARK_ENABLE, base_dark, alpha, IMAGE_VIGNETTE_STRENGTH, IMAGE_VIGNETTE_SOFTNESS, IMAGE_DARK_CENTER_PROTECT
-        )
     return _darken_and_vignette(
         base,
         base_dark_alpha=int(255 * _clamp(base_dark, 0.0, 1.0)),
@@ -483,7 +450,6 @@ def _render_singleline_center(
     max_size: int = 128,
     stroke_ratio: float = 0.045
 ) -> Image.Image:
-    # remove marcação **…** para não desenhar asteriscos
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
 
     W, H = img.size
@@ -501,12 +467,11 @@ def _render_singleline_center(
         else:
             hi = mid - 2
     font = _load_font(font_name, best)
-    tw, th = _text_size(draw, text, font)
+    tw, _ = _text_size(draw, text, font)
 
     x = (W - tw) // 2
     y = int(H * _clamp(y_ratio, 0.05, 0.35))
 
-    # contorno conforme estilo
     if IMAGE_TEXT_OUTLINE_STYLE == "stroke":
         stroke_w = max(1, int(best * stroke_ratio))
         _draw_text_with_stroke(draw, (x, y), text, font, "white", "black", stroke_w)
@@ -520,7 +485,6 @@ def _render_singleline_center(
     return img
 
 def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
-    """Intro menor + bloco principal (mesmo tamanho por linha). Destaque só quando houver markup (por padrão)."""
     img = _prepare_bg(img, IMAGE_DARK_MODERN, "modern_block").convert("RGBA")
     W, H = img.size
     draw = ImageDraw.Draw(img)
@@ -535,21 +499,16 @@ def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
     maxw  = int(W * 0.84)
     y     = int(H * 0.14)
 
-    # Intro (regular)
     if intro:
         f_small, lines1 = _best_font_and_wrap(
             draw, intro, "Montserrat-Regular.ttf",
             maxw, int(38*base_scale), int(70*base_scale), max_lines=2
         )
         for ln in lines1:
-            _draw_line_colored(
-                draw, left, y, ln, f_small, set(),
-                fill="white", hl_fill=IMAGE_HL_COLOR, style=None
-            )
+            _draw_line_colored(draw, left, y, ln, f_small, set(), fill="white", hl_fill=IMAGE_HL_COLOR, style=None)
             y += int(f_small.size * 1.16)
         y += int(H * 0.018)
 
-    # Bloco principal (bold) — faixa mais contida para não “explodir”
     f_main, lines2 = _best_font_and_wrap(
         draw, punch, "Montserrat-ExtraBold.ttf",
         maxw, int(68*base_scale), int(104*base_scale), max_lines=4
@@ -565,9 +524,8 @@ def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
     return img.convert("RGB")
 
 def _render_classic_serif(img: Image.Image, frase: str) -> Image.Image:
-    # limpa e captura palavras marcadas (só elas serão coloridas)
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
-    hl_set = set(explicit_words)  # já vem limpo/minúsculo
+    hl_set = set(explicit_words)
 
     img = _prepare_bg(img, IMAGE_DARK_CLASSIC, "classic_serif").convert("RGBA")
     W, H = img.size
@@ -577,7 +535,6 @@ def _render_classic_serif(img: Image.Image, frase: str) -> Image.Image:
     maxw = int(W * 0.76)
 
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
-    # tamanho **uniforme** em serif para todas as linhas
     f_serif, lines = _best_font_and_wrap(
         draw, text, "PlayfairDisplay-Bold.ttf",
         maxw, int(54*scls), int(80*scls), max_lines=4
@@ -585,8 +542,6 @@ def _render_classic_serif(img: Image.Image, frase: str) -> Image.Image:
 
     y = int(H*0.20)
     left = int(W*0.12)
-
-    # respeita ONLY_MARKUP: se true e não houver marcação, não destaca nada
     hl_for_draw = hl_set if (hl_set or not IMAGE_EMPHASIS_ONLY_MARKUP) else set()
 
     for ln in lines:
@@ -606,12 +561,10 @@ def _render_minimal_center(img: Image.Image, frase: str) -> Image.Image:
     W, H = img.size
     draw = ImageDraw.Draw(img)
 
-    # escala por template
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MINIMAL
     big_name   = "BebasNeue-Regular.ttf"
     small_name = "Montserrat-Regular.ttf"
 
-    # limpa **…** para não aparecer asterisco
     clean, _ = _parse_highlights_from_markdown(frase)
     two = quebrar_em_duas_linhas(clean)
     if IMAGE_TEXT_UPPER:
@@ -623,7 +576,6 @@ def _render_minimal_center(img: Image.Image, frase: str) -> Image.Image:
     small = _load_font(small_name, max(36, int(W*0.039*scls)))
     big   = _load_font(big_name,   max(90, int(W*0.102*scls)))
 
-    # linha 1 centralizada (menor)
     b1 = draw.textbbox((0,0), l1, font=small); tw1 = b1[2]-b1[0]; th1 = b1[3]-b1[1]
     x1 = (W - tw1)//2; y = int(H*0.20)
 
@@ -638,7 +590,6 @@ def _render_minimal_center(img: Image.Image, frase: str) -> Image.Image:
 
     y += th1 + int(H*0.02)
 
-    # bloco grande (wrap) centralizado
     maxw = int(W*0.90)
     words = l2.split(); cur=""; lines=[]
     for w in words:
@@ -674,17 +625,6 @@ def escrever_frase_na_imagem(imagem_path: str, frase: str, saida_path: str, *,
     if template == "auto":
         template = random.choice(["classic_serif", "modern_block", "minimal_center"])
 
-    if IMAGE_VERBOSE_LOG:
-        logger.info("🖼️ Render start | template=%s | input=%s | output=%s", template, imagem_path, saida_path)
-        logger.info(
-            "🔧 ENV | DARK_ENABLE=%s | DARK_M/CL/MN=%.3f/%.3f/%.3f | VIGNETTE=%.3f | SOFT=%.3f | CENTER=%.3f | "
-            "TEXT_SCALE=%.2f (C/Mo/Mi=%.2f/%.2f/%.2f) | UPPER=%s | HL_STROKE=%s | OUTLINE=%s",
-            IMAGE_DARK_ENABLE, IMAGE_DARK_MODERN, IMAGE_DARK_CLASSIC, IMAGE_DARK_MINIMAL,
-            IMAGE_VIGNETTE_STRENGTH, IMAGE_VIGNETTE_SOFTNESS, IMAGE_DARK_CENTER_PROTECT,
-            IMAGE_TEXT_SCALE, IMAGE_TEXT_SCALE_CLASSIC, IMAGE_TEXT_SCALE_MODERN, IMAGE_TEXT_SCALE_MINIMAL,
-            IMAGE_TEXT_UPPER, IMAGE_HL_STROKE, IMAGE_TEXT_OUTLINE_STYLE
-        )
-
     if template == "classic_serif":
         out = _render_classic_serif(img, frase)
     elif template == "minimal_center":
@@ -710,14 +650,12 @@ def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[s
 
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "portrait", "size": "large", "per_page": 30, "page": 1}
-    if IMAGE_VERBOSE_LOG: logger.info("🖼️ Slides Pexels: query='%s' count=%d", query, count)
-    else:                  logger.debug("🖼️ Slides Pexels: query='%s' count=%d", query, count)
+    logger.debug("🖼️ Slides Pexels: query='%s' count=%d", query, count)
 
     r = _SESSION.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     photos = r.json().get("photos") or []
-    if IMAGE_VERBOSE_LOG: logger.info("🖼️ Slides Pexels: resultados=%d", len(photos))
-    else:                  logger.debug("🖼️ Slides Pexels: resultados=%d", len(photos))
+    logger.debug("🖼️ Slides Pexels: resultados=%d", len(photos))
 
     slides: List[str] = []
     if primeira_imagem and os.path.isfile(primeira_imagem):
@@ -743,8 +681,7 @@ def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[s
             img = Image.open(out)
             img = _ensure_1080x1920(img)
             img.save(out, quality=92)
-            if IMAGE_VERBOSE_LOG: logger.info("⬇️  Slide salvo: id=%s file=%s", photo.get("id"), out.replace("\\", "/"))
-            else:                  logger.debug("⬇️  Slide salvo: id=%s", photo.get("id"))
+            logger.debug("⬇️  Slide salvo: id=%s", photo.get("id"))
             slides.append(out)
         except Exception as e:
             logger.warning("⚠️ Falha ao baixar slide id=%s: %s", photo.get("id"), e)

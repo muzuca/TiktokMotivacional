@@ -1,4 +1,4 @@
-#video.py
+# utils/video.py
 import os
 import re
 import logging
@@ -42,7 +42,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(AUDIO_TTS_DIR, exist_ok=True)
 
-# -------------------- ENV --------------------
+# -------------------- ENV helpers --------------------
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -55,28 +55,62 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v in ("1","true","yes","on"):
+        return True
+    if v in ("0","false","no","off"):
+        return False
+    return default
+
+# -------------------- ENV (áudio/motion/looks/ducking) --------------------
 BG_MIX_VOLUME      = _env_float("BG_MIX_VOLUME", 0.10)
 DEFAULT_TRANSITION = os.getenv("TRANSITION", "fade").strip().lower()
-VOICE_LOUDNORM     = os.getenv("VOICE_LOUDNORM", "1").strip().lower() in ("1", "true", "yes")
+VOICE_LOUDNORM     = _env_bool("VOICE_LOUDNORM", True)
 
 # Intensidades de movimento
-KENBURNS_ZOOM_MAX = _env_float("KENBURNS_ZOOM_MAX", 1.22)  # 22%
+KENBURNS_ZOOM_MAX = _env_float("KENBURNS_ZOOM_MAX", 1.22)
 PAN_ZOOM          = _env_float("PAN_ZOOM", 1.18)
 
-# FPS interno do movimento (capado para não travar máquina)
+# FPS interno do movimento (capado)
 _MOTION_FPS_ENV = _env_int("MOTION_FPS", 45)
 MOTION_FPS = max(24, min(90, _MOTION_FPS_ENV))
 if MOTION_FPS != _MOTION_FPS_ENV:
     logger.info("ℹ️ MOTION_FPS ajustado para %d (cap 24..90).", MOTION_FPS)
 
-# Whisper (opcional — só para sincronizar legendas com a fala)
-WHISPER_ENABLE = os.getenv("WHISPER_ENABLE", "0").strip().lower() in ("1", "true", "yes")
+# Look "orgânico"
+VIDEO_SAT          = _env_float("VIDEO_SAT", 1.00)
+VIDEO_CONTRAST     = _env_float("VIDEO_CONTRAST", 1.00)
+VIDEO_GAMMA        = _env_float("VIDEO_GAMMA", 1.00)
+VIDEO_SHARP        = _env_float("VIDEO_SHARP", 0.00)  # ex.: 0.35
+VIDEO_GRAIN        = _env_int  ("VIDEO_GRAIN", 0)     # 0..20
+VIDEO_CHROMA_SHIFT = _env_int  ("VIDEO_CHROMA_SHIFT", 0)  # 0=off, 1..2 sutil
+
+# Ducking
+DUCK_ENABLE     = _env_bool("DUCK_ENABLE", True)
+DUCK_THRESH     = _env_float("DUCK_THRESH", 0.05)
+DUCK_RATIO      = _env_float("DUCK_RATIO", 8.0)
+DUCK_ATTACK_MS  = _env_int  ("DUCK_ATTACK_MS", 20)
+DUCK_RELEASE_MS = _env_int  ("DUCK_RELEASE_MS", 250)
+
+# Whisper (opcional)
+WHISPER_ENABLE = _env_bool("WHISPER_ENABLE", False)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
-WHISPER_VAD = os.getenv("WHISPER_VAD", "1").strip().lower() in ("1", "true", "yes")
+WHISPER_BEAM_SIZE = _env_int("WHISPER_BEAM_SIZE", 1)
+WHISPER_VAD = _env_bool("WHISPER_VAD", True)
 WHISPER_MODEL_CACHE = os.getenv("WHISPER_MODEL_CACHE", "./whisper_models")
+
+# Meta spoof (opcional)
+META_SPOOF_ENABLE    = _env_bool("META_SPOOF_ENABLE", False)
+META_MAKE            = os.getenv("META_MAKE", "Apple")
+META_MODEL           = os.getenv("META_MODEL", "iPhone 13")
+META_SOFTWARE        = os.getenv("META_SOFTWARE", "iOS 17.5.1")
+META_LOCATION_ISO6709= os.getenv("META_LOCATION_ISO6709", "+37.7749-122.4194+000.00/")
 
 # -------------------- Helpers --------------------
 def _ffmpeg_or_die() -> str:
@@ -90,6 +124,25 @@ def _ffprobe_or_die() -> str:
     if not path:
         raise RuntimeError("ffprobe não encontrado no PATH.")
     return path
+
+def _ffmpeg_has_filter(filter_name: str) -> bool:
+    """Verifica se o FFmpeg suporta um filtro específico."""
+    try:
+        out = subprocess.check_output(
+            [_ffmpeg_or_die(), "-hide_banner", "-filters"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        for line in out.splitlines():
+            # formato típico: " T.. chromashift         V->V       Shift chroma."
+            if re.search(rf"\b{re.escape(filter_name)}\b", line):
+                return True
+        return False
+    except Exception as e:
+        logger.debug("Não consegui listar filtros do FFmpeg: %s", e)
+        return False
 
 def _idioma_norm(idioma: str) -> str:
     s = (idioma or "en").lower()
@@ -123,10 +176,6 @@ def _uuid_suffix() -> str:
     return uuid.uuid4().hex[:8]
 
 def _stage_to_dir(src_path: str, target_dir: str, prefix: str) -> str:
-    """
-    Copia o arquivo para 'target_dir' com um nome temporário seguro,
-    e retorna o caminho do arquivo encenado (staged).
-    """
     os.makedirs(target_dir, exist_ok=True)
     base, ext = os.path.splitext(os.path.basename(src_path))
     dst_name = f"{prefix}_{base}_{_uuid_suffix()}{ext or '.jpg'}"
@@ -310,11 +359,9 @@ def _build_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, flo
 
 # -------------------- Movimento (zoom/pan) --------------------
 def _smoothstep_expr(p: str) -> str:
-    # smoothstep: p*p*(3-2*p)
     return f"(({p})*({p})*(3-2*({p})))"
 
 def _kb_in(W: int, H: int, frames_this_slide: int) -> str:
-    # z = 1 + (Zmax-1)*smoothstep(p)
     p = f"(on/{frames_this_slide})"
     ps = _smoothstep_expr(p)
     z = f"(1+({KENBURNS_ZOOM_MAX:.3f}-1)*{ps})"
@@ -328,7 +375,6 @@ def _kb_in(W: int, H: int, frames_this_slide: int) -> str:
     )
 
 def _kb_out(W: int, H: int, frames_this_slide: int) -> str:
-    # z = Zmax + (1-Zmax)*smoothstep(p)  (vai diminuindo até ~1)
     p = f"(on/{frames_this_slide})"
     ps = _smoothstep_expr(p)
     z = f"({KENBURNS_ZOOM_MAX:.3f} + (1-{KENBURNS_ZOOM_MAX:.3f})*{ps})"
@@ -366,10 +412,6 @@ def _pan_ud(W: int, H: int, frames_this_slide: int) -> str:
     )
 
 def _build_slide_branch(idx: int, W: int, H: int, motion: str, per_slide: float) -> str:
-    """
-    Cada slide vira CFR estável:
-      [input] -> zoompan/scale -> format -> setsar -> trim -> setpts -> fps=MOTION_FPS -> [v{idx}]
-    """
     frames_slide = max(1, int(per_slide * MOTION_FPS))
     m = (motion or "none").lower()
 
@@ -405,11 +447,11 @@ def _quote(arg: str) -> str:
     if not arg:
         return '""'
     if any(c in arg for c in ' \t"\''):
-        return f'"{arg.replace("\"", "\\\"")}"'
+        return f"\"{arg.replace('\"', '\\\"')}\""
     return arg
 
 def gerar_video(
-    imagem_path: str,              # imagem de capa (será encenada em IMAGES_DIR)
+    imagem_path: str,
     saida_path: str,
     *,
     preset: str = "hd",
@@ -418,16 +460,15 @@ def gerar_video(
     legendas: bool = True,
     video_style: str = "1",
     motion: str = "none",
-    slides_paths: Optional[List[str]] = None,  # lista de imagens extras (serão encenadas em IMAGES_DIR)
+    slides_paths: Optional[List[str]] = None,
     transition: Optional[str] = None,
-    # ===== NOVOS PARÂMETROS PARA METADADOS =====
+    # ===== METADADOS =====
     autor: Optional[str] = "Gerador IA",
     tags: Optional[str] = None
 ):
-    # Coleta para cleanup
     staged_images: List[str] = []
     staged_tts: Optional[str] = None
-    extra_to_cleanup: List[str] = []  # ex.: original TTS fora de audios/tts
+    extra_to_cleanup: List[str] = []
     last_cmd: List[str] = []
 
     try:
@@ -439,7 +480,6 @@ def gerar_video(
         W, H = conf["w"], conf["h"]
         BR_V, BR_A, LEVEL = conf["br_v"], conf["br_a"], conf["level"]
 
-        # Normaliza lista de slides (inclui a capa se necessário)
         if not slides_paths or not isinstance(slides_paths, list) or not any(os.path.isfile(p) for p in slides_paths):
             slides_paths = [imagem_path]
         slides_paths = [p for p in slides_paths if os.path.isfile(p)]
@@ -447,7 +487,6 @@ def gerar_video(
 
         ffmpeg = _ffmpeg_or_die()
 
-        # Texto longo + TTS
         long_text = gerar_frase_motivacional_longa(idioma)
         lang_norm = _idioma_norm(idioma)
         style_norm = _normalize_style(video_style)
@@ -455,21 +494,18 @@ def gerar_video(
         voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
         dur_voz = _duracao_audio_segundos(voice_audio_path) if voice_audio_path else None
 
-        # === Stage do TTS para audios/tts (e vamos limpar depois) ===
         if voice_audio_path and os.path.isfile(voice_audio_path):
             try:
                 base, ext = os.path.splitext(os.path.basename(voice_audio_path))
                 staged_tts = os.path.join(AUDIO_TTS_DIR, f"{base}_{_uuid_suffix()}{ext or '.wav'}")
                 shutil.copy2(voice_audio_path, staged_tts)
-                # se o original estava em audios_tts/ raiz antiga, vamos limpar também
                 old_parent = os.path.basename(os.path.dirname(voice_audio_path)).lower()
                 if old_parent in ("audios_tts", "audio_tts"):
                     extra_to_cleanup.append(voice_audio_path)
-                voice_audio_path = staged_tts  # usar o staged
+                voice_audio_path = staged_tts
             except Exception as e:
                 logger.warning("Falha ao mover/copiar TTS para %s: %s. Usando original.", AUDIO_TTS_DIR, e)
 
-        # Música de fundo (não limpar depois)
         background_audio_path: Optional[str] = None
         try:
             background_audio_path = obter_caminho_audio()
@@ -479,14 +515,12 @@ def gerar_video(
         has_voice = bool(voice_audio_path)
         has_bg = bool(background_audio_path)
 
-        # Segmentos de legenda
         segments: List[Tuple[float, float, str]] = []
         if legendas and has_voice:
             seg_whisper = _segmentos_via_whisper(voice_audio_path, lang_norm) if WHISPER_ENABLE else []
             segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or DURACAO_MAXIMA_VIDEO)
             logger.info("📝 %d segmentos de legenda.", len(segments))
 
-        # Duração alvo do vídeo
         if segments:
             total_video = min(DURACAO_MAXIMA_VIDEO, max(8.0, segments[-1][1] + 0.45))
         elif dur_voz:
@@ -494,7 +528,6 @@ def gerar_video(
         else:
             total_video = min(DURACAO_MAXIMA_VIDEO, 12.0)
 
-        # Durations por slide e transição
         trans = transition or DEFAULT_TRANSITION or "fade"
         per_slide = total_video / n_slides
         trans_dur = max(0.50, min(0.90, per_slide * 0.135)) if n_slides > 1 else 0.0
@@ -503,13 +536,12 @@ def gerar_video(
                     bool(segments), video_style, style_norm, motion, n_slides, trans)
         logger.info("⏱️ Durations: total≈%.2fs | slide≈%.3fs | trans=%.2fs | motion_fps=%d", total_video, per_slide, trans_dur, MOTION_FPS)
 
-        # === Stage de TODAS as imagens para IMAGES_DIR e usar só esses caminhos >>> limpeza no final ===
         staged_inputs: List[str] = []
         for p in slides_paths:
             try:
                 staged = _stage_to_dir(p, IMAGES_DIR, "stage")
                 staged_inputs.append(staged)
-                staged_images.append(staged)  # marcar para limpar
+                staged_images.append(staged)
             except Exception as e:
                 logger.warning("Falha ao encenar imagem '%s': %s (ignorando este slide)", p, e)
         if not staged_inputs:
@@ -522,7 +554,7 @@ def gerar_video(
         for i in range(len(staged_inputs)):
             parts.append(_build_slide_branch(i, W, H, motion, per_slide))
 
-        # 2) Transições xfade (streams já CFR e com PTS zerado)
+        # 2) Transições xfade
         last_label = "[v0]"
         if len(staged_inputs) >= 2:
             offset = per_slide - trans_dur
@@ -538,9 +570,25 @@ def gerar_video(
         else:
             final_video_label = last_label
 
-        # 3) Normalização final + drawtext
-        parts.append(f"{final_video_label}format=yuv420p,setsar=1/1,fps={FPS_OUT}[vf]")
+        # 3) Look orgânico + normalização final
+        look_ops = []
+        if (VIDEO_SAT != 1.0) or (VIDEO_CONTRAST != 1.0) or (VIDEO_GAMMA != 1.0):
+            look_ops.append(f"eq=saturation={VIDEO_SAT:.3f}:contrast={VIDEO_CONTRAST:.3f}:gamma={VIDEO_GAMMA:.3f}")
+        if VIDEO_SHARP > 0:
+            look_ops.append(f"unsharp=3:3:{VIDEO_SHARP:.3f}:3:3:0.0")
+        if VIDEO_GRAIN > 0:
+            look_ops.append(f"noise=alls={VIDEO_GRAIN}:allf=t")
+        if VIDEO_CHROMA_SHIFT > 0:
+            if _ffmpeg_has_filter("chromashift"):
+                shift = int(VIDEO_CHROMA_SHIFT)
+                look_ops.append(f"chromashift=cbh={shift}:crh={-shift}")
+            else:
+                logger.warning("FFmpeg sem filtro 'chromashift'; seguindo sem deslocamento de croma (defina VIDEO_CHROMA_SHIFT=0 para silenciar).")
 
+        filters = look_ops + [f"format=yuv420p,setsar=1/1,fps={FPS_OUT}"]
+        parts.append(f"{final_video_label}{','.join(filters)}[vf]")
+
+        # 4) Legendas (drawtext)
         draw_chain = ""
         if segments:
             font_for_sub = _pick_drawtext_font(video_style)
@@ -551,51 +599,96 @@ def gerar_video(
         else:
             parts.append(f"[vf]format=yuv420p[vout]")
 
-        # 4) Áudio
-        if has_voice and has_bg:
-            va_idx = len(staged_inputs)
-            ba_idx = len(staged_inputs) + 1
-            voice_filters = []
-            if VOICE_LOUDNORM:
-                voice_filters.append("loudnorm=I=-15:TP=-1.0:LRA=11")
-            voice_filters.append(f"aresample={AUDIO_SR}:async=1")
-            vf_str = ",".join(voice_filters)
+        # 5) Áudio — robusto (padroniza formato + split + duck + mix)
+        fade_in_dur = 0.30
+        fade_out_dur = 0.60
+        fade_out_start = max(0.0, total_video - fade_out_dur)
 
-            parts.append(f"[{va_idx}:a]{vf_str}[va]")
-            parts.append(f"[{ba_idx}:a]volume={BG_MIX_VOLUME},aresample={AUDIO_SR}:async=1[ba]")
-            parts.append(f"[va][ba]amix=inputs=2:duration=longest:dropout_transition=0[aout]")
-        elif has_voice or has_bg:
-            a_idx = len(staged_inputs)
-            if has_voice and VOICE_LOUDNORM:
-                parts.append(f"[{a_idx}:a]loudnorm=I=-15:TP=-1.0:LRA=11,aresample={AUDIO_SR}:async=1[aout]")
+        if has_voice and has_bg:
+            idx_voice = len(staged_inputs)      # ex.: 1
+            idx_bg    = len(staged_inputs) + 1  # ex.: 2
+
+            # VOZ: normaliza (se disponível), padroniza formato e divide em 2 ramos
+            v_chain = []
+            if VOICE_LOUDNORM and _ffmpeg_has_filter("loudnorm"):
+                v_chain.append("loudnorm=I=-15:TP=-1.0:LRA=11")
+            elif VOICE_LOUDNORM:
+                logger.warning("FFmpeg sem 'loudnorm'; seguindo sem normalização.")
+            # padroniza para evitar nego de formato entre filtros
+            v_chain.append(f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR}")
+            v_chain.append(f"aresample={AUDIO_SR}")
+            parts.append(f"[{idx_voice}:a]{','.join(v_chain)},asplit=2[voice_main][voice_sc]")
+
+            # BG: ajusta ganho e padroniza formato
+            parts.append(
+                f"[{idx_bg}:a]"
+                f"volume={BG_MIX_VOLUME},"
+                f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
+                f"aresample={AUDIO_SR}[bg]"
+            )
+
+            if DUCK_ENABLE and _ffmpeg_has_filter("sidechaincompress"):
+                parts.append(
+                    f"[bg][voice_sc]sidechaincompress="
+                    f"threshold={DUCK_THRESH}:ratio={DUCK_RATIO}:attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[bg_duck]"
+                )
+                parts.append(f"[voice_main][bg_duck]amix=inputs=2:duration=longest:dropout_transition=0[mixa]")
             else:
-                parts.append(f"[{a_idx}:a]aresample={AUDIO_SR}:async=1[aout]")
+                if DUCK_ENABLE:
+                    logger.warning("FFmpeg sem 'sidechaincompress'; usando apenas amix (sem ducking).")
+                parts.append(f"[voice_main][bg]amix=inputs=2:duration=longest:dropout_transition=0[mixa]")
+
+            parts.append(
+                f"[mixa]afade=in:st=0:d={fade_in_dur:.2f},"
+                f"afade=out:st={fade_out_start:.2f}:d={fade_out_dur:.2f}[aout]"
+            )
+
+        elif has_voice or has_bg:
+            idx = len(staged_inputs)
+            if has_voice:
+                solo = []
+                if VOICE_LOUDNORM and _ffmpeg_has_filter("loudnorm"):
+                    solo.append("loudnorm=I=-15:TP=-1.0:LRA=11")
+                elif VOICE_LOUDNORM:
+                    logger.warning("FFmpeg sem 'loudnorm'; seguindo sem normalização.")
+                solo.append(f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR}")
+                solo.append(f"aresample={AUDIO_SR}")
+                parts.append(f"[{idx}:a]{','.join(solo)}[amono]")
+            else:
+                parts.append(
+                    f"[{idx}:a]"
+                    f"volume={BG_MIX_VOLUME},"
+                    f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
+                    f"aresample={AUDIO_SR}[amono]"
+                )
+            parts.append(
+                f"[amono]afade=in:st=0:d={fade_in_dur:.2f},"
+                f"afade=out:st={fade_out_start:.2f}:d={fade_out_dur:.2f}[aout]"
+            )
         else:
             parts.append(f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}:d={total_video:.3f}[aout]")
 
         filter_complex = ";".join(parts)
 
-        # dump do filtergraph para debug
+        # salva para debug e usa como script (evita escapagem do Windows)
         fc_path = os.path.join(CACHE_DIR, "last_filter.txt")
         with open(fc_path, "w", encoding="utf-8") as f:
             f.write(filter_complex)
         logger.info("🧩 filter_complex salvo em %s", fc_path)
 
-        # --------- montar comando ffmpeg ----------
-        cmd = [ffmpeg := _ffmpeg_or_die(), "-y", "-loglevel", "error", "-stats"]
+        # --------- comando ffmpeg ----------
+        cmd = [ffmpeg, "-y", "-loglevel", "error", "-stats"]
 
-        # inputs de vídeo (um por slide) — sempre a partir dos encenados em IMAGES_DIR
+        # imagens (cada uma com -loop 1)
         for sp in staged_inputs:
             cmd += ["-loop", "1", "-i", sp]
 
-        # inputs de áudio
+        # entradas de áudio
         if has_voice and voice_audio_path:
             cmd += ["-i", voice_audio_path]
         if has_bg and background_audio_path:
             cmd += ["-i", background_audio_path]
-            
-        # ==================== NOVA SEÇÃO: METADADOS ====================
-        # Gera o título a partir do início da frase
+
         title = (long_text[:75] + '...') if len(long_text) > 75 else long_text
         default_tags = "motivacional, inspirador, reflexão, shorts, reels, AI"
 
@@ -609,16 +702,25 @@ def gerar_video(
             "keywords": tags if tags else default_tags,
             "genre": "Inspirational",
             "creation_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "software": "Gerador de Vídeo Automático"
         }
-        
-        metadata_flags = []
+
+        if META_SPOOF_ENABLE:
+            metadata.update({
+                "make": META_MAKE,
+                "model": META_MODEL,
+                "software": META_SOFTWARE,
+                "location": META_LOCATION_ISO6709,
+                "location-eng": META_LOCATION_ISO6709,
+                "com.apple.quicktime.location.ISO6709": META_LOCATION_ISO6709,
+            })
+        else:
+            metadata["software"] = "Gerador de Vídeo Automático"
+
+        meta_flags: List[str] = []
         for key, value in metadata.items():
             if value:
-                metadata_flags.extend(["-metadata", f"{key}={value}"])
-        # =================================================================
+                meta_flags.extend(["-metadata", f"{key}={value}"])
 
-        # Saída — usar poucas threads ajuda a não travar
         common_out = [
             "-t", f"{total_video:.3f}",
             "-r", str(FPS_OUT),
@@ -635,17 +737,17 @@ def gerar_video(
             "-b:a", conf["br_a"],
             "-ar", str(AUDIO_SR),
             "-ac", "2",
-            "-movflags", "+faststart",
+            "-movflags", "+faststart+use_metadata_tags",
             "-x264-params", f"keyint={FPS_OUT*2}:min-keyint={FPS_OUT*2}:scenecut=0",
-            "-map_metadata", "-1",  # Limpa metadados dos arquivos de entrada
+            "-map_metadata", "-1",
             "-threads", "2",
         ]
 
-        cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]"]
+        # usa o script (mais robusto em Windows)
+        cmd += ["-filter_complex_script", fc_path, "-map", "[vout]", "-map", "[aout]"]
         cmd += common_out
-        cmd += metadata_flags  # <--- ADICIONA AS FLAGS DE METADADOS AQUI
+        cmd += meta_flags
 
-        # saída
         if os.path.isdir(saida_path):
             base = os.path.splitext(os.path.basename(imagem_path))[0]
             ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -653,7 +755,6 @@ def gerar_video(
         os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
         cmd.append(saida_path)
 
-        # salvar o comando para uso no except
         last_cmd = cmd[:]
 
         logger.info("📂 CWD: %s", os.getcwd())
@@ -664,7 +765,6 @@ def gerar_video(
 
     except subprocess.CalledProcessError as e:
         logger.error("❌ FFmpeg falhou (%s).", e)
-        # salva scripts de replay para facilitar teste manual
         try:
             bat_path = os.path.join(CACHE_DIR, "replay_ffmpeg.bat")
             sh_path  = os.path.join(CACHE_DIR, "replay_ffmpeg.sh")
@@ -682,7 +782,6 @@ def gerar_video(
             logger.debug("Falha ao salvar scripts de replay: %s", w)
         raise
     finally:
-        # -------- LIMPEZA: imagens encenadas + TTS copiado + resíduos antigos --------
         for fp in staged_images:
             try:
                 if fp and os.path.isfile(fp):
@@ -703,7 +802,6 @@ def gerar_video(
             except Exception as e:
                 logger.debug("Não consegui apagar TTS antigo '%s': %s", old, e)
 
-        # remove diretórios vazios opcionais
         for d in (AUDIO_TTS_DIR,):
             try:
                 if os.path.isdir(d) and not os.listdir(d):

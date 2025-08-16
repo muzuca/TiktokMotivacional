@@ -128,25 +128,21 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
     sw = _PT_SW if lang == "pt" else _EN_SW
     base = _clean_line(text)
 
-    # quantos destaques vieram?
     spans = list(re.finditer(r'\*\*([^*]+)\*\*', base))
     if len(spans) == 1:
-        # normaliza: no máximo 2 palavras dentro
         inner = spans[0].group(1).strip()
         words = [w for w in re.findall(r"[\w’'-]+", inner) if w]
         if len(words) > 2:
-            inner = " ".join(words[-2:])  # deixa só 1–2 mais ao fim
-        base = re.sub(r'\*\*([^*]+)\*\*', inner, base, count=0)  # remove todos
-        # recoloca um no fim do texto (última ocorrência do inner)
-        idx = base.lower().rfind(inner.lower())
+            inner = " ".join(words[-2:])
+        # remove e recoloca a última ocorrência do inner
+        base_no = re.sub(r'\*\*([^*]+)\*\*', r'\1', base)
+        idx = base_no.lower().rfind(inner.lower())
         if idx >= 0:
-            return base[:idx] + "**" + base[idx:idx+len(inner)] + "**" + base[idx+len(inner):]
-        # fallback: injeta automático
-    # zero ou muitos: remove e injeta automático
+            return base_no[:idx] + "**" + base_no[idx:idx+len(inner)] + "**" + base_no[idx+len(inner):]
+
     base = _strip_emph(base)
 
     tokens = re.findall(r"\w+|\W+", base, flags=re.UNICODE)
-    # acha últimas 1–2 palavras "de conteúdo"
     picks: List[int] = []
     for i in range(len(tokens)-1, -1, -1):
         if re.match(r"\w+", tokens[i], flags=re.UNICODE):
@@ -158,7 +154,6 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
     if not picks:
         return base
     picks = sorted(picks)
-    # coloca ** em volta do trecho contínuo (1 ou 2 palavras)
     i0, i1 = picks[0], picks[-1]
     tokens[i0] = "**" + tokens[i0]
     tokens[i1] = tokens[i1] + "**"
@@ -213,7 +208,6 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
     used = load_used_phrases()
     lang = _lang_tag(idioma)
 
-    # prompts com instruções de marcação
     prompt_text = (
         "Write 16 motivational short sentences in English. "
         "Each must have 9–20 words, natural and non-cliché. "
@@ -228,10 +222,8 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
         "Sem hashtags ou aspas. Retorne APENAS um array JSON de strings."
     )
 
-    # coleta
     items = _ask_json_list(prompt_text, temperature=0.95, tries=3)
 
-    # pós-processa, garante a marcação, filtra tamanho e novidade
     pool: List[str] = []
     for s in items:
         s = _clean_line(s)
@@ -240,14 +232,12 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
         if 9 <= wc <= 20:
             pool.append(s)
 
-    # se veio vazio, um fallback curto com marcação automática
     if not pool:
         base = "A vida é curta demais — faça hoje o que aproxima dos seus sonhos" \
             if lang == "pt" else \
             "Life is short — do today what moves you closer to your dreams"
         pool = [_ensure_single_emphasis(base, lang)]
 
-    # escolhe uma ainda não usada (hash ignora **)
     random.shuffle(pool)
     for cand in pool:
         key = _md5(_strip_emph(cand))
@@ -256,7 +246,6 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
             logger.info("🧠 Frase motivacional escolhida: %s", cand)
             return cand
 
-    # se todas repetidas, devolve a primeira mesmo
     return pool[0]
 
 
