@@ -1,4 +1,4 @@
-# utils/video.py
+#video.py
 import os
 import re
 import logging
@@ -409,7 +409,7 @@ def _quote(arg: str) -> str:
     return arg
 
 def gerar_video(
-    imagem_path: str,             # imagem de capa (será encenada em IMAGES_DIR)
+    imagem_path: str,              # imagem de capa (será encenada em IMAGES_DIR)
     saida_path: str,
     *,
     preset: str = "hd",
@@ -418,8 +418,11 @@ def gerar_video(
     legendas: bool = True,
     video_style: str = "1",
     motion: str = "none",
-    slides_paths: Optional[List[str]] = None,   # lista de imagens extras (serão encenadas em IMAGES_DIR)
-    transition: Optional[str] = None
+    slides_paths: Optional[List[str]] = None,  # lista de imagens extras (serão encenadas em IMAGES_DIR)
+    transition: Optional[str] = None,
+    # ===== NOVOS PARÂMETROS PARA METADADOS =====
+    autor: Optional[str] = "Gerador IA",
+    tags: Optional[str] = None
 ):
     # Coleta para cleanup
     staged_images: List[str] = []
@@ -590,6 +593,30 @@ def gerar_video(
             cmd += ["-i", voice_audio_path]
         if has_bg and background_audio_path:
             cmd += ["-i", background_audio_path]
+            
+        # ==================== NOVA SEÇÃO: METADADOS ====================
+        # Gera o título a partir do início da frase
+        title = (long_text[:75] + '...') if len(long_text) > 75 else long_text
+        default_tags = "motivacional, inspirador, reflexão, shorts, reels, AI"
+
+        metadata = {
+            "title": title,
+            "artist": autor or "Autor Desconhecido",
+            "album_artist": autor or "Autor Desconhecido",
+            "composer": autor or "Autor Desconhecido",
+            "comment": long_text,
+            "description": long_text,
+            "keywords": tags if tags else default_tags,
+            "genre": "Inspirational",
+            "creation_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "software": "Gerador de Vídeo Automático"
+        }
+        
+        metadata_flags = []
+        for key, value in metadata.items():
+            if value:
+                metadata_flags.extend(["-metadata", f"{key}={value}"])
+        # =================================================================
 
         # Saída — usar poucas threads ajuda a não travar
         common_out = [
@@ -610,12 +637,13 @@ def gerar_video(
             "-ac", "2",
             "-movflags", "+faststart",
             "-x264-params", f"keyint={FPS_OUT*2}:min-keyint={FPS_OUT*2}:scenecut=0",
-            "-map_metadata", "-1",
+            "-map_metadata", "-1",  # Limpa metadados dos arquivos de entrada
             "-threads", "2",
         ]
 
         cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]"]
         cmd += common_out
+        cmd += metadata_flags  # <--- ADICIONA AS FLAGS DE METADADOS AQUI
 
         # saída
         if os.path.isdir(saida_path):

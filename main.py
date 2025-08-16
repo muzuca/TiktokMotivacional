@@ -6,18 +6,22 @@ from datetime import datetime, timedelta
 import random
 import shutil
 from glob import glob
-from dotenv import load_dotenv
 
+# >>> Carrega o .env o mais cedo possível e com override
+from dotenv import load_dotenv, find_dotenv
+ENV_PATH = find_dotenv(usecwd=True)
+load_dotenv(ENV_PATH, override=True)
+
+# Só depois do .env carregado, importamos os utilitários que lêem variáveis
 from utils.frase import gerar_prompt_paisagem, gerar_frase_motivacional, gerar_slug
 from utils.imagem import gerar_imagem_com_frase, escrever_frase_na_imagem, montar_slides_pexels
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
-load_dotenv()
-
 # LOG_LEVEL do .env (INFO default)
+LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    level=LOG_LEVEL,
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S'
 )
@@ -41,7 +45,6 @@ MOTION_OPTIONS = {
 }
 
 DEFAULT_SLIDES_COUNT = int(os.getenv("SLIDES_COUNT", "4"))
-
 IMAGENS_DIR = "imagens"
 IMAGENS_SLIDES_TXT = os.path.join(IMAGENS_DIR, "slides_txt")
 AUDIOS_DIR = "audios"
@@ -94,10 +97,7 @@ def _limpar_pre_post(imagem_base: str, imagem_capa: str):
             _safe_unlink(p)
 
 def _limpar_pos_post(imagem_base: str, imagem_capa: str):
-    """
-    Executa após postar:
-      - remove também imagem_base e imagem_capa
-    """
+    """Executa após postar: remove também imagem_base e imagem_capa."""
     _safe_unlink(imagem_base)
     _safe_unlink(imagem_capa)
 
@@ -194,13 +194,21 @@ def _selecionar_qtd_fotos(padrao: int) -> int:
         return max(1, min(10, padrao))
 
 def _map_video_style_to_image_template(style_key: str) -> str:
+    """
+    Mapeia o estilo escolhido no menu para o template de imagem.
+    Agora 'classic' realmente usa 'classic_serif'.
+    """
     s = (style_key or "").lower()
-    if s in ("classic", "clean", "1", "5"):
+    if s in ("classic", "1"):
+        return "classic_serif"
+    if s in ("clean", "5"):
         return "modern_block"
     if s in ("serif", "3"):
         return "classic_serif"
     if s in ("mono", "4"):
         return "minimal_center"
+    if s in ("modern", "2"):
+        return "modern_block"
     return "minimal_center"
 
 # --------------------- pipeline ---------------------
