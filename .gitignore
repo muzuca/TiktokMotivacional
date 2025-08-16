@@ -11,3 +11,4 @@ imagens/
 cache/
 audio_tts/
 venv/
+whisper_models/
