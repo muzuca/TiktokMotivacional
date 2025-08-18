@@ -1,6 +1,7 @@
 # utils/tiktok.py
 
 import os
+import re
 import time  # Para delays
 from datetime import datetime, timedelta
 from .tiktok_uploader.upload import upload_video  # Import local da pasta tiktok_uploader
@@ -21,6 +22,10 @@ PASTA_VIDEOS = "videos"
 PASTA_IMAGENS = "imagens"
 PASTA_AUDIOS = "audios"
 
+# Controla se removemos marcações markdown da legenda
+_STRIP_FLAG = os.getenv("STRIP_MARKDOWN_IN_DESC", "1").strip().lower()
+STRIP_MARKDOWN_IN_DESC = _STRIP_FLAG not in ("0", "false", "no", "off")
+
 
 def _normalizar_idioma(v: Optional[str]) -> str:
     """Normaliza a entrada do idioma para 'en', 'pt-br' ou 'auto'."""
@@ -30,6 +35,27 @@ def _normalizar_idioma(v: Optional[str]) -> str:
     if s in ("2", "pt", "pt-br", "br", "brasil", "portugues", "português"):
         return "pt-br"
     return "auto"
+
+
+_MD_PATTERNS = (
+    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),   # **bold**
+    (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),   # *italic*
+    (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),   # __underline__
+    (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),   # _italic_
+    (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),   # ~~strike~~
+    (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),   # `code`
+)
+
+def _strip_markdown(texto: str) -> str:
+    """Remove marcações básicas de Markdown e normaliza espaços."""
+    s = (texto or "")
+    for pat, rep in _MD_PATTERNS:
+        s = pat.sub(rep, s)
+    # Normaliza aspas “ ” ’
+    s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
+    # Colapsa espaços múltiplos
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
 
 
 def obter_ultimo_video(pasta=PASTA_VIDEOS):
@@ -85,12 +111,21 @@ def postar_no_tiktok_e_renomear(
         hashtags_pt = " #Motivacao #Inspiracao #TikTokMotivacional"
         hashtags = hashtags_pt if idioma_norm == 'pt-br' else hashtags_en
 
+        # Monta a descrição e limpa markdown, se habilitado
         if descricao_personalizada:
-            description = descricao_personalizada + hashtags
+            base_desc = descricao_personalizada
         else:
-            description = ("Motivational content of the day!" + hashtags_en
-                           if idioma_norm == 'en' else
-                           "Conteúdo motivacional do dia!" + hashtags_pt)
+            base_desc = ("Motivational content of the day!"
+                         if idioma_norm == 'en' else
+                         "Conteúdo motivacional do dia!")
+
+        if STRIP_MARKDOWN_IN_DESC:
+            cleaned = _strip_markdown(base_desc)
+            if cleaned != base_desc:
+                logger.debug("🧹 Limpando markdown da descrição: '%s' -> '%s'", base_desc, cleaned)
+            base_desc = cleaned
+
+        description = base_desc + hashtags
 
         schedule = None
         if agendar:
@@ -98,6 +133,7 @@ def postar_no_tiktok_e_renomear(
             logger.info("📅 Agendando post para: %s", schedule.strftime("%H:%M:%S"))
 
         logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
+        logger.info("📝 Descrição final: %s", description)
         time.sleep(2)  # Delay antes do upload para estabilidade da rede
 
         # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

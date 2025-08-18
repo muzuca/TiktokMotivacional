@@ -28,6 +28,7 @@ PRESETS = {
     "fullhd": {"w": 1080, "h": 1920, "br_v": "5000k", "br_a": "192k", "level": "4.0"},
 }
 
+# Mantido por compatibilidade; não usamos como teto duro
 DURACAO_MAXIMA_VIDEO = 20.0
 FPS_OUT = 30
 AUDIO_SR = 44100
@@ -85,9 +86,9 @@ if MOTION_FPS != _MOTION_FPS_ENV:
 VIDEO_SAT          = _env_float("VIDEO_SAT", 1.00)
 VIDEO_CONTRAST     = _env_float("VIDEO_CONTRAST", 1.00)
 VIDEO_GAMMA        = _env_float("VIDEO_GAMMA", 1.00)
-VIDEO_SHARP        = _env_float("VIDEO_SHARP", 0.00)  # ex.: 0.35
-VIDEO_GRAIN        = _env_int  ("VIDEO_GRAIN", 0)     # 0..20
-VIDEO_CHROMA_SHIFT = _env_int  ("VIDEO_CHROMA_SHIFT", 0)  # 0=off, 1..2 sutil
+VIDEO_SHARP        = _env_float("VIDEO_SHARP", 0.00)
+VIDEO_GRAIN        = _env_int  ("VIDEO_GRAIN", 0)
+VIDEO_CHROMA_SHIFT = _env_int  ("VIDEO_CHROMA_SHIFT", 0)
 
 # Ducking
 DUCK_ENABLE     = _env_bool("DUCK_ENABLE", True)
@@ -112,6 +113,12 @@ META_MODEL           = os.getenv("META_MODEL", "iPhone 13")
 META_SOFTWARE        = os.getenv("META_SOFTWARE", "iOS 17.5.1")
 META_LOCATION_ISO6709= os.getenv("META_LOCATION_ISO6709", "+37.7749-122.4194+000.00/")
 
+# >>> Respeitar TTS
+VIDEO_RESPECT_TTS = _env_bool("VIDEO_RESPECT_TTS", True)
+VIDEO_TAIL_PAD    = _env_float("VIDEO_TAIL_PAD", 0.40)   # margem após a fala
+VIDEO_MAX_S       = _env_float("VIDEO_MAX_S", 0.0)       # 0 = sem teto
+TPAD_EPS          = _env_float("TPAD_EPS", 0.25)         # segurança para arredondamentos
+
 # -------------------- Helpers --------------------
 def _ffmpeg_or_die() -> str:
     path = shutil.which("ffmpeg")
@@ -126,7 +133,6 @@ def _ffprobe_or_die() -> str:
     return path
 
 def _ffmpeg_has_filter(filter_name: str) -> bool:
-    """Verifica se o FFmpeg suporta um filtro específico."""
     try:
         out = subprocess.check_output(
             [_ffmpeg_or_die(), "-hide_banner", "-filters"],
@@ -136,7 +142,6 @@ def _ffmpeg_has_filter(filter_name: str) -> bool:
             errors="ignore",
         )
         for line in out.splitlines():
-            # formato típico: " T.. chromashift         V->V       Shift chroma."
             if re.search(rf"\b{re.escape(filter_name)}\b", line):
                 return True
         return False
@@ -223,7 +228,7 @@ def _segmentos_legenda_palavras(texto: str, duracao_audio: float) -> List[Tuple[
         return []
     chunks = _chunk_words(tokens)
     lines = [" ".join(ch).upper() for ch in chunks]
-    alvo = max(3.0, min(DURACAO_MAXIMA_VIDEO - 0.3, (duracao_audio or DURACAO_MAXIMA_VIDEO) - 0.2))
+    alvo = max(3.0, (duracao_audio or 12.0) - 0.2)
     gap = 0.10
     duracoes = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
     t = 0.25
@@ -245,6 +250,9 @@ def _segmentos_via_whisper(audio_path: str, idioma: str) -> List[Tuple[float, fl
         return []
     lang_code = "pt" if (idioma or "").lower().startswith("pt") else "en"
     try:
+        dur_audio = _duracao_audio_segundos(audio_path) or 0.0
+        cap = dur_audio + 0.10 if dur_audio > 0 else 60.0
+
         logger.info("🧩 Whisper: carregando modelo '%s' (%s, %s) ...", WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
         model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE, download_root=WHISPER_MODEL_CACHE)
         segments, _info = model.transcribe(audio_path, language=lang_code, beam_size=WHISPER_BEAM_SIZE, vad_filter=WHISPER_VAD, word_timestamps=True)
@@ -270,13 +278,13 @@ def _segmentos_via_whisper(audio_path: str, idioma: str) -> List[Tuple[float, fl
             chunk = words[i:i + take]
             ini, fim = chunk[0][0], chunk[-1][1]
             texto = " ".join([w[2] for w in chunk]).upper()
-            if ini < DURACAO_MAXIMA_VIDEO and fim > 0:
+            if ini < cap and fim > 0:
                 ini2 = max(0.20, ini)
-                fim2 = min(DURACAO_MAXIMA_VIDEO - 0.05, fim)
+                fim2 = min(cap - 0.05, fim)
                 if fim2 > ini2 + 0.12:
                     out.append((ini2, fim2, texto))
             i += take
-        out = [(s, e, t) for (s, e, t) in out if s < DURACAO_MAXIMA_VIDEO]
+        out = [(s, e, t) for (s, e, t) in out if s < cap]
         logger.info("📝 %d segmentos via Whisper.", len(out))
         return out
     except Exception as e:
@@ -463,7 +471,7 @@ def gerar_video(
     slides_paths: Optional[List[str]] = None,
     transition: Optional[str] = None,
     # ===== METADADOS =====
-    autor: Optional[str] = "Gerador IA",
+    autor: Optional[str] = "Capcut",
     tags: Optional[str] = None
 ):
     staged_images: List[str] = []
@@ -493,6 +501,7 @@ def gerar_video(
 
         voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
         dur_voz = _duracao_audio_segundos(voice_audio_path) if voice_audio_path else None
+        logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz or 0.0)
 
         if voice_audio_path and os.path.isfile(voice_audio_path):
             try:
@@ -518,23 +527,32 @@ def gerar_video(
         segments: List[Tuple[float, float, str]] = []
         if legendas and has_voice:
             seg_whisper = _segmentos_via_whisper(voice_audio_path, lang_norm) if WHISPER_ENABLE else []
-            segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or DURACAO_MAXIMA_VIDEO)
+            segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or 12.0)
             logger.info("📝 %d segmentos de legenda.", len(segments))
 
-        if segments:
-            total_video = min(DURACAO_MAXIMA_VIDEO, max(8.0, segments[-1][1] + 0.45))
-        elif dur_voz:
-            total_video = min(DURACAO_MAXIMA_VIDEO, max(8.0, dur_voz + 0.25))
+        # --- duração alvo do vídeo (segue TTS) ---
+        if has_voice and VIDEO_RESPECT_TTS and (dur_voz or 0) > 0:
+            base_len = max(5.0, (dur_voz or 0) + VIDEO_TAIL_PAD)
+            total_video = min(base_len, VIDEO_MAX_S) if (VIDEO_MAX_S and VIDEO_MAX_S > 0) else base_len
         else:
-            total_video = min(DURACAO_MAXIMA_VIDEO, 12.0)
+            if segments:
+                total_video = max(8.0, segments[-1][1] + 0.45)
+            elif dur_voz:
+                total_video = max(8.0, (dur_voz or 0) + 0.25)
+            else:
+                total_video = 12.0
 
+        # 1) calcula transição a partir de um per_slide aproximado
+        per_slide_rough = total_video / n_slides
         trans = transition or DEFAULT_TRANSITION or "fade"
-        per_slide = total_video / n_slides
-        trans_dur = max(0.50, min(0.90, per_slide * 0.135)) if n_slides > 1 else 0.0
+        trans_dur = max(0.50, min(0.90, per_slide_rough * 0.135)) if n_slides > 1 else 0.0
 
-        logger.info("⚙️ legendas=%s | style='%s'(=%s) | motion=%s | slides=%d | transition=%s",
-                    bool(segments), video_style, style_norm, motion, n_slides, trans)
-        logger.info("⏱️ Durations: total≈%.2fs | slide≈%.3fs | trans=%.2fs | motion_fps=%d", total_video, per_slide, trans_dur, MOTION_FPS)
+        # 2) corrige per_slide para compensar o overlap do xfade:
+        #    comprimento_out = n*per_slide - (n-1)*trans_dur = total_video  =>  per_slide = (total_video + (n-1)*trans_dur)/n
+        per_slide = (total_video + (n_slides - 1) * trans_dur) / n_slides
+
+        logger.info("⏱️ Target: total=%.3fs | n=%d | per_slide=%.3fs | xfade=%.3fs | perda_overlap=%.3fs",
+                    total_video, n_slides, per_slide, trans_dur, (n_slides - 1) * trans_dur)
 
         staged_inputs: List[str] = []
         for p in slides_paths:
@@ -570,7 +588,7 @@ def gerar_video(
         else:
             final_video_label = last_label
 
-        # 3) Look orgânico + normalização final
+        # 3) Look orgânico + normalização final + tpad+trim para garantir duração exata
         look_ops = []
         if (VIDEO_SAT != 1.0) or (VIDEO_CONTRAST != 1.0) or (VIDEO_GAMMA != 1.0):
             look_ops.append(f"eq=saturation={VIDEO_SAT:.3f}:contrast={VIDEO_CONTRAST:.3f}:gamma={VIDEO_GAMMA:.3f}")
@@ -583,10 +601,15 @@ def gerar_video(
                 shift = int(VIDEO_CHROMA_SHIFT)
                 look_ops.append(f"chromashift=cbh={shift}:crh={-shift}")
             else:
-                logger.warning("FFmpeg sem filtro 'chromashift'; seguindo sem deslocamento de croma (defina VIDEO_CHROMA_SHIFT=0 para silenciar).")
+                logger.warning("FFmpeg sem 'chromashift'; seguindo sem deslocamento de croma.")
 
         filters = look_ops + [f"format=yuv420p,setsar=1/1,fps={FPS_OUT}"]
-        parts.append(f"{final_video_label}{','.join(filters)}[vf]")
+        # tpad clona o último frame para cobrir sobras de arredondamento, depois trimamos no total exato
+        parts.append(
+            f"{final_video_label}{','.join(filters)},"
+            f"tpad=stop_mode=clone:stop_duration={max(TPAD_EPS, 0.01):.3f},"
+            f"trim=duration={total_video:.3f},setpts=PTS-STARTPTS[vf]"
+        )
 
         # 4) Legendas (drawtext)
         draw_chain = ""
@@ -599,32 +622,29 @@ def gerar_video(
         else:
             parts.append(f"[vf]format=yuv420p[vout]")
 
-        # 5) Áudio — robusto (padroniza formato + split + duck + mix)
+        # 5) Áudio — segue a VOZ e casa com o total do vídeo
         fade_in_dur = 0.30
         fade_out_dur = 0.60
         fade_out_start = max(0.0, total_video - fade_out_dur)
 
         if has_voice and has_bg:
-            idx_voice = len(staged_inputs)      # ex.: 1
-            idx_bg    = len(staged_inputs) + 1  # ex.: 2
+            idx_voice = len(staged_inputs)
+            idx_bg    = len(staged_inputs) + 1
 
-            # VOZ: normaliza (se disponível), padroniza formato e divide em 2 ramos
             v_chain = []
             if VOICE_LOUDNORM and _ffmpeg_has_filter("loudnorm"):
                 v_chain.append("loudnorm=I=-15:TP=-1.0:LRA=11")
             elif VOICE_LOUDNORM:
                 logger.warning("FFmpeg sem 'loudnorm'; seguindo sem normalização.")
-            # padroniza para evitar nego de formato entre filtros
             v_chain.append(f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR}")
-            v_chain.append(f"aresample={AUDIO_SR}")
+            v_chain.append(f"aresample={AUDIO_SR}:async=1")
             parts.append(f"[{idx_voice}:a]{','.join(v_chain)},asplit=2[voice_main][voice_sc]")
 
-            # BG: ajusta ganho e padroniza formato
             parts.append(
                 f"[{idx_bg}:a]"
                 f"volume={BG_MIX_VOLUME},"
                 f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
-                f"aresample={AUDIO_SR}[bg]"
+                f"aresample={AUDIO_SR}:async=1[bg]"
             )
 
             if DUCK_ENABLE and _ffmpeg_has_filter("sidechaincompress"):
@@ -632,14 +652,16 @@ def gerar_video(
                     f"[bg][voice_sc]sidechaincompress="
                     f"threshold={DUCK_THRESH}:ratio={DUCK_RATIO}:attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[bg_duck]"
                 )
-                parts.append(f"[voice_main][bg_duck]amix=inputs=2:duration=longest:dropout_transition=0[mixa]")
+                parts.append(f"[voice_main][bg_duck]amix=inputs=2:duration=first:dropout_transition=0[mixa]")
             else:
                 if DUCK_ENABLE:
                     logger.warning("FFmpeg sem 'sidechaincompress'; usando apenas amix (sem ducking).")
-                parts.append(f"[voice_main][bg]amix=inputs=2:duration=longest:dropout_transition=0[mixa]")
+                parts.append(f"[voice_main][bg]amix=inputs=2:duration=first:dropout_transition=0[mixa]")
 
             parts.append(
-                f"[mixa]afade=in:st=0:d={fade_in_dur:.2f},"
+                f"[mixa]"
+                f"atrim=end={total_video:.3f},asetpts=PTS-STARTPTS,"
+                f"afade=in:st=0:d={fade_in_dur:.2f},"
                 f"afade=out:st={fade_out_start:.2f}:d={fade_out_dur:.2f}[aout]"
             )
 
@@ -652,17 +674,19 @@ def gerar_video(
                 elif VOICE_LOUDNORM:
                     logger.warning("FFmpeg sem 'loudnorm'; seguindo sem normalização.")
                 solo.append(f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR}")
-                solo.append(f"aresample={AUDIO_SR}")
+                solo.append(f"aresample={AUDIO_SR}:async=1")
                 parts.append(f"[{idx}:a]{','.join(solo)}[amono]")
             else:
                 parts.append(
                     f"[{idx}:a]"
                     f"volume={BG_MIX_VOLUME},"
                     f"aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
-                    f"aresample={AUDIO_SR}[amono]"
+                    f"aresample={AUDIO_SR}:async=1[amono]"
                 )
             parts.append(
-                f"[amono]afade=in:st=0:d={fade_in_dur:.2f},"
+                f"[amono]"
+                f"atrim=end={total_video:.3f},asetpts=PTS-STARTPTS,"
+                f"afade=in:st=0:d={fade_in_dur:.2f},"
                 f"afade=out:st={fade_out_start:.2f}:d={fade_out_dur:.2f}[aout]"
             )
         else:
@@ -673,7 +697,7 @@ def gerar_video(
         # salva para debug e usa como script (evita escapagem do Windows)
         fc_path = os.path.join(CACHE_DIR, "last_filter.txt")
         with open(fc_path, "w", encoding="utf-8") as f:
-            f.write(filter_complex)
+            f.write(filter_complex.rstrip() + "\n")
         logger.info("🧩 filter_complex salvo em %s", fc_path)
 
         # --------- comando ffmpeg ----------
@@ -722,7 +746,6 @@ def gerar_video(
                 meta_flags.extend(["-metadata", f"{key}={value}"])
 
         common_out = [
-            "-t", f"{total_video:.3f}",
             "-r", str(FPS_OUT),
             "-vsync", "cfr",
             "-pix_fmt", "yuv420p",
@@ -741,10 +764,13 @@ def gerar_video(
             "-x264-params", f"keyint={FPS_OUT*2}:min-keyint={FPS_OUT*2}:scenecut=0",
             "-map_metadata", "-1",
             "-threads", "2",
+            # sem -shortest: durations já casadas por trim/atrim
         ]
 
         # usa o script (mais robusto em Windows)
         cmd += ["-filter_complex_script", fc_path, "-map", "[vout]", "-map", "[aout]"]
+        # também forçamos um -t total para o muxer, combinando com os trims
+        cmd += ["-t", f"{total_video:.3f}"]
         cmd += common_out
         cmd += meta_flags
 
@@ -758,7 +784,7 @@ def gerar_video(
         last_cmd = cmd[:]
 
         logger.info("📂 CWD: %s", os.getcwd())
-        logger.info("🎬 FFmpeg: %s", " ".join(_quote(a) for a in cmd))
+        logger.info("🎬 FFmpeg args:\n%s", "\n".join(_quote(a) for a in cmd))
 
         subprocess.run(cmd, check=True)
         logger.info("✅ Vídeo salvo: %s", saida_path)
