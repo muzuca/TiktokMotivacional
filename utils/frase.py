@@ -71,6 +71,8 @@ def _lang_tag(idioma: Optional[str]) -> str:
     s = (idioma or "en").strip().lower()
     if s in ("pt", "pt-br", "br", "brasil", "portugues", "português"):
         return "pt"
+    if s.startswith("ar"):
+        return "ar"
     return "en"
 
 def _md5(s: str) -> str:
@@ -134,7 +136,6 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
         words = [w for w in re.findall(r"[\w’'-]+", inner) if w]
         if len(words) > 2:
             inner = " ".join(words[-2:])
-        # remove e recoloca a última ocorrência do inner
         base_no = re.sub(r'\*\*([^*]+)\*\*', r'\1', base)
         idx = base_no.lower().rfind(inner.lower())
         if idx >= 0:
@@ -160,7 +161,7 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
     return "".join(tokens)
 
 # -----------------------------------------------------------------------------#
-# Geradores
+# Geradores (Motivacional – existentes)
 # -----------------------------------------------------------------------------#
 def gerar_prompt_paisagem(idioma: str = "en") -> str:
     if not os.getenv("GEMINI_API_KEY"):
@@ -249,7 +250,7 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
     return pool[0]
 
 
-# Longa (mantida)
+# Longa (motivacional – mantida)
 def _gen_call(prompt: str, generation_config: dict) -> Optional[str]:
     try:
         resp = model.generate_content(
@@ -332,6 +333,8 @@ def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
     used = load_used_phrases()
     prefix = "LONG::"
     lang = _lang_tag(idioma)
+    if lang == "ar":
+        return "استقبل رسائل الكون بقلب هادئ. تذكّر: كل اختيار اليوم يغيّر مصيرك. ثق بحدسك وامضِ بخطوات واثقة."
 
     for round_idx in range(1, 4):
         try:
@@ -365,6 +368,142 @@ def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
     return ("Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos."
             if lang == "pt"
             else "You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams.")
+
+# -----------------------------------------------------------------------------#
+# Tarot (Fase 4)
+# -----------------------------------------------------------------------------#
+def gerar_prompt_tarot(idioma: str = "en") -> str:
+    """
+    Prompt curto para Pexels/planos de fundo (sempre em inglês p/ melhor match).
+    Conteúdo: mesa de cartas, velas, atmosfera mística, vertical/cinematic.
+    """
+    if not os.getenv("GEMINI_API_KEY"):
+        logger.warning("GEMINI_API_KEY ausente — usando prompt tarot padrão.")
+        return "tarot table, candlelight, mystic fortune teller hands shuffling cards, purple velvet, cinematic, vertical"
+
+    used = load_used_phrases()
+    prefix = "PROMPT_TAROT::"
+
+    prompt_text = (
+        "Create 16 short visual queries for stock images about tarot/fortune-telling. "
+        "Each query <= 12 words, English, concrete nouns/visual cues only, vertical/cinematic vibe. "
+        "Return ONLY a JSON array of strings."
+    )
+    items = _ask_json_list(prompt_text, temperature=0.9, tries=3)
+    items = [i for i in items if len(i.split()) <= 12]
+
+    random.shuffle(items)
+    for it in items:
+        key = prefix + _md5(it)
+        if key not in used:
+            used.add(key); save_used_phrases(used)
+            logger.info("🔮 Prompt tarot gerado: %s", it)
+            return it
+
+    return "tarot table, candlelight, mystic fortune teller hands, purple velvet, cinematic, vertical"
+
+def gerar_frase_tarot_curta(idioma: str = "en") -> str:
+    """
+    Frase curta para capa/descrição. Sem markdown, sem hashtags.
+    """
+    lang = _lang_tag(idioma)
+    if not os.getenv("GEMINI_API_KEY"):
+        return ("A carta certa aparece quando você está pronto." if lang == "pt"
+                else ("البطاقة المناسبة تظهر حين يكون قلبك مستعدًا." if lang == "ar"
+                else "The right card appears when your heart is ready."))
+
+    used = load_used_phrases()
+    prefix = "TAROT_SHORT::"
+
+    if lang == "ar":
+        prompt = (
+            "اكتب 16 جملة قصيرة مستوحاة من قراءة التاروت باللهجة العربية المفهومة في مصر. "
+            "كل جملة بين 6 و 14 كلمة، بلا علامات تنصيص ولا وسوم. "
+            "تكون روحانية ولطيفة وتدعو للتأمل بلا وعود حتمية. "
+            "أعد فقط مصفوفة JSON من السلاسل."
+        )
+    elif lang == "pt":
+        prompt = (
+            "Escreva 16 frases curtas inspiradas em leitura de tarô, em português do Brasil. "
+            "Cada uma com 6–14 palavras, sem aspas e sem hashtags; tom místico, gentil, sem promessas determinísticas. "
+            "Retorne APENAS um array JSON de strings."
+        )
+    else:
+        prompt = (
+            "Write 16 short tarot-inspired lines in English. "
+            "Each 6–14 words, no quotes, no hashtags; mystical, gentle, non-deterministic. "
+            "Return ONLY a JSON array of strings."
+        )
+
+    items = _ask_json_list(prompt, temperature=0.95, tries=3)
+    random.shuffle(items)
+    for it in items:
+        key = prefix + _md5(it)
+        if key not in used:
+            used.add(key); save_used_phrases(used)
+            logger.info("🃏 Frase tarot curta: %s", it)
+            return it
+
+    # fallbacks
+    if lang == "ar":
+        return "اسمع همس قلبك… الرسالة أوضح مما تظن."
+    if lang == "pt":
+        return "Ouça o sussurro do seu coração — a mensagem está mais perto do que imagina."
+    return "Listen to the whisper within — your message is closer than you think."
+
+def gerar_frase_tarot_longa(idioma: str = "en") -> str:
+    """
+    Narração ~12–20 s, tom místico e gentil. Sem markdown/hashtags.
+    """
+    lang = _lang_tag(idioma)
+    if not os.getenv("GEMINI_API_KEY"):
+        return ("Hoje, o tarô revela uma passagem de clareza: respire, acolha o que chega e libere o que pesa. "
+                "Seu caminho brilha quando você honra sua intuição e dá um passo de cada vez.")
+    used = load_used_phrases()
+    prefix = "TAROT_LONG::"
+
+    if lang == "ar":
+        prompt = (
+            "اكتب 8 مقاطع قصيرة مستوحاة من قراءة التاروت بالعربية المفهومة في مصر. "
+            "طول كل مقطع 40–55 كلمة تقريبًا، نبرة روحانية ولطيفة وغير حتمية، بدون وعود مطلقة. "
+            "بدون علامات تنصيص وبدون هاشتاجات. "
+            "أعد فقط مصفوفة JSON من السلاسل."
+        )
+    elif lang == "pt":
+        prompt = (
+            "Escreva 8 textos curtos inspirados em leitura de tarô, em português do Brasil. "
+            "Cada um com 40–55 palavras (~20s), tom místico, acolhedor e não determinístico, sem promessas absolutas. "
+            "Sem aspas e sem hashtags. Retorne APENAS um array JSON de strings."
+        )
+    else:
+        prompt = (
+            "Write 8 short tarot-inspired narrations in English. "
+            "Each 40–55 words (~20s), mystical, gentle, non-deterministic, no absolute promises. "
+            "No quotes and no hashtags. Return ONLY a JSON array of strings."
+        )
+
+    items = _ask_json_list(prompt, temperature=1.02, tries=3)
+    items = [_clean_line(x) for x in items if _clean_line(x)]
+    random.shuffle(items)
+    for it in items:
+        wc = len(it.split())
+        if 35 <= wc <= 65:
+            key = prefix + _md5(it)
+            if key not in used:
+                used.add(key); save_used_phrases(used)
+                logger.info("🔮 Frase tarot longa escolhida (%d palavras).", wc)
+                return it
+
+    # fallback simples
+    if lang == "ar":
+        return ("تنصحك الرسالة اليوم بالهدوء والإصغاء لنبض قلبك. ما تبحث عنه يقترب حين تتقبل إشارات الكون "
+                "بدون استعجال. خطوة صغيرة بنية صادقة تغيّر المزاج والاتجاه. دع الضوء يرشدك، وستعرف متى تتحرك.")
+    if lang == "pt":
+        return ("A mensagem de hoje convida ao silêncio e à escuta da sua intuição. Quando você acolhe os sinais "
+                "sem pressa, o caminho clareia. Um passo sincero muda o ritmo e a direção. Confie no brilho que já "
+                "habita em você, e avance quando o coração disser sim.")
+    return ("Today’s message invites quiet and listening. As you welcome subtle signs without haste, the path clears. "
+            "A sincere small step shifts your rhythm and direction. Trust the light already within you, and move when your heart says yes.")
 
 # -----------------------------------------------------------------------------#
 # Utilidades
@@ -408,12 +547,15 @@ def quebrar_em_duas_linhas(frase: str) -> str:
 
 def gerar_slug(texto: str, limite: int = 30) -> str:
     try:
-        texto = unicodedata.normalize('NFD', texto).encode('ascii', 'ignore').decode('utf-8')
-        texto = re.sub(r'[^a-zA-Z0-9\s]', '', texto)
-        texto = texto.strip().lower().replace(" ", "_")
-        slug = texto[:limite]
+        base = (texto or "").strip()
+        texto_ascii = unicodedata.normalize('NFD', base).encode('ascii', 'ignore').decode('utf-8')
+        texto_ascii = re.sub(r'[^a-zA-Z0-9\s]', '', texto_ascii)
+        texto_ascii = texto_ascii.strip().lower().replace(" ", "_")
+        slug = texto_ascii[:limite]
+        if not slug:
+            slug = f"slug_{int(time.time())}"
         logger.info("🔗 Slug gerado: %s", slug)
         return slug
     except Exception as e:
         logger.error("Erro ao gerar slug: %s", e)
-        return "default_slug"
+        return f"slug_{int(time.time())}"

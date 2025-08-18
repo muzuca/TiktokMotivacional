@@ -28,6 +28,13 @@ from utils.imagem import gerar_imagem_com_frase, escrever_frase_na_imagem, monta
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
+# (Tarot – Fase 4: se já existir, usa; senão, mantém motivacional)
+try:
+    from utils.frase import gerar_prompt_tarot, gerar_frase_tarot_curta
+    _HAVE_TAROT_FUNCS = True
+except Exception:
+    _HAVE_TAROT_FUNCS = False
+
 # LOG_LEVEL do .env (INFO default)
 LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
@@ -56,7 +63,6 @@ _watchdog_log_path = os.path.join("cache", "hang_watchdog.log")
 try:
     _watchdog_f = open(_watchdog_log_path, "w", buffering=1, encoding="utf-8")
     faulthandler.enable(_watchdog_f)
-    # despeja stack a cada HANG_WATCHDOG_SECS se o processo ficar preso em syscalls
     if HANG_WATCHDOG_SECS > 0:
         faulthandler.dump_traceback_later(HANG_WATCHDOG_SECS, repeat=True, file=_watchdog_f)
         atexit.register(faulthandler.cancel_dump_traceback_later)
@@ -97,13 +103,6 @@ def _safe_unlink(path: str):
         logger.debug("não consegui remover '%s': %s", path, e)
 
 def _limpar_pre_post(imagem_base: str, imagem_capa: str):
-    """
-    Executa após gerar o vídeo e ANTES de postar:
-      - apaga audios/ (raiz) e audios/tts/
-      - apaga cache/*.txt (drawtext, etc.)
-      - apaga imagens/slides_txt/
-      - apaga imagens/* EXCETO imagem_base e imagem_capa (essas ainda serão usadas na postagem)
-    """
     # 1) audios raiz e tts
     for d in (AUDIOS_TTS_DIR, AUDIOS_DIR):
         if os.path.isdir(d):
@@ -132,21 +131,11 @@ def _limpar_pre_post(imagem_base: str, imagem_capa: str):
             _safe_unlink(p)
 
 def _limpar_pos_post(imagem_base: str, imagem_capa: str):
-    """Executa após postar: remove também imagem_base e imagem_capa."""
     _safe_unlink(imagem_base)
     _safe_unlink(imagem_capa)
 
 # --------------------- helpers robustez ---------------------
 def _cleanup_browsers(policy: str = None):
-    """
-    Limpeza segura de processos do ecossistema Selenium.
-    policy:
-      - "none"          -> não mata nada
-      - "drivers_only"  -> mata apenas chromedriver
-      - "children"      -> mata chromes cujo ANCESTRAL é um chromedriver
-      - "match"         -> mata chromes cujo cmdline contém CHROME_KILL_MATCH
-      - "all"           -> mata TUDO (chrome + chromedriver) — perigoso
-    """
     if not psutil:
         return
     policy = (policy or CHROME_CLEANUP_POLICY).strip().lower()
@@ -169,7 +158,6 @@ def _cleanup_browsers(policy: str = None):
                 if policy == "all":
                     p.kill(); killed += 1; continue
 
-                # policy == children -> verifica ancestrais
                 if policy == "children":
                     try:
                         parents = p.parents()
@@ -179,7 +167,6 @@ def _cleanup_browsers(policy: str = None):
                         p.kill(); killed += 1
                     continue
 
-                # policy == match -> substring no cmdline
                 if policy == "match" and CHROME_KILL_MATCH:
                     cmd = " ".join(p.info.get("cmdline") or [])
                     if CHROME_KILL_MATCH.lower() in cmd.lower():
@@ -188,7 +175,6 @@ def _cleanup_browsers(policy: str = None):
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         except Exception:
-            # melhor ser resiliente do que travar
             continue
 
     if killed:
@@ -197,22 +183,18 @@ def _cleanup_browsers(policy: str = None):
         logger.debug("🧹 Cleanup browsers (%s): nada a fazer.", policy)
 
 def _run_rotina_once(args_tuple) -> bool:
-    """Executa 1 ciclo completo em *subprocesso* (para timeout duro)."""
     try:
-        # pré-limpeza defensiva de zumbis (segura)
         _cleanup_browsers()
-        idioma, tts_engine, legendas, video_style, motion, slides_count = args_tuple
-        rotina(idioma, tts_engine, legendas, video_style, motion, slides_count)
+        modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count = args_tuple
+        rotina(modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count)
         return True
     except Exception as e:
         logging.exception("Falha na execução única: %s", e)
         return False
     finally:
-        # pós-limpeza defensiva (segura)
         _cleanup_browsers()
 
 def _executar_com_timeout(args_tuple) -> bool:
-    """Roda _run_rotina_once em processo isolado com timeout."""
     ctx = multiprocessing.get_context("spawn")
     start = time.time()
     _cleanup_browsers()
@@ -235,17 +217,32 @@ def _selecionar_idioma() -> str:
     print("\nEscolha o país para referência da língua das mensagens:")
     print("1. EUA (Inglês) *padrão")
     print("2. Brasil (pt-br)")
-    op = input("Digite o número da opção (1 ou 2): ").strip()
-    if op not in ("1", "2"):
+    print("3. Árabe (egípcio)")
+    op = input("Digite o número da opção: ").strip()
+    if op not in ("1", "2", "3"):
         print("Opção inválida! Usando EUA (Inglês) como padrão.")
         op = "1"
-    return "en" if op == "1" else "pt-br"
+    return "en" if op == "1" else ("pt-br" if op == "2" else "ar")
+
+def _selecionar_modo_conteudo() -> str:
+    env_default = (os.getenv("CONTENT_MODE", "motivacional") or "motivacional").strip().lower()
+    padr = "Motivacional" if env_default != "tarot" else "Cartomante"
+    print("\nEscolha o tipo de conteúdo:")
+    print(f"1. Motivacional {'*padrão' if env_default != 'tarot' else ''}")
+    print(f"2. Cartomante {'*padrão' if env_default == 'tarot' else ''}")
+    op = input("Digite o número da opção: ").strip()
+    if op == "2":
+        return "tarot"
+    if op != "1" and env_default in ("motivacional", "tarot"):
+        print(f"Opção inválida! Usando {padr} como padrão.")
+        return env_default
+    return "motivacional"
 
 def _menu_modo_execucao() -> str:
     print("\nO que você deseja fazer?")
-    print("1. Postar agora (uma vez)")
+    print("1. Postar agora (uma vez) *padrão")
     print("2. Postar automaticamente a cada X horas")
-    op = input("Escolha 1 ou 2: ").strip()
+    op = input("Escolha uma opção: ").strip()
     return op if op in ("1","2") else "1"
 
 def _ler_intervalo_horas() -> float:
@@ -268,18 +265,18 @@ def _selecionar_tts_engine() -> str:
 
 def _selecionar_legendas() -> bool:
     print("\nDeseja adicionar legendas sincronizadas no vídeo?")
-    print("1. Sim (padrão)")
+    print("1. Sim *padrão")
     print("2. Não")
     op = input("Escolha 1 ou 2: ").strip()
     return False if op == "2" else True
 
 def _selecionar_estilo_video() -> str:
     print("\nEscolha o estilo do vídeo (legendas/typography):")
-    print("0. Aleatório")
+    print("0. Aleatório *padrão")
     for k, (_, desc) in STYLE_OPTIONS.items():
         print(f"{k}. {desc}")
     op = input("Digite o número da opção: ").strip()
-    if op == "0":
+    if op == "0" or op == "":
         escolha = random.choice(list(STYLE_OPTIONS.values()))[0]
         print(f"Estilo sorteado: {escolha}")
         return escolha
@@ -290,9 +287,13 @@ def _selecionar_estilo_video() -> str:
 
 def _selecionar_motion(env_default: str) -> str:
     print("\nMovimento do vídeo:")
-    print("(Enter para manter do .env: '%s')" % env_default)
-    for k, (_, desc) in MOTION_OPTIONS.items():
-        print(f"{k}. {desc}")
+    print(f"(Enter para manter do .env: '{env_default}')")
+    print("1. Sem movimento *padrão")
+    print("2. Zoom in (Ken Burns)")
+    print("3. Zoom out (Ken Burns)")
+    print("4. Pan left→right")
+    print("5. Pan up→down")
+    print("0. Aleatório (entre movimentos)")
     op = input("Digite o número da opção: ").strip()
     if op == "":
         print(f"Movimento: {env_default} (do .env)")
@@ -323,10 +324,6 @@ def _selecionar_qtd_fotos(padrao: int) -> int:
         return max(1, min(10, padrao))
 
 def _map_video_style_to_image_template(style_key: str) -> str:
-    """
-    Mapeia o estilo escolhido no menu para o template de imagem.
-    Agora 'classic' realmente usa 'classic_serif'.
-    """
     s = (style_key or "").lower()
     if s in ("classic", "1"):
         return "classic_serif"
@@ -341,14 +338,20 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     return "minimal_center"
 
 # --------------------- pipeline ---------------------
-def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
+def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
     os.makedirs(IMAGENS_DIR, exist_ok=True)
     os.makedirs("videos", exist_ok=True)
     os.makedirs(AUDIOS_DIR, exist_ok=True)
 
-    logger.info("Gerando conteúdos (%s)...", idioma)
-    prompt_imagem = gerar_prompt_paisagem(idioma)
-    frase = gerar_frase_motivacional(idioma)
+    logger.info("Gerando conteúdos (%s | modo=%s)...", idioma, modo_conteudo)
+
+    # Seleção do prompt/frase conforme modo — FALLBACK seguro
+    if modo_conteudo == "tarot" and _HAVE_TAROT_FUNCS:
+        prompt_imagem = gerar_prompt_tarot(idioma)
+        frase = gerar_frase_tarot_curta(idioma)
+    else:
+        prompt_imagem = gerar_prompt_paisagem(idioma)
+        frase = gerar_frase_motivacional(idioma)
 
     slug_img = gerar_slug(prompt_imagem)
     slug_frase = gerar_slug(frase)
@@ -389,21 +392,37 @@ def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motio
 
     logger.info("🖼️ Slides com texto (%d): %s", len(slides_com_texto), " | ".join(slides_com_texto))
 
-    # 3) vídeo
-    gerar_video(
-        imagem_capa,
-        video_final,
-        preset="hd",
-        idioma=idioma,
-        tts_engine=tts_engine,
-        legendas=legendas,
-        video_style=video_style,
-        motion=motion,
-        slides_paths=slides_com_texto,
-        transition=None  # usa TRANSITION do .env
-    )
+    # 3) vídeo — tenta passar content_mode; se a função não aceitar, reexecuta sem quebrar
+    try:
+        gerar_video(
+            imagem_capa,
+            video_final,
+            preset="hd",
+            idioma=idioma,
+            tts_engine=tts_engine,
+            legendas=legendas,
+            video_style=video_style,
+            motion=motion,
+            slides_paths=slides_com_texto,
+            transition=None,  # usa TRANSITION do .env
+            content_mode=modo_conteudo
+        )
+    except TypeError:
+        # compat com versões antigas de utils/video.py
+        gerar_video(
+            imagem_capa,
+            video_final,
+            preset="hd",
+            idioma=idioma,
+            tts_engine=tts_engine,
+            legendas=legendas,
+            video_style=video_style,
+            motion=motion,
+            slides_paths=slides_com_texto,
+            transition=None
+        )
 
-    # >>> Limpeza PRÉ-POST (mantém capa e base para a função de postagem)
+    # >>> Limpeza PRÉ-POST
     try:
         _limpar_pre_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
         logger.info("🧹 Limpeza pré-post concluída.")
@@ -422,7 +441,7 @@ def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motio
     except Exception as e:
         logger.exception("❌ Falha ao postar no TikTok: %s", e)
 
-    # >>> Limpeza PÓS-POST (remove capa e base também)
+    # >>> Limpeza PÓS-POST
     try:
         _limpar_pos_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
         logger.info("🧹 Limpeza pós-post concluída.")
@@ -431,7 +450,7 @@ def rotina(idioma: str, tts_engine: str, legendas: bool, video_style: str, motio
 
     logger.info("✅ Execução concluída.")
 
-def postar_em_intervalo(cada_horas: float, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
+def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
     logger.info("⏱️ Modo automático: a cada %.2f horas (Ctrl+C para parar).", cada_horas)
     intervalo = float(cada_horas) * 3600.0
     try:
@@ -439,19 +458,16 @@ def postar_em_intervalo(cada_horas: float, idioma: str, tts_engine: str, legenda
             inicio = datetime.now()
             logger.info("🟢 Nova execução (%s).", inicio.strftime("%d/%m %H:%M:%S"))
 
-            # executa em subprocesso com timeout duro + limpeza segura
-            ok = _executar_com_timeout((idioma, tts_engine, legendas, video_style, motion, slides_count))
+            ok = _executar_com_timeout((modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count))
 
-            # agenda a próxima pelo horário-alvo (mantém cadência)
             proxima = inicio + timedelta(seconds=intervalo)
             restante = (proxima - datetime.now()).total_seconds()
             if restante < 0:
-                restante = 60.0  # mínimo 1 min entre ciclos
+                restante = 60.0
 
             logger.info("✅ Execução %s. ⏳ Próxima em ~%.0f min.",
                         "ok" if ok else "com falha", restante / 60)
 
-            # dormir em blocos curtos p/ permitir Ctrl+C fácil + heartbeat
             slept = 0.0
             hb_elapsed = 0.0
             while slept < restante:
@@ -460,7 +476,6 @@ def postar_em_intervalo(cada_horas: float, idioma: str, tts_engine: str, legenda
                 slept += step
                 hb_elapsed += step
 
-                # Heartbeat: imprime a cada HEARTBEAT_SECS se configurado (>0)
                 if HEARTBEAT_SECS > 0.0 and hb_elapsed >= HEARTBEAT_SECS:
                     rem = max(0.0, (proxima - datetime.now()).total_seconds())
                     logger.info("⏳ Em execução. Faltam ~%.0f min para o próximo ciclo (alvo: %s).",
@@ -475,19 +490,24 @@ if __name__ == "__main__":
     if env_motion not in valid_motions:
         env_motion = "none"
 
+    # === Sequência do menu (conforme solicitado) ===
     idioma = _selecionar_idioma()
-    modo = _menu_modo_execucao()
+    modo_conteudo = _selecionar_modo_conteudo()
+    modo_exec = _menu_modo_execucao()
+    if modo_exec == "2":
+        intervalo_horas = _ler_intervalo_horas()
+    else:
+        intervalo_horas = None
+
     tts_engine = _selecionar_tts_engine()
     legendas = _selecionar_legendas()
     video_style = _selecionar_estilo_video()
     motion = _selecionar_motion(env_motion)
     slides_count = _selecionar_qtd_fotos(DEFAULT_SLIDES_COUNT)
 
-    args_tuple = (idioma, tts_engine, legendas, video_style, motion, slides_count)
+    args_tuple = (modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count)
 
-    if modo == "1":
-        # também dá para usar timeout no modo único; se preferir direto, troque por: rotina(*args_tuple)
+    if modo_exec == "1":
         _executar_com_timeout(args_tuple)
     else:
-        intervalo = _ler_intervalo_horas()
-        postar_em_intervalo(intervalo, *args_tuple)
+        postar_em_intervalo(intervalo_horas, *args_tuple)

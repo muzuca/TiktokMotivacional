@@ -44,6 +44,58 @@ AUDIOS_CACHE_FILE = os.path.join(CACHE_DIR, "used_audios.json")
 
 USER_AGENT = "TiktokMotivacional/1.0 (+https://local)"
 
+# ---------- Proxy region-aware ----------
+# Regras:
+# - Padrão: usa PROXY_HOST/PORT/USER/PASS (EUA)
+# - Para Egito: usa PROXY_HOST_EG/PORT_EG/USER_EG/PASS_EG
+# - Auto por idioma: se começar com 'ar' -> usar região 'EG' (pode desativar com PROXY_AUTO_BY_LANG=0)
+PROXY_AUTO_BY_LANG = os.getenv("PROXY_AUTO_BY_LANG", "1").strip().lower() not in ("0", "false", "no")
+DEFAULT_PROXY_REGION = (os.getenv("DEFAULT_PROXY_REGION", "") or "").upper() or None  # ex: 'US' ou 'EG'
+
+def _proxy_url_from_env(prefix: str) -> Optional[str]:
+    host = os.getenv(f"{prefix}_HOST", "").strip()
+    port = os.getenv(f"{prefix}_PORT", "").strip()
+    user = os.getenv(f"{prefix}_USER", "").strip()
+    pw   = os.getenv(f"{prefix}_PASS", "").strip()
+    if not host or not port:
+        return None
+    auth = f"{user}:{pw}@" if (user or pw) else ""
+    return f"http://{auth}{host}:{port}"
+
+def _pick_proxy_region(explicit_region: Optional[str], idioma: Optional[str]) -> Optional[str]:
+    if explicit_region:
+        return explicit_region.upper()
+    if PROXY_AUTO_BY_LANG and (idioma or "").strip().lower().startswith("ar"):
+        return "EG"
+    return DEFAULT_PROXY_REGION
+
+def _apply_env_proxy(region: Optional[str]) -> dict:
+    """
+    Define HTTP(S)_PROXY no ambiente (também em minúsculas) e retorna
+    um dict com os valores antigos para restauração.
+    """
+    old = {
+        "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
+        "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
+        "http_proxy": os.environ.get("http_proxy"),
+        "https_proxy": os.environ.get("https_proxy"),
+    }
+    prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
+    url = _proxy_url_from_env(prefix)
+    for k in ("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy"):
+        if url:
+            os.environ[k] = url
+        else:
+            os.environ.pop(k, None)
+    return old
+
+def _restore_env_proxy(old: dict):
+    for k, v in (old or {}).items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
 # ================== utils de cache ==================
 def load_used_audios():
     if os.path.exists(AUDIOS_CACHE_FILE):
@@ -82,24 +134,26 @@ def _retry(fn: Callable[[], T],
 
 # ================== HTTP session (proxy + retries) ==================
 from requests.adapters import HTTPAdapter, Retry
+_SESSIONS: dict[str, requests.Session] = {}
 
-def _make_session() -> requests.Session:
+def _make_session(region: Optional[str] = None) -> requests.Session:
     s = requests.Session()
     retry = Retry(total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.mount("http://", HTTPAdapter(max_retries=retry))
-    ph = os.getenv("PROXY_HOST")
-    if ph:
-        user = os.getenv("PROXY_USER", "")
-        pw = os.getenv("PROXY_PASS", "")
-        port = os.getenv("PROXY_PORT", "")
-        auth = f"{user}:{pw}@" if (user or pw) else ""
-        url = f"http://{auth}{ph}:{port}"
+
+    prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
+    url = _proxy_url_from_env(prefix)
+    if url:
         s.proxies.update({"http": url, "https": url})
     s.headers.update({"User-Agent": USER_AGENT})
     return s
 
-_SESSION = _make_session()
+def _get_session(region: Optional[str]) -> requests.Session:
+    key = (region or "DEFAULT").upper()
+    if key not in _SESSIONS:
+        _SESSIONS[key] = _make_session(region)
+    return _SESSIONS[key]
 
 # ================= ÁUDIO DE FUNDO ===================
 def _duracao_arquivo(path: str) -> float:
@@ -133,7 +187,7 @@ def escolher_audio_local(diretorio=AUDIO_DIR):
     logger.info("🎵 Áudio local: %s (%.0fs)", escolhido, duracao)
     return escolhido
 
-def _freesound_busca(query: str, sort: str, filters: str, page_size: int = 20) -> dict:
+def _freesound_busca(session: requests.Session, query: str, sort: str, filters: str, page_size: int = 20) -> dict:
     url = "https://freesound.org/apiv2/search/text/"
     headers = {"Authorization": f"Token {FREESOUND_API_KEY}"}
     params = {
@@ -143,14 +197,14 @@ def _freesound_busca(query: str, sort: str, filters: str, page_size: int = 20) -
         "fields": "id,name,duration,tags,license,previews",
         "page_size": page_size,
     }
-    r = _SESSION.get(url, headers=headers, params=params, timeout=15)
+    r = session.get(url, headers=headers, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def _baixar_preview(audio_meta: dict, destino: str) -> float:
+def _baixar_preview(session: requests.Session, audio_meta: dict, destino: str) -> float:
     os.makedirs(os.path.dirname(destino) or ".", exist_ok=True)
     preview_url = audio_meta["previews"]["preview-hq-mp3"]
-    with _SESSION.get(preview_url, stream=True, timeout=30) as resp:
+    with session.get(preview_url, stream=True, timeout=30) as resp:
         resp.raise_for_status()
         with open(destino, "wb") as f:
             for chunk in resp.iter_content(8192):
@@ -169,23 +223,28 @@ def buscar_audio_freesound(
     sort="rating_desc",
     additional_filters='tag:music tag:instrumental -tag:speech -tag:voice',
     *,
+    proxy_region: Optional[str] = None,
+    idioma: Optional[str] = None,
     max_retries: int = MAX_RETRIES_DEFAULT
 ):
     if not FREESOUND_API_KEY:
         raise ValueError("FREESOUND_API_KEY não configurada no .env.")
 
+    region = _pick_proxy_region(proxy_region, idioma)
+    session = _get_session(region)
+
     def tentar() -> str:
-        logger.info("🔍 Freesound: query='%s', sort='%s', filtros='%s'", query, sort, additional_filters)
+        logger.info("🔍 Freesound (%s): query='%s', sort='%s', filtros='%s'", region or "DEFAULT", query, sort, additional_filters)
         filters = f"duration:[{DURACAO_MINIMA} TO 300] {additional_filters}".strip()
-        data = _freesound_busca(query, sort, filters)
+        data = _freesound_busca(session, query, sort, filters)
         if not data.get("results"):
             logger.warning("Sem resultados; afrouxando filtros…")
             filters = f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech"
-            data = _freesound_busca(query, sort, filters)
+            data = _freesound_busca(session, query, sort, filters)
         if not data.get("results"):
-            data = _freesound_busca("uplifting music", sort, f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech")
+            data = _freesound_busca(session, "uplifting music", sort, f"duration:[{DURACAO_MINIMA} TO 300] tag:music -tag:speech")
         if not data.get("results"):
-            data = _freesound_busca(query, sort, f"duration:[{DURACAO_MINIMA} TO 300]")
+            data = _freesound_busca(session, query, sort, f"duration:[{DURACAO_MINIMA} TO 300]")
 
         used = load_used_audios()
         resultados = data.get("results", [])
@@ -203,7 +262,7 @@ def buscar_audio_freesound(
                 os.remove(caminho)
                 raise ValueError(f"Áudio existente curto ({dur:.0f}s).")
         else:
-            dur = _baixar_preview(audio, caminho)
+            dur = _baixar_preview(session, audio, caminho)
 
         used.add(str(audio_id))
         save_used_audios(used)
@@ -217,12 +276,17 @@ def buscar_audio_freesound(
 
 def obter_caminho_audio(query="inspirational", diretorio=AUDIO_DIR,
                         sort="rating_desc",
-                        additional_filters='tag:music tag:instrumental -tag:speech -tag:voice'):
+                        additional_filters='tag:music tag:instrumental -tag:speech -tag:voice',
+                        *,
+                        proxy_region: Optional[str] = None,
+                        idioma: Optional[str] = None):
+    region = _pick_proxy_region(proxy_region, idioma)
     if USE_REMOTE_AUDIO:
-        logger.info("Tentando áudio remoto: %s", query)
+        logger.info("Tentando áudio remoto: %s (proxy=%s)", query, region or "DEFAULT")
 
         def tentar_remoto():
-            return buscar_audio_freesound(query, diretorio, sort, additional_filters, max_retries=1)
+            return buscar_audio_freesound(query, diretorio, sort, additional_filters,
+                                          proxy_region=region, idioma=idioma, max_retries=1)
 
         for i in range(MAX_RETRIES_DEFAULT):
             caminho = _retry(tentar_remoto, tries=1, on_error_msg=f"Rodada remota {i+1}")
@@ -276,30 +340,36 @@ def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
     voice_name = voice_name or os.getenv("GEMINI_TTS_VOICE") or default_voice_map.get(lang, "Kore")
 
     client = genai_new.Client(api_key=api_key)
+    # aplica proxy no ambiente se necessário (para libs que não usam requests)
+    region = _pick_proxy_region(None, idioma)
+    old_env = _apply_env_proxy(region)
 
-    def tentar() -> str:
-        resp = client.models.generate_content(
-            model=model,
-            contents=texto,
-            config=genai_types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=genai_types.SpeechConfig(
-                    voice_config=genai_types.VoiceConfig(
-                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=voice_name)
-                    )
+    try:
+        def tentar() -> str:
+            resp = client.models.generate_content(
+                model=model,
+                contents=texto,
+                config=genai_types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=genai_types.SpeechConfig(
+                        voice_config=genai_types.VoiceConfig(
+                            prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name=voice_name)
+                        )
+                    ),
                 ),
-            ),
-        )
-        data = resp.candidates[0].content.parts[0].inline_data.data
-        pcm_bytes = base64.b64decode(data) if isinstance(data, str) else data
-        out_path = _tts_outname(lang, "wav")
-        _wav_write(out_path, pcm_bytes, channels=1, rate=24000, sample_width=2)
-        return out_path
+            )
+            data = resp.candidates[0].content.parts[0].inline_data.data
+            pcm_bytes = base64.b64decode(data) if isinstance(data, str) else data
+            out_path = _tts_outname(lang, "wav")
+            _wav_write(out_path, pcm_bytes, channels=1, rate=24000, sample_width=2)
+            return out_path
 
-    path = _retry(tentar, tries=max_retries, on_error_msg="Falha no TTS Gemini")
-    if path:
-        logger.info("🎧 TTS (Gemini) gerado: %s", path)
-    return path
+        path = _retry(tentar, tries=max_retries, on_error_msg="Falha no TTS Gemini")
+        if path:
+            logger.info("🎧 TTS (Gemini) gerado: %s", path)
+        return path
+    finally:
+        _restore_env_proxy(old_env)
 
 _HAS_ELEVENLABS = True
 try:
@@ -325,23 +395,31 @@ def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en",
     }
     lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
     voice_id = voice_ids.get(lang, voice_ids["en"])
-    client = ElevenLabs(api_key=api_key)
 
-    def tentar() -> str:
-        stream = client.text_to_speech.stream(text=texto, voice_id=voice_id, model_id="eleven_multilingual_v2")
-        out_path = _tts_outname(lang, "mp3")
-        with open(out_path, "wb") as f:
-            for chunk in stream:
-                if isinstance(chunk, bytes) and chunk:
-                    f.write(chunk)
-        if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
-            raise RuntimeError("Arquivo MP3 inválido/pequeno.")
-        return out_path
+    # aplica proxy no ambiente se necessário (lib externa)
+    region = _pick_proxy_region(None, idioma)
+    old_env = _apply_env_proxy(region)
 
-    path = _retry(tentar, tries=max_retries, on_error_msg="Erro ElevenLabs")
-    if path:
-        logger.info("🎧 TTS (ElevenLabs) gerado: %s", path)
-    return path
+    try:
+        client = ElevenLabs(api_key=api_key)
+
+        def tentar() -> str:
+            stream = client.text_to_speech.stream(text=texto, voice_id=voice_id, model_id="eleven_multilingual_v2")
+            out_path = _tts_outname(lang, "mp3")
+            with open(out_path, "wb") as f:
+                for chunk in stream:
+                    if isinstance(chunk, bytes) and chunk:
+                        f.write(chunk)
+            if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+                raise RuntimeError("Arquivo MP3 inválido/pequeno.")
+            return out_path
+
+        path = _retry(tentar, tries=max_retries, on_error_msg="Erro ElevenLabs")
+        if path:
+            logger.info("🎧 TTS (ElevenLabs) gerado: %s", path)
+        return path
+    finally:
+        _restore_env_proxy(old_env)
 
 def gerar_narracao_tts(texto: str, idioma: str = "en", engine: str = "gemini") -> Optional[str]:
     engine = (engine or "gemini").strip().lower()

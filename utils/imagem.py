@@ -115,8 +115,37 @@ IMAGE_TEXT_SCALE_MINIMAL = _clamp(_env_float("IMAGE_TEXT_SCALE_MINIMAL", 1.0), 0
 IMAGE_LOG_PROXY   = _env_bool("IMAGE_LOG_PROXY", False)
 IMAGE_VERBOSE_LOG = _env_bool("IMAGE_VERBOSE_LOG", False)
 
-# ----------------------------------------------------
-def _make_session() -> requests.Session:
+# --------- Proxy por região (DEFAULT/EG) ----------
+PROXY_AUTO_BY_LANG = os.getenv("PROXY_AUTO_BY_LANG", "1").strip().lower() not in ("0", "false", "no")
+DEFAULT_PROXY_REGION = (os.getenv("DEFAULT_PROXY_REGION", "") or "").upper() or None  # ex: 'US'|'EG'|None
+
+def _idioma_norm(idioma: Optional[str]) -> str:
+    s = (idioma or "pt").lower()
+    if s.startswith("ar"): return "ar"
+    if s.startswith("pt"): return "pt"
+    return "en"
+
+def _proxy_url_from_env(prefix: str) -> Optional[str]:
+    host = os.getenv(f"{prefix}_HOST", "").strip()
+    port = os.getenv(f"{prefix}_PORT", "").strip()
+    user = os.getenv(f"{prefix}_USER", "").strip()
+    pw   = os.getenv(f"{prefix}_PASS", "").strip()
+    if not host or not port:
+        return None
+    auth = f"{user}:{pw}@" if (user or pw) else ""
+    return f"http://{auth}{host}:{port}"
+
+def _pick_proxy_region(explicit_region: Optional[str], idioma: Optional[str]) -> Optional[str]:
+    if explicit_region:
+        return explicit_region.upper()
+    if PROXY_AUTO_BY_LANG and _idioma_norm(idioma) == "ar":
+        return "EG"
+    return DEFAULT_PROXY_REGION
+
+from requests.adapters import HTTPAdapter
+_SESSIONS: dict[str, requests.Session] = {}
+
+def _make_session(region: Optional[str] = None) -> requests.Session:
     s = requests.Session()
     if Retry is not None:
         retry = Retry(total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504])
@@ -126,25 +155,23 @@ def _make_session() -> requests.Session:
         s.mount("https://", HTTPAdapter())
         s.mount("http://", HTTPAdapter())
 
-    ph = os.getenv("PROXY_HOST")
-    if ph:
-        user = os.getenv("PROXY_USER", "")
-        pw = os.getenv("PROXY_PASS", "")
-        port = os.getenv("PROXY_PORT", "")
-        auth = f"{user}:{pw}@" if (user or pw) else ""
-        url = f"http://{auth}{ph}:{port}"
+    prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
+    url = _proxy_url_from_env(prefix)
+    if url:
         s.proxies.update({"http": url, "https": url})
         if IMAGE_LOG_PROXY:
-            logger.info("🌐 Proxy habilitado (%s:%s) - auth=%s", ph, port or "-", "sim" if (user or pw) else "não")
-        else:
-            logger.debug("🌐 Proxy habilitado (detalhes ocultos).")
+            logger.info("🌐 Proxy %s habilitado", (region or "DEFAULT"))
     else:
-        logger.debug("🌐 Proxy desabilitado")
+        logger.debug("🌐 Proxy desabilitado (%s)", (region or "DEFAULT"))
 
     s.headers.update({"User-Agent": USER_AGENT})
     return s
 
-_SESSION = _make_session()
+def _get_session(region: Optional[str]) -> requests.Session:
+    key = (region or "DEFAULT").upper()
+    if key not in _SESSIONS:
+        _SESSIONS[key] = _make_session(region)
+    return _SESSIONS[key]
 
 def load_used_images():
     if os.path.exists(IMAGES_CACHE_FILE):
@@ -167,25 +194,67 @@ def _slug(s: str, maxlen: int = 28) -> str:
     return s[:maxlen] or "img"
 
 # -------------------- Fontes / medidas --------------------
+ARABIC_FONT_IMAGE_REG  = os.getenv("ARABIC_FONT_IMAGE_REG",  "NotoNaskhArabic-Regular.ttf")
+ARABIC_FONT_IMAGE_BOLD = os.getenv("ARABIC_FONT_IMAGE_BOLD", "NotoNaskhArabic-Bold.ttf")
+
 _FONT_CACHE: dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
 _logged_fonts: set[Tuple[str, int]] = set()
+
+def _find_first_existing(paths: List[str]) -> Optional[str]:
+    for p in paths:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+def _system_font_candidates(names: List[str]) -> List[str]:
+    # caminhos comuns (Linux, Mac, Windows)
+    base_candidates = []
+    for n in names:
+        base_candidates += [
+            os.path.join(FONTS_DIR, n),
+            f"/usr/share/fonts/truetype/dejavu/{n}",
+            f"/usr/share/fonts/truetype/noto/{n}",
+            f"/usr/share/fonts/{n}",
+            f"/Library/Fonts/{n}",
+            f"/System/Library/Fonts/Supplemental/{n}",
+            f"C:\\Windows\\Fonts\\{n}",
+        ]
+    # alguns nomes reais específicos
+    base_candidates += [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "C:\\Windows\\Fonts\\arialuni.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    # absolutiza
+    return [os.path.abspath(p) for p in base_candidates]
+
+def _abs_font_path(fname: str) -> str:
+    return os.path.abspath(os.path.join(FONTS_DIR, fname))
 
 def _load_font(fname: str, size: int) -> ImageFont.FreeTypeFont:
     key = (fname, size)
     if key in _FONT_CACHE:
         return _FONT_CACHE[key]
-    path = os.path.join(FONTS_DIR, fname)
+
+    primary = _abs_font_path(fname)
+    candidates = [primary] + _system_font_candidates([fname])
+
+    chosen = _find_first_existing(candidates)
     try:
-        font = ImageFont.truetype(path, size=size)
+        if not chosen:
+            raise FileNotFoundError(f"Fonte '{fname}' não encontrada.")
+        font = ImageFont.truetype(chosen, size=size)
         if key not in _logged_fonts and IMAGE_VERBOSE_LOG:
-            logger.info("🔤 Fonte carregada: %s (tam=%d)", fname, size)
+            logger.info("🔤 Fonte carregada: %s (tam=%d)", chosen, size)
             _logged_fonts.add(key)
         _FONT_CACHE[key] = font
         return font
-    except Exception:
-        if key not in _logged_fonts and IMAGE_VERBOSE_LOG:
-            logger.warning("⚠️  Fonte %s não encontrada; usando default.", fname)
-            _logged_fonts.add(key)
+    except Exception as e:
+        if IMAGE_VERBOSE_LOG:
+            logger.warning("⚠️  Falha ao carregar fonte %s: %s; usando default.", fname, e)
         f = ImageFont.load_default()
         _FONT_CACHE[key] = f
         return f
@@ -321,9 +390,11 @@ def _ensure_1080x1920(img: Image.Image) -> Image.Image:
     return new.crop((left, top, left+tw, top+th))
 
 # -------------------- Download / geração --------------------
-def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, max_retries: int = 3):
+def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None, max_retries: int = 3):
     os.makedirs(os.path.dirname(arquivo_saida) or ".", exist_ok=True)
     used = load_used_images()
+    region = _pick_proxy_region(None, idioma)
+    session = _get_session(region)
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -334,9 +405,9 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, max_retries: int 
             headers = {"Authorization": PEXELS_API_KEY}
             page = random.randint(1, 10)
             params = {"query": prompt, "orientation": "portrait", "size": "large", "per_page": 30, "page": page}
-            logger.debug("📸 Pexels: query='%s' page=%s", prompt, page)
+            logger.debug("📸 Pexels: query='%s' page=%s (region=%s)", prompt, page, region or "DEFAULT")
 
-            r = _SESSION.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
+            r = session.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
             photos = data.get("photos") or []
@@ -348,7 +419,7 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, max_retries: int 
             url = src.get("large2x") or src.get("large") or src.get("portrait")
             logger.debug("📸 Pexels: escolhida id=%s", choice.get("id"))
 
-            raw_resp = _SESSION.get(url, timeout=20)
+            raw_resp = session.get(url, timeout=20)
             raw_resp.raise_for_status()
             raw = raw_resp.content
             with open(arquivo_saida, "wb") as f:
@@ -425,6 +496,12 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
 
     return intro, punch, hl
 
+# -------------------- escolha de fonte por idioma --------------------
+def _font_for_lang(base_font: str, idioma: Optional[str], bold: bool = False) -> str:
+    if _idioma_norm(idioma) == "ar":
+        return ARABIC_FONT_IMAGE_BOLD if bold else ARABIC_FONT_IMAGE_REG
+    return base_font
+
 # -------------------- Renders --------------------
 def _prepare_bg(img: Image.Image, base_dark: float, template: str) -> Image.Image:
     base = _ensure_1080x1920(img)
@@ -448,14 +525,17 @@ def _render_singleline_center(
     y_ratio: float = 0.18,
     min_size: int = 54,
     max_size: int = 128,
-    stroke_ratio: float = 0.045
+    stroke_ratio: float = 0.045,
+    idioma: Optional[str] = None
 ) -> Image.Image:
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
 
     W, H = img.size
     draw = ImageDraw.Draw(img)
-    text = text.upper() if IMAGE_TEXT_UPPER else text
+    do_upper = (IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar")
+    text = text.upper() if do_upper else text
 
+    font_name = _font_for_lang(font_name, idioma, bold=False)
     max_w = int(W * _clamp(width_ratio, 0.4, 0.95))
     lo, hi = min_size, max_size
     best = lo
@@ -484,13 +564,13 @@ def _render_singleline_center(
 
     return img
 
-def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
+def _render_modern_block(img: Image.Image, frase: str, *, idioma: Optional[str] = None) -> Image.Image:
     img = _prepare_bg(img, IMAGE_DARK_MODERN, "modern_block").convert("RGBA")
     W, H = img.size
     draw = ImageDraw.Draw(img)
 
     intro, punch, hl_words = _split_for_emphasis(frase)
-    if IMAGE_TEXT_UPPER:
+    if IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar":
         intro = intro.upper()
         punch = punch.upper()
 
@@ -501,7 +581,7 @@ def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
 
     if intro:
         f_small, lines1 = _best_font_and_wrap(
-            draw, intro, "Montserrat-Regular.ttf",
+            draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False),
             maxw, int(38*base_scale), int(70*base_scale), max_lines=2
         )
         for ln in lines1:
@@ -510,7 +590,7 @@ def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
         y += int(H * 0.018)
 
     f_main, lines2 = _best_font_and_wrap(
-        draw, punch, "Montserrat-ExtraBold.ttf",
+        draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, bold=True),
         maxw, int(68*base_scale), int(104*base_scale), max_lines=4
     )
     for ln in lines2:
@@ -523,7 +603,7 @@ def _render_modern_block(img: Image.Image, frase: str) -> Image.Image:
 
     return img.convert("RGB")
 
-def _render_classic_serif(img: Image.Image, frase: str) -> Image.Image:
+def _render_classic_serif(img: Image.Image, frase: str, *, idioma: Optional[str] = None) -> Image.Image:
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
     hl_set = set(explicit_words)
 
@@ -531,12 +611,12 @@ def _render_classic_serif(img: Image.Image, frase: str) -> Image.Image:
     W, H = img.size
     draw = ImageDraw.Draw(img)
 
-    text = clean.upper() if IMAGE_TEXT_UPPER else clean
+    text = clean.upper() if (IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar") else clean
     maxw = int(W * 0.76)
 
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
     f_serif, lines = _best_font_and_wrap(
-        draw, text, "PlayfairDisplay-Bold.ttf",
+        draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, bold=True),
         maxw, int(54*scls), int(80*scls), max_lines=4
     )
 
@@ -556,18 +636,18 @@ def _render_classic_serif(img: Image.Image, frase: str) -> Image.Image:
         y += int(f_serif.size * 1.18)
     return img.convert("RGB")
 
-def _render_minimal_center(img: Image.Image, frase: str) -> Image.Image:
+def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str] = None) -> Image.Image:
     img = _prepare_bg(img, IMAGE_DARK_MINIMAL, "minimal_center").convert("RGBA")
     W, H = img.size
     draw = ImageDraw.Draw(img)
 
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MINIMAL
-    big_name   = "BebasNeue-Regular.ttf"
-    small_name = "Montserrat-Regular.ttf"
+    big_name   = _font_for_lang("BebasNeue-Regular.ttf", idioma, bold=True)
+    small_name = _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False)
 
     clean, _ = _parse_highlights_from_markdown(frase)
     two = quebrar_em_duas_linhas(clean)
-    if IMAGE_TEXT_UPPER:
+    if IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar":
         two = two.upper()
     parts = two.split("\n")
     l1 = parts[0].strip()
@@ -626,11 +706,11 @@ def escrever_frase_na_imagem(imagem_path: str, frase: str, saida_path: str, *,
         template = random.choice(["classic_serif", "modern_block", "minimal_center"])
 
     if template == "classic_serif":
-        out = _render_classic_serif(img, frase)
+        out = _render_classic_serif(img, frase, idioma=idioma)
     elif template == "minimal_center":
-        out = _render_minimal_center(img, frase)
+        out = _render_minimal_center(img, frase, idioma=idioma)
     else:
-        out = _render_modern_block(img, frase)
+        out = _render_modern_block(img, frase, idioma=idioma)
 
     os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
     out.save(saida_path, quality=92)
@@ -643,16 +723,19 @@ def escrever_frase_na_imagem(imagem_path: str, frase: str, saida_path: str, *,
 
     logger.info("✅ Imagem final salva (%s) | %dx%d | %d KB", template, w, h, size_kb)
 
-def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[str] = None) -> List[str]:
+def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[str] = None, *, idioma: Optional[str] = None) -> List[str]:
     if not PEXELS_API_KEY:
         logger.error("❌ PEXELS_API_KEY não configurado.")
         return [p for p in [primeira_imagem] if p and os.path.isfile(p)]
 
+    region = _pick_proxy_region(None, idioma)
+    session = _get_session(region)
+
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "portrait", "size": "large", "per_page": 30, "page": 1}
-    logger.debug("🖼️ Slides Pexels: query='%s' count=%d", query, count)
+    logger.debug("🖼️ Slides Pexels: query='%s' count=%d (region=%s)", query, count, region or "DEFAULT")
 
-    r = _SESSION.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
+    r = session.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     photos = r.json().get("photos") or []
     logger.debug("🖼️ Slides Pexels: resultados=%d", len(photos))
@@ -670,7 +753,7 @@ def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[s
         if not url:
             continue
         try:
-            resp = _SESSION.get(url, timeout=15)
+            resp = session.get(url, timeout=15)
             resp.raise_for_status()
             raw = resp.content
             pid = photo.get("id") or random.randint(100000, 999999)

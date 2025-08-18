@@ -1,5 +1,4 @@
 # utils/tiktok.py
-
 import os
 import re
 import time  # Para delays
@@ -28,12 +27,14 @@ STRIP_MARKDOWN_IN_DESC = _STRIP_FLAG not in ("0", "false", "no", "off")
 
 
 def _normalizar_idioma(v: Optional[str]) -> str:
-    """Normaliza a entrada do idioma para 'en', 'pt-br' ou 'auto'."""
+    """Normaliza a entrada do idioma para 'en', 'pt-br', 'ar' ou 'auto'."""
     s = (v or "").strip().lower()
     if s in ("1", "en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english"):
         return "en"
     if s in ("2", "pt", "pt-br", "br", "brasil", "portugues", "português"):
         return "pt-br"
+    if s in ("3", "ar", "ar-eg", "egito", "eg", "árabe", "arabe"):
+        return "ar"
     return "auto"
 
 
@@ -89,7 +90,7 @@ def postar_no_tiktok_e_renomear(
       - descricao_personalizada (str): legenda dinâmica
       - imagem_base, imagem_final, video_final: caminhos dos arquivos
       - agendar (bool): se True, agenda ~20min à frente
-      - idioma (str): 'en' / 'pt-br' (controla proxy, hashtags e cookies)
+      - idioma (str): 'en' / 'pt-br' / 'ar' (controla proxy, hashtags e cookies)
     """
     idioma_norm = _normalizar_idioma(idioma)
     logger.info("postar_no_tiktok_e_renomear: idioma_in=%s | idioma_norm=%s", idioma, idioma_norm)
@@ -98,26 +99,42 @@ def postar_no_tiktok_e_renomear(
     if not video_path:
         return
 
-    # Seleciona o arquivo de cookies com base no idioma
-    COOKIES_PATH = "cookies_us.txt" if idioma_norm == 'en' else "cookies_br.txt"
+    # Seleciona cookies por idioma (env-first)
+    cookies_map = {
+        "en":   os.getenv("COOKIES_US_FILENAME", "cookies_us.txt"),
+        "pt-br":os.getenv("COOKIES_BR_FILENAME", "cookies_br.txt"),
+        "ar":   os.getenv("COOKIES_EG_FILENAME", "cookies_eg.txt"),
+    }
+    COOKIES_PATH = cookies_map.get(idioma_norm, os.getenv("COOKIES_US_FILENAME", "cookies_us.txt"))
+    logger.info("🍪 Cookies utilizados: %s", COOKIES_PATH)
 
     if not os.path.exists(COOKIES_PATH):
         logger.error(f"❌ Arquivo de cookies não encontrado: {COOKIES_PATH}")
         return
 
     try:
-        # Hashtags conforme idioma
-        hashtags_en = " #Motivation #Inspiration #TikTokMotivational"
-        hashtags_pt = " #Motivacao #Inspiracao #TikTokMotivacional"
-        hashtags = hashtags_pt if idioma_norm == 'pt-br' else hashtags_en
+        # Hashtags conforme idioma (env-first)
+        hashtags_en = os.getenv("HASHTAGS_EN", " #Motivation #Inspiration #TikTokMotivational")
+        hashtags_pt = os.getenv("HASHTAGS_PT_BR", " #Motivacao #Inspiracao #TikTokMotivacional")
+        hashtags_ar = os.getenv("HASHTAGS_AR_EG", " #تاروت #قراءة_تاروت #ابراج #طاقة #توقعات")
+
+        if idioma_norm == "pt-br":
+            hashtags = hashtags_pt
+        elif idioma_norm == "ar":
+            hashtags = hashtags_ar
+        else:
+            hashtags = hashtags_en
 
         # Monta a descrição e limpa markdown, se habilitado
         if descricao_personalizada:
             base_desc = descricao_personalizada
         else:
-            base_desc = ("Motivational content of the day!"
-                         if idioma_norm == 'en' else
-                         "Conteúdo motivacional do dia!")
+            if idioma_norm == "pt-br":
+                base_desc = "Conteúdo motivacional do dia!"
+            elif idioma_norm == "ar":
+                base_desc = "رسالة اليوم ✨"
+            else:
+                base_desc = "Motivational content of the day!"
 
         if STRIP_MARKDOWN_IN_DESC:
             cleaned = _strip_markdown(base_desc)
@@ -136,19 +153,16 @@ def postar_no_tiktok_e_renomear(
         logger.info("📝 Descrição final: %s", description)
         time.sleep(2)  # Delay antes do upload para estabilidade da rede
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # PONTO CRÍTICO: repassar o idioma para o uploader!
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         upload_video(
             filename=video_path,
             description=description,
-            cookies=COOKIES_PATH,   # seu AuthBackend aceita path de cookies
+            cookies=COOKIES_PATH,
             comment=True,
             stitch=True,
             duet=True,
             headless=False,         # troque para True se quiser rodar invisível
             schedule=schedule,
-            idioma=idioma_norm      # <<< GARANTIDO
+            idioma=idioma_norm      # ex.: 'ar' -> ar-EG na lib
         )
         logger.info("✅ Vídeo postado com sucesso!")
 
@@ -174,7 +188,6 @@ def postar_no_tiktok_e_renomear(
                 os.remove(audio_to_remove)
                 logger.info("🗑️ Áudio removido: %s", audio_to_remove)
         except Exception:
-            # não interrompe o fluxo se não conseguir remover
             pass
 
     except (NoSuchElementException, TimeoutException) as e:
@@ -191,4 +204,4 @@ def postar_no_tiktok_e_renomear(
         logger.error("❌ Erro geral ao postar: %s", str(e))
     finally:
         logger.info("⏳ Aguardando 5 segundos antes de finalizar...")
-        time.sleep(5)  # Delay final para qualquer verificação de rede
+        time.sleep(5)

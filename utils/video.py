@@ -10,6 +10,13 @@ from typing import Optional, List, Tuple
 
 from dotenv import load_dotenv
 from .frase import gerar_frase_motivacional_longa
+# Tarot (opcional – fallback seguro)
+try:
+    from .frase import gerar_frase_tarot_longa
+    _HAVE_TAROT_LONG = True
+except Exception:
+    _HAVE_TAROT_LONG = False
+
 from .audio import obter_caminho_audio, gerar_narracao_tts
 
 load_dotenv()
@@ -119,6 +126,12 @@ VIDEO_TAIL_PAD    = _env_float("VIDEO_TAIL_PAD", 0.40)   # margem após a fala
 VIDEO_MAX_S       = _env_float("VIDEO_MAX_S", 0.0)       # 0 = sem teto
 TPAD_EPS          = _env_float("TPAD_EPS", 0.25)         # segurança para arredondamentos
 
+# --------- Fase 3: Árabe / ASS legendas ----------
+SUBS_USE_ASS_FOR_RTL   = _env_bool("SUBS_USE_ASS_FOR_RTL", True)
+ARABIC_FONT            = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
+SUBS_ASS_BASE_FONTSIZE = _env_int("SUBS_ASS_BASE_FONTSIZE", 36)
+META_SOFTWARE_FALLBACK = os.getenv("META_SOFTWARE_FALLBACK", "").strip()  # se vazio, não escreve
+
 # -------------------- Helpers --------------------
 def _ffmpeg_or_die() -> str:
     path = shutil.which("ffmpeg")
@@ -151,7 +164,14 @@ def _ffmpeg_has_filter(filter_name: str) -> bool:
 
 def _idioma_norm(idioma: str) -> str:
     s = (idioma or "en").lower()
-    return "pt" if s.startswith("pt") else "en"
+    if s.startswith("pt"):
+        return "pt"
+    if s.startswith("ar"):
+        return "ar"
+    return "en"
+
+def _lang_is_rtl(lang: str) -> bool:
+    return lang in ("ar",)
 
 def _duracao_audio_segundos(audio_path: str) -> Optional[float]:
     if not audio_path or not os.path.isfile(audio_path):
@@ -177,6 +197,24 @@ def _ff_normpath(path: str) -> str:
         rel = path
     return rel.replace("\\", "/")
 
+# >>>>>>> ESCAPE SEGURO PARA FILTERGRAPH (Windows e Unix) <<<<<<<
+_IS_WIN = (os.name == "nt")
+
+def _ff_escape_filter_path(p: str) -> str:
+    """
+    Normaliza para '/', escapa o 'C:' -> 'C\\:' (Windows) e aspas simples.
+    Útil para valores dentro de filtros (drawtext/subtitles).
+    """
+    s = _ff_normpath(p)
+    if _IS_WIN and re.match(r"^[A-Za-z]:/", s):
+        s = s[0] + r"\:" + s[2:]  # C:/... -> C\:/...
+    s = s.replace("'", r"\'")
+    return s
+
+def _ff_q(val: str) -> str:
+    """Coloca entre aspas simples para o parser do filtergraph."""
+    return f"'{_ff_escape_filter_path(val)}'"
+
 def _uuid_suffix() -> str:
     return uuid.uuid4().hex[:8]
 
@@ -190,9 +228,12 @@ def _stage_to_dir(src_path: str, target_dir: str, prefix: str) -> str:
 
 # ---------- Segmentação para legendas ----------
 import re as _re
+_AR_RANGES = r"\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF"
+
 def _tokenize_words(text: str) -> List[str]:
     text = _re.sub(r"[\r\n]+", " ", (text or "")).strip()
-    tokens = _re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-]+", text)
+    # Latin + extended + números + apóstrofos | blocos árabes
+    tokens = _re.findall(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ'’\-]+|[" + _AR_RANGES + r"]+", text)
     return [t for t in tokens if t]
 
 def _chunk_words(tokens: List[str]) -> List[List[str]]:
@@ -215,19 +256,19 @@ def _distribuir_duracoes_por_palavra(frases: List[str], total_disp: float) -> Li
     if not frases:
         return []
     min_seg, max_seg = 0.7, 3.0
-    pesos = [max(1, len(f.split())) for f in frases]
+    pesos = [max(1, len(_tokenize_words(f))) for f in frases]
     soma = sum(pesos)
     brutas = [(p / soma) * total_disp for p in pesos]
     clamped = [min(max(b, min_seg), max_seg) for b in brutas]
     fator = min(1.0, (total_disp / sum(clamped))) if sum(clamped) > 0 else 1.0
     return [d * fator for d in clamped]
 
-def _segmentos_legenda_palavras(texto: str, duracao_audio: float) -> List[Tuple[float, float, str]]:
+def _segmentos_legenda_palavras(texto: str, duracao_audio: float, uppercase: bool = True) -> List[Tuple[float, float, str]]:
     tokens = _tokenize_words(texto)
     if not tokens:
         return []
     chunks = _chunk_words(tokens)
-    lines = [" ".join(ch).upper() for ch in chunks]
+    lines = [" ".join(ch).upper() if uppercase else " ".join(ch) for ch in chunks]
     alvo = max(3.0, (duracao_audio or 12.0) - 0.2)
     gap = 0.10
     duracoes = _distribuir_duracoes_por_palavra(lines, alvo - gap * (len(lines) - 1))
@@ -248,7 +289,12 @@ def _segmentos_via_whisper(audio_path: str, idioma: str) -> List[Tuple[float, fl
     except Exception as e:
         logger.warning("WHISPER_ENABLE=1 mas 'faster-whisper' não está disponível: %s", e)
         return []
-    lang_code = "pt" if (idioma or "").lower().startswith("pt") else "en"
+    if (idioma or "").lower().startswith("pt"):
+        lang_code = "pt"
+    elif (idioma or "").lower().startswith("ar"):
+        lang_code = "ar"
+    else:
+        lang_code = "en"
     try:
         dur_audio = _duracao_audio_segundos(audio_path) or 0.0
         cap = dur_audio + 0.10 if dur_audio > 0 else 60.0
@@ -277,7 +323,8 @@ def _segmentos_via_whisper(audio_path: str, idioma: str) -> List[Tuple[float, fl
                 take = max(1, n - i)
             chunk = words[i:i + take]
             ini, fim = chunk[0][0], chunk[-1][1]
-            texto = " ".join([w[2] for w in chunk]).upper()
+            texto = " ".join([w[2] for w in chunk])
+            # não upper() para preservar script árabe
             if ini < cap and fim > 0:
                 ini2 = max(0.20, ini)
                 fim2 = min(cap - 0.05, fim)
@@ -340,7 +387,7 @@ def _build_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, flo
         fs = max(18, int(H * 0.024)); borderw = 1; margin = max(56, int(H * 0.12))
 
     use_fontfile = (font_path and os.path.isfile(font_path))
-    font_opt = f":fontfile={_ff_normpath(font_path)}" if use_fontfile else ""
+    font_opt = f":fontfile={_ff_q(font_path)}" if use_fontfile else ""
     if use_fontfile:
         logger.info("🔤 drawtext usando fonte: %s", font_path)
     else:
@@ -349,9 +396,10 @@ def _build_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, flo
     blocks = []
     for idx, (ini, fim, txt) in enumerate(segments, start=1):
         tf_posix = _ff_normpath(_write_textfile(txt, idx))
+        tf_q = _ff_q(tf_posix)
         block = (
             "drawtext="
-            f"textfile={tf_posix}"
+            f"textfile={tf_q}"
             f"{font_opt}"
             f":fontsize={fs}"
             f":fontcolor=white"
@@ -364,6 +412,55 @@ def _build_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, flo
         )
         blocks.append(block)
     return ",".join(blocks)
+
+# --------- ASS (libass) p/ RTL ----------
+def _ass_escape(s: str) -> str:
+    return s.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", r"\N")
+
+def _segments_to_ass_file(H: int, segments: List[Tuple[float, float, str]], font_name: str, base_fs: int) -> str:
+    """
+    Gera um arquivo .ass simples com estilo centrado no rodapé.
+    """
+    fs = max(18, int(base_fs if base_fs > 0 else 36))
+    margin_v = max(54, int(H * 0.115))
+    style = (
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font_name},{fs},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
+        "0,0,0,0,100,100,0,0,1,2,0,2,20,20," + str(margin_v) + ",1\n"
+    )
+    hdr = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "WrapStyle: 2\n"
+        "ScaledBorderAndShadow: yes\n"
+        "YCbCr Matrix: TV.709\n"
+        "\n"
+    )
+    events_hdr = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    def ts(t: float) -> str:
+        t = max(0.0, t)
+        h = int(t // 3600); t -= h * 3600
+        m = int(t // 60);   t -= m * 60
+        s = int(t);         cs = int(round((t - s) * 100))
+        return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+    lines = []
+    for (ini, fim, txt) in segments:
+        line = f"Dialogue: 0,{ts(ini)},{ts(fim)},Default,,0,0,0,,{_ass_escape(txt)}"
+        lines.append(line)
+
+    ass = hdr + style + "\n" + events_hdr + "\n".join(lines) + "\n"
+    path = os.path.join(CACHE_DIR, f"subs_{_uuid_suffix()}.ass")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(ass)
+    return path
 
 # -------------------- Movimento (zoom/pan) --------------------
 def _smoothstep_expr(p: str) -> str:
@@ -472,7 +569,9 @@ def gerar_video(
     transition: Optional[str] = None,
     # ===== METADADOS =====
     autor: Optional[str] = "Capcut",
-    tags: Optional[str] = None
+    tags: Optional[str] = None,
+    # ===== Fase 3 =====
+    content_mode: str = "motivacional"   # "motivacional" | "tarot"
 ):
     staged_images: List[str] = []
     staged_tts: Optional[str] = None
@@ -495,8 +594,13 @@ def gerar_video(
 
         ffmpeg = _ffmpeg_or_die()
 
-        long_text = gerar_frase_motivacional_longa(idioma)
+        # ====== TEXTO LONGO (TTS) por modo ======
         lang_norm = _idioma_norm(idioma)
+        if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG:
+            long_text = gerar_frase_tarot_longa(idioma)
+        else:
+            long_text = gerar_frase_motivacional_longa(idioma)
+
         style_norm = _normalize_style(video_style)
 
         voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
@@ -524,10 +628,12 @@ def gerar_video(
         has_voice = bool(voice_audio_path)
         has_bg = bool(background_audio_path)
 
+        # ====== LEGENDAS (ASS p/ árabe; drawtext p/ en/pt) ======
         segments: List[Tuple[float, float, str]] = []
         if legendas and has_voice:
             seg_whisper = _segmentos_via_whisper(voice_audio_path, lang_norm) if WHISPER_ENABLE else []
-            segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or 12.0)
+            # Uppercase só para latinos
+            segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or 12.0, uppercase=(lang_norm != "ar"))
             logger.info("📝 %d segmentos de legenda.", len(segments))
 
         # --- duração alvo do vídeo (segue TTS) ---
@@ -548,7 +654,6 @@ def gerar_video(
         trans_dur = max(0.50, min(0.90, per_slide_rough * 0.135)) if n_slides > 1 else 0.0
 
         # 2) corrige per_slide para compensar o overlap do xfade:
-        #    comprimento_out = n*per_slide - (n-1)*trans_dur = total_video  =>  per_slide = (total_video + (n-1)*trans_dur)/n
         per_slide = (total_video + (n_slides - 1) * trans_dur) / n_slides
 
         logger.info("⏱️ Target: total=%.3fs | n=%d | per_slide=%.3fs | xfade=%.3fs | perda_overlap=%.3fs",
@@ -604,23 +709,35 @@ def gerar_video(
                 logger.warning("FFmpeg sem 'chromashift'; seguindo sem deslocamento de croma.")
 
         filters = look_ops + [f"format=yuv420p,setsar=1/1,fps={FPS_OUT}"]
-        # tpad clona o último frame para cobrir sobras de arredondamento, depois trimamos no total exato
         parts.append(
             f"{final_video_label}{','.join(filters)},"
             f"tpad=stop_mode=clone:stop_duration={max(TPAD_EPS, 0.01):.3f},"
             f"trim=duration={total_video:.3f},setpts=PTS-STARTPTS[vf]"
         )
 
-        # 4) Legendas (drawtext)
-        draw_chain = ""
-        if segments:
-            font_for_sub = _pick_drawtext_font(video_style)
-            draw_chain = _build_drawtext_chain(H, style_norm, segments, font_for_sub)
-
-        if draw_chain:
-            parts.append(f"[vf]{draw_chain},format=yuv420p[vout]")
+        # 4) Legendas: ASS para árabe (se possível), drawtext para en/pt
+        use_ass = (legendas and segments and _lang_is_rtl(lang_norm) and SUBS_USE_ASS_FOR_RTL)
+        if use_ass:
+            try:
+                font_name = os.path.splitext(os.path.basename(ARABIC_FONT))[0] or "NotoNaskhArabic"
+                ass_path = _segments_to_ass_file(H, segments, font_name, SUBS_ASS_BASE_FONTSIZE)
+                parts.append(
+                    f"[vf]subtitles=filename={_ff_q(ass_path)}:fontsdir={_ff_q(FONTS_DIR)}[vout]"
+                )
+            except Exception as e:
+                logger.warning("Falha no ASS/RTL (%s). Voltando ao drawtext simples sem uppercase.", e)
+                font_for_sub = _pick_drawtext_font(video_style)
+                draw_chain = _build_drawtext_chain(H, style_norm, segments, font_for_sub)
+                parts.append(f"[vf]{draw_chain},format=yuv420p[vout]")
         else:
-            parts.append(f"[vf]format=yuv420p[vout]")
+            draw_chain = ""
+            if legendas and segments:
+                font_for_sub = _pick_drawtext_font(video_style)
+                draw_chain = _build_drawtext_chain(H, style_norm, segments, font_for_sub)
+            if draw_chain:
+                parts.append(f"[vf]{draw_chain},format=yuv420p[vout]")
+            else:
+                parts.append(f"[vf]format=yuv420p[vout]")
 
         # 5) Áudio — segue a VOZ e casa com o total do vídeo
         fade_in_dur = 0.30
@@ -713,18 +830,28 @@ def gerar_video(
         if has_bg and background_audio_path:
             cmd += ["-i", background_audio_path]
 
-        title = (long_text[:75] + '...') if len(long_text) > 75 else long_text
-        default_tags = "motivacional, inspirador, reflexão, shorts, reels, AI"
+        # ---------- Metadados 100% em inglês ----------
+        if (content_mode or "").lower() == "tarot":
+            default_tags = "tarot, fortune teller, reading, spirituality"
+            genre = "Spiritual"
+            meta_title = "Tarot reading — daily guidance"
+        else:
+            default_tags = "motivational, inspirational, reflection, shorts, reels, ai"
+            genre = "Inspirational"
+            meta_title = "Motivational quote"
+
+        meta_comment = f"Auto-generated narration video. Mode={content_mode}, VO language={_idioma_norm(idioma)}."
+        meta_description = meta_comment
 
         metadata = {
-            "title": title,
-            "artist": autor or "Autor Desconhecido",
-            "album_artist": autor or "Autor Desconhecido",
-            "composer": autor or "Autor Desconhecido",
-            "comment": long_text,
-            "description": long_text,
+            "title": meta_title,
+            "artist": autor or "Unknown Artist",
+            "album_artist": autor or "Unknown Artist",
+            "composer": autor or "Unknown Artist",
+            "comment": meta_comment,
+            "description": meta_description,
             "keywords": tags if tags else default_tags,
-            "genre": "Inspirational",
+            "genre": genre,
             "creation_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
 
@@ -738,7 +865,9 @@ def gerar_video(
                 "com.apple.quicktime.location.ISO6709": META_LOCATION_ISO6709,
             })
         else:
-            metadata["software"] = "Gerador de Vídeo Automático"
+            # NADA de "Gerador de IA". Se estiver vazio, não adiciona a chave.
+            if META_SOFTWARE_FALLBACK:
+                metadata["software"] = META_SOFTWARE_FALLBACK
 
         meta_flags: List[str] = []
         for key, value in metadata.items():
@@ -764,12 +893,9 @@ def gerar_video(
             "-x264-params", f"keyint={FPS_OUT*2}:min-keyint={FPS_OUT*2}:scenecut=0",
             "-map_metadata", "-1",
             "-threads", "2",
-            # sem -shortest: durations já casadas por trim/atrim
         ]
 
-        # usa o script (mais robusto em Windows)
         cmd += ["-filter_complex_script", fc_path, "-map", "[vout]", "-map", "[aout]"]
-        # também forçamos um -t total para o muxer, combinando com os trims
         cmd += ["-t", f"{total_video:.3f}"]
         cmd += common_out
         cmd += meta_flags
