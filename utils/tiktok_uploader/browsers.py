@@ -1,4 +1,3 @@
-# utils/tiktok_uploader/browsers.py
 import logging
 import os
 from typing import Optional, Tuple
@@ -33,14 +32,19 @@ def _idioma_norm(idioma: Optional[str]) -> str:
 
 
 def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
-    """Heurística padrão: liga proxy para EN e AR (Egito)."""
+    """Heurística: liga proxy para EN (US) e AR (EG)."""
     lang = _idioma_norm(idioma)
     return lang in ("en", "ar")
 
 
 def _compute_region_from_idioma(idioma: Optional[str]) -> Optional[str]:
-    """Region default por idioma (hoje só especial-caso para árabe)."""
-    return "EG" if _idioma_norm(idioma) == "ar" else None
+    """Mapeia idioma -> região do proxy."""
+    lang = _idioma_norm(idioma)
+    if lang == "ar":
+        return "EG"
+    if lang == "en":
+        return "US"
+    return None
 
 
 def _lang_tag_and_header_from_idioma(idioma: Optional[str]) -> Tuple[str, str]:
@@ -54,15 +58,15 @@ def _lang_tag_and_header_from_idioma(idioma: Optional[str]) -> Tuple[str, str]:
 
 def _accept_header_from_tag(tag: Optional[str]) -> str:
     tag = (tag or "").strip() or "en-US"
-    if tag.lower().startswith("pt"):
+    tl = tag.lower()
+    if tl.startswith("pt"):
         return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tag.lower().startswith("ar"):
+    if tl.startswith("ar"):
         return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
     return "en-US,en;q=0.9"
 
 
 def _silenciar_ruido(nivel_wire=logging.ERROR, nivel_net=logging.WARNING, nivel_wdm=logging.WARNING) -> None:
-    """Reduz verbosidade de libs ruidosas."""
     for name in (
         "seleniumwire",
         "seleniumwire.server",
@@ -87,19 +91,44 @@ def _silenciar_ruido(nivel_wire=logging.ERROR, nivel_net=logging.WARNING, nivel_
         lg.propagate = False
 
 
-def _resolve_proxy_env(region: Optional[str]) -> Tuple[str, str, Optional[str], Optional[str]]:
+def _env_first(*keys: str, default: str = "") -> str:
+    """Retorna o primeiro env não vazio dentre as chaves fornecidas."""
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return default
+
+
+def _resolve_proxy_env(region: Optional[str]) -> Tuple[str, str, Optional[str], Optional[str], str]:
     """
-    Lê variáveis de ambiente com suporte a região:
-      - EG => PROXY_EG_HOST/PORT/USER/PASS
-      - padrão => PROXY_HOST/PORT/USER/PASS
+    Suporta esquema semântico por região:
+      - US => PROXY_US_HOST/PORT/USER/PASS (também aceita PROXY_HOST_US/PORT_US/..)
+      - EG => PROXY_EG_HOST/PORT/USER/PASS (também aceita PROXY_HOST_EG/PORT_EG/..)
+    Fallback (sem região): PROXY_HOST/PORT/USER/PASS
+    Retorna: host, port, user, pass, region_key_usada
     """
     load_dotenv()
-    prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
-    host = os.getenv(f"{prefix}_HOST") or ""
-    port = os.getenv(f"{prefix}_PORT") or ""
-    user = os.getenv(f"{prefix}_USER")
-    pw   = os.getenv(f"{prefix}_PASS")
-    return host, port, user, pw
+    reg = (region or "").upper()
+
+    if reg == "US":
+        host = _env_first("PROXY_US_HOST", "PROXY_HOST_US", "PROXY_HOST")
+        port = _env_first("PROXY_US_PORT", "PROXY_PORT_US", "PROXY_PORT")
+        user = _env_first("PROXY_US_USER", "PROXY_USER_US", "PROXY_USER") or None
+        pw   = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
+        return host, port, user, pw, "US"
+    elif reg == "EG":
+        host = _env_first("PROXY_EG_HOST", "PROXY_HOST_EG", "PROXY_HOST")
+        port = _env_first("PROXY_EG_PORT", "PROXY_PORT_EG", "PROXY_PORT")
+        user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
+        pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
+        return host, port, user, pw, "EG"
+    else:
+        host = _env_first("PROXY_HOST")
+        port = _env_first("PROXY_PORT")
+        user = _env_first("PROXY_USER") or None
+        pw   = _env_first("PROXY_PASS") or None
+        return host, port, user, pw, "DEFAULT"
 
 
 def _mk_seleniumwire_options(
@@ -107,7 +136,7 @@ def _mk_seleniumwire_options(
     region: Optional[str],
 ):
     """Monta seleniumwire_options com proxy autenticado + scopes (menos ruído)."""
-    host, port, user, pw = _resolve_proxy_env(region)
+    host, port, user, pw, key = _resolve_proxy_env(region)
     opts = {
         "request_storage": "none",
         "verify_ssl": False,
@@ -128,9 +157,9 @@ def _mk_seleniumwire_options(
                 "https": proxy_uri,
                 "no_proxy": "localhost,127.0.0.1",
             }
-            logging.info("🌐 UPSTREAM proxy ON (%s): %s", (region or "DEFAULT"), proxy_uri)
+            logging.info("🌐 UPSTREAM proxy ON (%s): %s", key, proxy_uri)
         else:
-            logging.warning("⚠️ want_proxy=True mas PROXY vars ausentes para região %s. Caindo para conexão direta.", region or "DEFAULT")
+            logging.warning("⚠️ want_proxy=True mas PROXY vars ausentes para %s. Caindo para conexão direta.", key)
     return opts
 
 
@@ -144,7 +173,6 @@ def get_browser(
     idioma: str = "auto",
     headless: bool = False,
     *,
-    # NOVOS PARÂMETROS (respeitados se fornecidos)
     want_proxy: Optional[bool] = None,
     region: Optional[str] = None,
     lang_tag: Optional[str] = None,
@@ -152,14 +180,13 @@ def get_browser(
 ):
     """
     Cria um WebDriver:
-    - Se want_proxy=True => Selenium-Wire + proxy upstream (PROXY_* ou PROXY_<REG>_*)
-    - Se want_proxy=False => Selenium "puro"
-    - region pode ser 'EG' p/ árabe (lê PROXY_EG_*). Se None, cai para PROXY_*.
+    - Se want_proxy=True => Selenium-Wire + proxy upstream (PROXY_* ou PROXY_<REG>_*).
+    - Se want_proxy=False => Selenium "puro".
+    - region pode ser 'US' ou 'EG' (lerá PROXY_US_* / PROXY_EG_*). Se None, cai para PROXY_*.
     - Define Accept-Language/--lang segundo lang_tag (ou deduz de 'idioma').
     """
     _silenciar_ruido()
 
-    # Defaults se não vierem explícitos
     if want_proxy is None:
         want_proxy = _use_proxy_from_idioma(idioma)
     if region is None:

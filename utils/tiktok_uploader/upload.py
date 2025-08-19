@@ -63,10 +63,14 @@ except ImportError:
         return "en"
 
     def _want_proxy_default(idioma: Optional[str]) -> bool:
+        # proxy para EN (US) e AR (EG)
         return _norm_lang(idioma) in ("en", "ar")
 
     def _region_default(idioma: Optional[str]) -> Optional[str]:
-        return "EG" if _norm_lang(idioma) == "ar" else None
+        n = _norm_lang(idioma)
+        if n == "ar": return "EG"
+        if n == "en": return "US"
+        return None
 
     def _lang_tag_default(idioma: Optional[str]) -> str:
         n = _norm_lang(idioma)
@@ -74,18 +78,46 @@ except ImportError:
         if n == "ar": return "ar-EG"
         return "en-US"
 
+    def _env_first(*keys: str, default: str = "") -> str:
+        for k in keys:
+            v = os.getenv(k)
+            if v: return v
+        return default
+
     def _resolve_proxy_env(region: Optional[str]):
+        """
+        Lê variáveis com suporte a região:
+          - US => PROXY_US_HOST/PORT/USER/PASS (aceita também PROXY_HOST_US/PORT_US/...)
+          - EG => PROXY_EG_HOST/PORT/USER/PASS (aceita também PROXY_HOST_EG/PORT_EG/...)
+          - default => PROXY_HOST/PORT/USER/PASS
+        """
         load_dotenv()
-        prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
-        host = os.getenv(f"{prefix}_HOST") or os.getenv("PROXY_HOST") or ""
-        port = os.getenv(f"{prefix}_PORT") or os.getenv("PROXY_PORT") or ""
-        user = os.getenv(f"{prefix}_USER") or os.getenv("PROXY_USER")
-        pw   = os.getenv(f"{prefix}_PASS") or os.getenv("PROXY_PASS")
+        reg = (region or "").upper()
+        if reg == "US":
+            host = _env_first("PROXY_US_HOST", "PROXY_HOST_US", "PROXY_HOST")
+            port = _env_first("PROXY_US_PORT", "PROXY_PORT_US", "PROXY_PORT")
+            user = _env_first("PROXY_US_USER", "PROXY_USER_US", "PROXY_USER") or None
+            pw   = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
+            return host, port, user, pw
+        if reg == "EG":
+            host = _env_first("PROXY_EG_HOST", "PROXY_HOST_EG", "PROXY_HOST")
+            port = _env_first("PROXY_EG_PORT", "PROXY_PORT_EG", "PROXY_PORT")
+            user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
+            pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
+            return host, port, user, pw
+        # fallback
+        host = _env_first("PROXY_HOST")
+        port = _env_first("PROXY_PORT")
+        user = _env_first("PROXY_USER") or None
+        pw   = _env_first("PROXY_PASS") or None
         return host, port, user, pw
 
     def _mk_sw_opts(use_proxy: bool, region: Optional[str]):
-        opts = {'request_storage': 'none', 'verify_ssl': False,
-                'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"]}
+        opts = {
+            'request_storage': 'none',
+            'verify_ssl': False,
+            'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"]
+        }
         if not use_proxy:
             return opts
         host, port, user, pw = _resolve_proxy_env(region)
@@ -99,6 +131,15 @@ except ImportError:
         else:
             logging.warning("want_proxy=True mas variáveis de proxy ausentes (%s). Seguiremos sem upstream.", region or "DEFAULT")
         return opts
+
+    def _accept_header_from_tag(tag: Optional[str]) -> str:
+        tag = (tag or "").strip() or "en-US"
+        tl = tag.lower()
+        if tl.startswith("pt"):
+            return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+        if tl.startswith("ar"):
+            return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+        return "en-US,en;q=0.9"
 
     def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto",
                     headless: bool = False, *, want_proxy: Optional[bool] = None,
@@ -118,11 +159,19 @@ except ImportError:
             if options is None:
                 options = ChromeOptions()
             options.add_argument(f"--lang={lang_tag}")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-logging")
+            options.add_argument("--log-level=3")
+            options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
             if headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--ignore-certificate-errors")
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            # se quisermos sem proxy, ainda usamos wire (sem proxy) para manter compat
             driver = wire_webdriver.Chrome(
                 service=ChromeService(ChromeDriverManager().install()),
                 options=options,
@@ -158,9 +207,10 @@ except ImportError:
         elif name == "edge":
             if options is None:
                 options = EdgeOptions()
+            options.add_argument(f"--lang={lang_tag}")
             if headless:
                 options.add_argument("--headless=new")
-            options.add_argument(f"--lang={lang_tag}")
+                options.add_argument("--ignore-certificate-errors")
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
             return wire_webdriver.Edge(
                 service=EdgeService(EdgeChromiumDriverManager().install()),
@@ -206,8 +256,11 @@ def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
 
 
 def _region_from_idioma(idioma: Optional[str]) -> Optional[str]:
-    """EG para árabe; None para demais (usa PROXY_* default)."""
-    return "EG" if _idioma_norm(idioma) == "ar" else None
+    """US para inglês; EG para árabe; None para demais (usa PROXY_* default)."""
+    n = _idioma_norm(idioma)
+    if n == "ar": return "EG"
+    if n == "en": return "US"
+    return None
 
 
 def _lang_tag_from_idioma(idioma: Optional[str]) -> str:
@@ -335,7 +388,7 @@ def upload_videos(
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--ignore-certificate-errors")
 
-        # IMPORTANTE: get_browser (do módulo browsers OU fallback) agora respeita want_proxy/region/lang_tag
+        # IMPORTANTE: get_browser (do módulo browsers OU fallback) respeita want_proxy/region/lang_tag
         driver = get_browser(
             browser,
             headless=headless,
