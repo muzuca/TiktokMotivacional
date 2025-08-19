@@ -1,11 +1,19 @@
 # main.py
 import os
+import sys
 import time
 import logging
 from datetime import datetime, timedelta
 import random
 import shutil
 from glob import glob
+
+# === Ajusta CWD quando empacotado para ler .env/cookies ao lado do .exe ===
+if getattr(sys, 'frozen', False):
+    try:
+        os.chdir(os.path.dirname(sys.executable))
+    except Exception:
+        pass
 
 # ====== Robustez extra (timeout/cleanup/watchdog) ======
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
@@ -56,6 +64,9 @@ HEARTBEAT_SECS = HEARTBEAT_MIN * 60.0 if HEARTBEAT_MIN > 0 else 0.0
 # Opções: "none" | "drivers_only" | "children" | "match" | "all"
 CHROME_CLEANUP_POLICY = os.getenv("CHROME_CLEANUP_POLICY", "drivers_only").strip().lower()
 CHROME_KILL_MATCH     = os.getenv("CHROME_KILL_MATCH", "").strip()  # usado quando policy=match
+
+# Quando empacotado (PyInstaller), roda inline para evitar reexecução do menu
+RUN_INLINE_WHEN_FROZEN = os.getenv("RUN_INLINE_WHEN_FROZEN", "1").strip() != "0"
 
 # Watchdog para identificar enforcamentos raros
 os.makedirs("cache", exist_ok=True)
@@ -195,6 +206,17 @@ def _run_rotina_once(args_tuple) -> bool:
         _cleanup_browsers()
 
 def _executar_com_timeout(args_tuple) -> bool:
+    # Em executável (PyInstaller), roda inline para evitar reexecução do menu
+    if getattr(sys, 'frozen', False) and RUN_INLINE_WHEN_FROZEN:
+        start = time.time()
+        try:
+            ok = _run_rotina_once(args_tuple)
+            return bool(ok)
+        finally:
+            dur = time.time() - start
+            logging.info("⏲️ Duração do ciclo (inline/frozen): %.1fs", dur)
+
+    # Ambiente normal (dev): mantém subprocesso com timeout
     ctx = multiprocessing.get_context("spawn")
     start = time.time()
     _cleanup_browsers()
@@ -485,6 +507,12 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
         logger.info("🛑 Automático interrompido.")
 
 if __name__ == "__main__":
+    # Necessário no Windows quando empacotado
+    try:
+        multiprocessing.freeze_support()
+    except Exception:
+        pass
+
     env_motion = os.getenv("MOTION", "none").strip().lower()
     valid_motions = {v[0] for v in MOTION_OPTIONS.values()}
     if env_motion not in valid_motions:

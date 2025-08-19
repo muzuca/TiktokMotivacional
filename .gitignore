@@ -6,6 +6,8 @@ cookies_us.txt
 cookies_br.txt
 cookies_eg.txt
 cookies_*.txt
+build_exe.bat
+*.spec
 *.TEMP_MPY_wvf_snd
 audios/
 videos/
@@ -14,3 +16,5 @@ cache/
 audio_tts/
 venv/
 whisper_models/
+dist/
+build/
