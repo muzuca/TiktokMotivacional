@@ -1,3 +1,4 @@
+# utils/tiktok_uploader/upload.py
 """
 Módulo `tiktok_uploader` para fazer upload de vídeos no TikTok
 
@@ -18,6 +19,7 @@ import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from typing import Any, Callable, Literal, Optional, List, Dict
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 # ===== Selenium =====
 from selenium.webdriver.common.by import By
@@ -39,11 +41,12 @@ from . import config
 
 # Preferimos o get_browser (com Selenium-Wire) do módulo browsers.
 try:
-    from .browsers import get_browser  # preferencial
+    from .browsers import get_browser  # preferencial (respeita want_proxy/region/lang_tag)
 except ImportError:
-    # Fallback minimalista com Selenium-Wire embutido (mantém compat)
+    # ------------------ Fallback minimalista com Selenium-Wire ------------------
     from dotenv import load_dotenv
     from seleniumwire import webdriver as wire_webdriver  # type: ignore
+    from selenium import webdriver as std_webdriver
     from selenium.webdriver.chrome.service import Service as ChromeService
     from webdriver_manager.chrome import ChromeDriverManager
     from selenium.webdriver.firefox.options import Options as FirefoxOptions
@@ -53,48 +56,82 @@ except ImportError:
     from selenium.webdriver.edge.service import Service as EdgeService
     from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
-    def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
-        if not idioma:
-            return False
-        s = idioma.strip().lower()
-        logging.info(f"_use_proxy_from_idioma: idioma={s}")
-        return s in ("en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english")
+    def _norm_lang(s: Optional[str]) -> str:
+        s = (s or "").strip().lower()
+        if s.startswith("ar"): return "ar"
+        if s.startswith("pt"): return "pt"
+        return "en"
 
-    def _mk_sw_opts(use_proxy: bool, host: str, port: str, user: Optional[str], pw: Optional[str]):
-        opts = {'request_storage': 'none', 'verify_ssl': False}
-        if use_proxy and host and port:
+    def _want_proxy_default(idioma: Optional[str]) -> bool:
+        return _norm_lang(idioma) in ("en", "ar")
+
+    def _region_default(idioma: Optional[str]) -> Optional[str]:
+        return "EG" if _norm_lang(idioma) == "ar" else None
+
+    def _lang_tag_default(idioma: Optional[str]) -> str:
+        n = _norm_lang(idioma)
+        if n == "pt": return "pt-BR"
+        if n == "ar": return "ar-EG"
+        return "en-US"
+
+    def _resolve_proxy_env(region: Optional[str]):
+        load_dotenv()
+        prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
+        host = os.getenv(f"{prefix}_HOST") or os.getenv("PROXY_HOST") or ""
+        port = os.getenv(f"{prefix}_PORT") or os.getenv("PROXY_PORT") or ""
+        user = os.getenv(f"{prefix}_USER") or os.getenv("PROXY_USER")
+        pw   = os.getenv(f"{prefix}_PASS") or os.getenv("PROXY_PASS")
+        return host, port, user, pw
+
+    def _mk_sw_opts(use_proxy: bool, region: Optional[str]):
+        opts = {'request_storage': 'none', 'verify_ssl': False,
+                'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"]}
+        if not use_proxy:
+            return opts
+        host, port, user, pw = _resolve_proxy_env(region)
+        if host and port:
             if user and pw:
                 proxy_uri = f"http://{user}:{pw}@{host}:{port}"
-                opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
-                logging.info("Selenium-Wire proxy configurado: %s", proxy_uri)
             else:
-                logging.warning("Proxy configurado sem usuário ou senha. Verifique .env.")
+                proxy_uri = f"http://{host}:{port}"
+            opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
+            logging.info("Selenium-Wire proxy configurado (%s): %s", (region or "DEFAULT"), proxy_uri)
         else:
-            logging.info("Proxy desativado (idioma ou configuração inválida)")
+            logging.warning("want_proxy=True mas variáveis de proxy ausentes (%s). Seguiremos sem upstream.", region or "DEFAULT")
         return opts
 
-    def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto", headless: bool = False, *args, **kwargs):
+    def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto",
+                    headless: bool = False, *, want_proxy: Optional[bool] = None,
+                    region: Optional[str] = None, lang_tag: Optional[str] = None, **kwargs):
         load_dotenv()
-        proxy_host = os.getenv("PROXY_HOST") or ""
-        proxy_port = os.getenv("PROXY_PORT") or ""
-        proxy_user = os.getenv("PROXY_USER")
-        proxy_pass = os.getenv("PROXY_PASS")
-        use_proxy = _use_proxy_from_idioma(idioma)
-        logging.info(f"get_browser: idioma={idioma} | use_proxy={use_proxy}")
+        if want_proxy is None:
+            want_proxy = _want_proxy_default(idioma)
+        if region is None:
+            region = _region_default(idioma)
+        if lang_tag is None:
+            lang_tag = _lang_tag_default(idioma)
+
+        logging.info("get_browser (fallback): idioma=%s | want_proxy=%s | region=%s | lang_tag=%s",
+                     idioma, want_proxy, region or "-", lang_tag)
 
         if name == "chrome":
             if options is None:
                 options = ChromeOptions()
+            options.add_argument(f"--lang={lang_tag}")
             if headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--ignore-certificate-errors")
-            sw_opts = _mk_sw_opts(use_proxy, proxy_host, proxy_port, proxy_user, proxy_pass)
+            sw_opts = _mk_sw_opts(bool(want_proxy), region)
+            # se quisermos sem proxy, ainda usamos wire (sem proxy) para manter compat
             driver = wire_webdriver.Chrome(
                 service=ChromeService(ChromeDriverManager().install()),
                 options=options,
                 seleniumwire_options=sw_opts
             )
             try:
+                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
+                    "headers": {"Accept-Language": _accept_header_from_tag(lang_tag), "Upgrade-Insecure-Requests": "1"}
+                })
                 driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                     "source": "try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}"
                 })
@@ -107,7 +144,11 @@ except ImportError:
                 options = FirefoxOptions()
             if headless:
                 options.add_argument("-headless")
-            sw_opts = _mk_sw_opts(use_proxy, proxy_host, proxy_port, proxy_user, proxy_pass)
+            try:
+                options.set_preference("intl.accept_languages", _accept_header_from_tag(lang_tag))
+            except Exception:
+                pass
+            sw_opts = _mk_sw_opts(bool(want_proxy), region)
             return wire_webdriver.Firefox(
                 service=FirefoxService(GeckoDriverManager().install()),
                 options=options,
@@ -119,7 +160,8 @@ except ImportError:
                 options = EdgeOptions()
             if headless:
                 options.add_argument("--headless=new")
-            sw_opts = _mk_sw_opts(use_proxy, proxy_host, proxy_port, proxy_user, proxy_pass)
+            options.add_argument(f"--lang={lang_tag}")
+            sw_opts = _mk_sw_opts(bool(want_proxy), region)
             return wire_webdriver.Edge(
                 service=EdgeService(EdgeChromiumDriverManager().install()),
                 options=options,
@@ -149,21 +191,46 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 
 
 # --------------------------- helpers de proxy/idioma ---------------------------
+def _idioma_norm(idioma: Optional[str]) -> str:
+    s = (idioma or "").strip().lower()
+    if s.startswith("ar"): return "ar"
+    if s.startswith("pt"): return "pt"
+    return "en"
+
+
 def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
-    """Liga o proxy só para EUA/inglês (aliases)."""
-    if not idioma:
-        return False
-    s = idioma.strip().lower()
-    logging.info(f"_use_proxy_from_idioma: idioma={s}")
-    return s in ("en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english")
+    """
+    Liga o proxy para EN/EUA e também para árabe (Egito).
+    """
+    return _idioma_norm(idioma) in ("en", "ar")
+
+
+def _region_from_idioma(idioma: Optional[str]) -> Optional[str]:
+    """EG para árabe; None para demais (usa PROXY_* default)."""
+    return "EG" if _idioma_norm(idioma) == "ar" else None
+
+
+def _lang_tag_from_idioma(idioma: Optional[str]) -> str:
+    n = _idioma_norm(idioma)
+    if n == "pt": return "pt-BR"
+    if n == "ar": return "ar-EG"
+    return "en-US"
 
 
 def _is_seleniumwire_driver(driver) -> bool:
-    """Detecta driver do Selenium-Wire (para saber se tem proxy interceptando)."""
     try:
         return driver.__class__.__module__.startswith("seleniumwire")
     except Exception:
         return False
+
+
+def _accept_header_from_tag(tag: Optional[str]) -> str:
+    tag = (tag or "").strip() or "en-US"
+    if tag.lower().startswith("pt"):
+        return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tag.lower().startswith("ar"):
+        return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+    return "en-US,en;q=0.9"
 
 
 # --------------------------------- API ----------------------------------------
@@ -232,7 +299,10 @@ def upload_videos(
         logger.info("Fazendo upload de %d vídeos", len(videos))
 
     want_proxy = _use_proxy_from_idioma(idioma)
-    logger.info("upload_videos: idioma=%s | want_proxy=%s", idioma, want_proxy)
+    region = _region_from_idioma(idioma)
+    lang_tag = _lang_tag_from_idioma(idioma)
+    logger.info("upload_videos: idioma=%s | want_proxy=%s | region=%s | lang_tag=%s",
+                idioma, want_proxy, region or "-", lang_tag)
 
     # Se vier um browser_agent incompatível com a decisão de proxy, recria
     if browser_agent is not None:
@@ -265,8 +335,18 @@ def upload_videos(
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--ignore-certificate-errors")
 
-        # IMPORTANTE: não adicionar --proxy-server. Selenium-Wire injeta o proxy quando preciso.
-        driver = get_browser(browser, headless=headless, proxy=proxy, idioma=idioma, options=chrome_options, *args, **kwargs)
+        # IMPORTANTE: get_browser (do módulo browsers OU fallback) agora respeita want_proxy/region/lang_tag
+        driver = get_browser(
+            browser,
+            headless=headless,
+            proxy=proxy,
+            idioma=idioma,
+            options=chrome_options,
+            want_proxy=want_proxy,
+            region=region,
+            lang_tag=lang_tag,
+            *args, **kwargs
+        )
     else:
         logger.info("Usando agente de navegador definido pelo usuário")
         driver = browser_agent
@@ -285,18 +365,15 @@ def upload_videos(
 
             logger.info("Postando %s%s", bold(video.get("path", "")), f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
 
-            # Tipo de arquivo suportado
             if not _check_valid_path(path):
                 logger.warning("%s é inválido, pulando", path)
                 failed.append(video)
                 continue
 
-            # Agendamento válido (naive -> UTC; aware deve ser UTC)
             if schedule:
                 if schedule.tzinfo is None:
                     schedule = pytz.UTC.localize(schedule)
                 else:
-                    # exige estar em UTC (offset 0)
                     utc_offset = schedule.utcoffset()
                     if not (utc_offset and int(utc_offset.total_seconds()) == 0):
                         logger.warning("%s é inválido, o horário de agendamento deve ser ingênuo (será tratado como UTC) ou ciente de UTC (offset 0). Pulando.", schedule)
@@ -310,7 +387,12 @@ def upload_videos(
                     failed.append(video)
                     continue
 
-            complete_upload_form(driver, path, description, schedule, skip_split_window, product_id, num_retries, *args, **kwargs)
+            complete_upload_form(
+                driver, path, description, schedule, skip_split_window,
+                product_id, num_retries, headless=headless,
+                idioma=idioma, lang_tag=lang_tag,  # >>> usado para ajustar ?lang= na URL
+                *args, **kwargs
+            )
 
         except WebDriverException as e:
             logger.error("Falha ao fazer upload de %s devido a erro no WebDriver", path)
@@ -324,7 +406,6 @@ def upload_videos(
         if callable(on_complete):
             on_complete(video)
 
-    # Fecha o driver se fomos nós que criamos
     if we_created_driver:
         try:
             driver.quit()
@@ -344,12 +425,14 @@ def complete_upload_form(
     product_id: Optional[str] = None,
     num_retries: int = 1,
     headless: bool = False,
-    *args,
+    *,
+    idioma: Optional[str] = None,
+    lang_tag: Optional[str] = None,
     **kwargs
 ) -> None:
     """Realiza o upload de um vídeo."""
     logger.info(f"Navegando para a página de upload: {config['paths']['upload']}")
-    _go_to_upload(driver)
+    _go_to_upload(driver, lang_tag=lang_tag)
 
     upload_complete_event = threading.Event()
 
@@ -384,10 +467,24 @@ def complete_upload_form(
         pass
 
 
-def _go_to_upload(driver: WebDriver) -> None:
-    """Navega para a página de upload."""
-    if driver.current_url != config["paths"]["upload"]:
-        driver.get(config["paths"]["upload"])
+def _apply_lang_to_url(url: str, lang_tag: Optional[str]) -> str:
+    if not lang_tag:
+        return url
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["lang"] = [lang_tag]
+        new_q = urlencode(qs, doseq=True)
+        return urlunparse(parsed._replace(query=new_q))
+    except Exception:
+        return url
+
+
+def _go_to_upload(driver: WebDriver, *, lang_tag: Optional[str] = None) -> None:
+    """Navega para a página de upload (forçando ?lang=<lang_tag> se fornecido)."""
+    target = _apply_lang_to_url(config["paths"]["upload"], lang_tag)
+    if driver.current_url != target:
+        driver.get(target)
         logger.info(f"Navegou para: {driver.current_url}")
     else:
         _refresh_with_alert(driver)
@@ -398,7 +495,7 @@ def _go_to_upload(driver: WebDriver) -> None:
 
 
 def _change_to_upload_iframe(driver: WebDriver) -> None:
-    """Alterna para o iframe da página de upload."""
+    """Alterna para o iframe da página de upload (se existir)."""
     iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
     iframe = WebDriverWait(driver, config["explicit_wait"]).until(iframe_selector)
     driver.switch_to.frame(iframe)
@@ -477,7 +574,6 @@ def _set_description(driver: WebDriver, description: str) -> None:
 
             else:
                 desc.send_keys((word or "") + " ")
-
     except Exception as exception:
         logger.error("Falha ao definir descrição: %s", str(exception))
         _clear(desc)

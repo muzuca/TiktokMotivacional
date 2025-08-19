@@ -35,7 +35,6 @@ PRESETS = {
     "fullhd": {"w": 1080, "h": 1920, "br_v": "5000k", "br_a": "192k", "level": "4.0"},
 }
 
-# Mantido por compatibilidade; não usamos como teto duro
 DURACAO_MAXIMA_VIDEO = 20.0
 FPS_OUT = 30
 AUDIO_SR = 44100
@@ -79,17 +78,14 @@ BG_MIX_VOLUME      = _env_float("BG_MIX_VOLUME", 0.10)
 DEFAULT_TRANSITION = os.getenv("TRANSITION", "fade").strip().lower()
 VOICE_LOUDNORM     = _env_bool("VOICE_LOUDNORM", True)
 
-# Intensidades de movimento
 KENBURNS_ZOOM_MAX = _env_float("KENBURNS_ZOOM_MAX", 1.22)
 PAN_ZOOM          = _env_float("PAN_ZOOM", 1.18)
 
-# FPS interno do movimento (capado)
 _MOTION_FPS_ENV = _env_int("MOTION_FPS", 45)
 MOTION_FPS = max(24, min(90, _MOTION_FPS_ENV))
 if MOTION_FPS != _MOTION_FPS_ENV:
     logger.info("ℹ️ MOTION_FPS ajustado para %d (cap 24..90).", MOTION_FPS)
 
-# Look "orgânico"
 VIDEO_SAT          = _env_float("VIDEO_SAT", 1.00)
 VIDEO_CONTRAST     = _env_float("VIDEO_CONTRAST", 1.00)
 VIDEO_GAMMA        = _env_float("VIDEO_GAMMA", 1.00)
@@ -97,7 +93,6 @@ VIDEO_SHARP        = _env_float("VIDEO_SHARP", 0.00)
 VIDEO_GRAIN        = _env_int  ("VIDEO_GRAIN", 0)
 VIDEO_CHROMA_SHIFT = _env_int  ("VIDEO_CHROMA_SHIFT", 0)
 
-# Ducking
 DUCK_ENABLE     = _env_bool("DUCK_ENABLE", True)
 DUCK_THRESH     = _env_float("DUCK_THRESH", 0.05)
 DUCK_RATIO      = _env_float("DUCK_RATIO", 8.0)
@@ -122,15 +117,15 @@ META_LOCATION_ISO6709= os.getenv("META_LOCATION_ISO6709", "+37.7749-122.4194+000
 
 # >>> Respeitar TTS
 VIDEO_RESPECT_TTS = _env_bool("VIDEO_RESPECT_TTS", True)
-VIDEO_TAIL_PAD    = _env_float("VIDEO_TAIL_PAD", 0.40)   # margem após a fala
-VIDEO_MAX_S       = _env_float("VIDEO_MAX_S", 0.0)       # 0 = sem teto
-TPAD_EPS          = _env_float("TPAD_EPS", 0.25)         # segurança para arredondamentos
+VIDEO_TAIL_PAD    = _env_float("VIDEO_TAIL_PAD", 0.40)
+VIDEO_MAX_S       = _env_float("VIDEO_MAX_S", 0.0)
+TPAD_EPS          = _env_float("TPAD_EPS", 0.25)
 
-# --------- Fase 3: Árabe / ASS legendas ----------
+# --------- Árabe / ASS legendas ----------
 SUBS_USE_ASS_FOR_RTL   = _env_bool("SUBS_USE_ASS_FOR_RTL", True)
 ARABIC_FONT            = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
-SUBS_ASS_BASE_FONTSIZE = _env_int("SUBS_ASS_BASE_FONTSIZE", 36)
-META_SOFTWARE_FALLBACK = os.getenv("META_SOFTWARE_FALLBACK", "").strip()  # se vazio, não escreve
+SUBS_ASS_BASE_FONTSIZE = _env_int("SUBS_ASS_BASE_FONTSIZE", 36)  # ajuste no .env se quiser menor
+META_SOFTWARE_FALLBACK = os.getenv("META_SOFTWARE_FALLBACK", "").strip()
 
 # -------------------- Helpers --------------------
 def _ffmpeg_or_die() -> str:
@@ -197,14 +192,10 @@ def _ff_normpath(path: str) -> str:
         rel = path
     return rel.replace("\\", "/")
 
-# >>>>>>> ESCAPE SEGURO PARA FILTERGRAPH (Windows e Unix) <<<<<<<
+# ---- caminhos amigáveis para filtros (Windows/Unix) ----
 _IS_WIN = (os.name == "nt")
 
 def _ff_escape_filter_path(p: str) -> str:
-    """
-    Normaliza para '/', escapa o 'C:' -> 'C\\:' (Windows) e aspas simples.
-    Útil para valores dentro de filtros (drawtext/subtitles).
-    """
     s = _ff_normpath(p)
     if _IS_WIN and re.match(r"^[A-Za-z]:/", s):
         s = s[0] + r"\:" + s[2:]  # C:/... -> C\:/...
@@ -212,7 +203,6 @@ def _ff_escape_filter_path(p: str) -> str:
     return s
 
 def _ff_q(val: str) -> str:
-    """Coloca entre aspas simples para o parser do filtergraph."""
     return f"'{_ff_escape_filter_path(val)}'"
 
 def _uuid_suffix() -> str:
@@ -232,7 +222,6 @@ _AR_RANGES = r"\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF"
 
 def _tokenize_words(text: str) -> List[str]:
     text = _re.sub(r"[\r\n]+", " ", (text or "")).strip()
-    # Latin + extended + números + apóstrofos | blocos árabes
     tokens = _re.findall(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ'’\-]+|[" + _AR_RANGES + r"]+", text)
     return [t for t in tokens if t]
 
@@ -324,7 +313,6 @@ def _segmentos_via_whisper(audio_path: str, idioma: str) -> List[Tuple[float, fl
             chunk = words[i:i + take]
             ini, fim = chunk[0][0], chunk[-1][1]
             texto = " ".join([w[2] for w in chunk])
-            # não upper() para preservar script árabe
             if ini < cap and fim > 0:
                 ini2 = max(0.20, ini)
                 fim2 = min(cap - 0.05, fim)
@@ -417,23 +405,32 @@ def _build_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, flo
 def _ass_escape(s: str) -> str:
     return s.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", r"\N")
 
-def _segments_to_ass_file(H: int, segments: List[Tuple[float, float, str]], font_name: str, base_fs: int) -> str:
+def _segments_to_ass_file(W: int, H: int, segments: List[Tuple[float, float, str]], font_name: str, base_fs: int) -> str:
     """
-    Gera um arquivo .ass simples com estilo centrado no rodapé.
+    Gera um arquivo .ass para árabe:
+    - alinhado bottom-right (Alignment=3)
+    - margens inferiores/à direita proporcionais
+    - PlayResX/PlayResY setados (escala correta)
     """
-    fs = max(18, int(base_fs if base_fs > 0 else 36))
+    # fontsize: limite superior proporcional para não “gigantar”
+    fs = max(22, min(int(base_fs if base_fs > 0 else 34), int(H * 0.030)))
     margin_v = max(54, int(H * 0.115))
+    margin_r = max(28, int(W * 0.06))
+
     style = (
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_name},{fs},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
-        "0,0,0,0,100,100,0,0,1,2,0,2,20,20," + str(margin_v) + ",1\n"
+        "0,0,0,0,100,100,0,0,1,2,0,3,20," + str(margin_r) + "," + str(margin_v) + ",1\n"
     )
+
     hdr = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
+        "PlayResX: " + str(W) + "\n"
+        "PlayResY: " + str(H) + "\n"
         "WrapStyle: 2\n"
         "ScaledBorderAndShadow: yes\n"
         "YCbCr Matrix: TV.709\n"
@@ -603,6 +600,7 @@ def gerar_video(
 
         style_norm = _normalize_style(video_style)
 
+        # ====== Narração TTS ======
         voice_audio_path: Optional[str] = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
         dur_voz = _duracao_audio_segundos(voice_audio_path) if voice_audio_path else None
         logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz or 0.0)
@@ -619,24 +617,30 @@ def gerar_video(
             except Exception as e:
                 logger.warning("Falha ao mover/copiar TTS para %s: %s. Usando original.", AUDIO_TTS_DIR, e)
 
+        # ====== Trilha de fundo (respeitando região/idioma quando disponível) ======
         background_audio_path: Optional[str] = None
         try:
-            background_audio_path = obter_caminho_audio()
+            # assinatura mais nova (com região/idioma)
+            background_audio_path = obter_caminho_audio(content_mode=(content_mode or "motivacional"), idioma=lang_norm)
+        except TypeError:
+            try:
+                background_audio_path = obter_caminho_audio(content_mode=(content_mode or "motivacional"))
+            except TypeError:
+                background_audio_path = obter_caminho_audio()
         except Exception as e:
             logger.warning("Sem áudio de fundo válido: %s", e)
 
         has_voice = bool(voice_audio_path)
         has_bg = bool(background_audio_path)
 
-        # ====== LEGENDAS (ASS p/ árabe; drawtext p/ en/pt) ======
+        # ====== LEGENDAS ======
         segments: List[Tuple[float, float, str]] = []
         if legendas and has_voice:
             seg_whisper = _segmentos_via_whisper(voice_audio_path, lang_norm) if WHISPER_ENABLE else []
-            # Uppercase só para latinos
             segments = seg_whisper if seg_whisper else _segmentos_legenda_palavras(long_text, dur_voz or 12.0, uppercase=(lang_norm != "ar"))
             logger.info("📝 %d segmentos de legenda.", len(segments))
 
-        # --- duração alvo do vídeo (segue TTS) ---
+        # --- duração alvo do vídeo ---
         if has_voice and VIDEO_RESPECT_TTS and (dur_voz or 0) > 0:
             base_len = max(5.0, (dur_voz or 0) + VIDEO_TAIL_PAD)
             total_video = min(base_len, VIDEO_MAX_S) if (VIDEO_MAX_S and VIDEO_MAX_S > 0) else base_len
@@ -648,12 +652,10 @@ def gerar_video(
             else:
                 total_video = 12.0
 
-        # 1) calcula transição a partir de um per_slide aproximado
+        # transições
         per_slide_rough = total_video / n_slides
         trans = transition or DEFAULT_TRANSITION or "fade"
         trans_dur = max(0.50, min(0.90, per_slide_rough * 0.135)) if n_slides > 1 else 0.0
-
-        # 2) corrige per_slide para compensar o overlap do xfade:
         per_slide = (total_video + (n_slides - 1) * trans_dur) / n_slides
 
         logger.info("⏱️ Target: total=%.3fs | n=%d | per_slide=%.3fs | xfade=%.3fs | perda_overlap=%.3fs",
@@ -670,14 +672,14 @@ def gerar_video(
         if not staged_inputs:
             raise RuntimeError("Nenhuma imagem disponível para montar o vídeo.")
 
-        # -------- construir filter_complex --------
+        # -------- filter_complex --------
         parts: List[str] = []
 
-        # 1) Branch por slide
+        # 1) Slides
         for i in range(len(staged_inputs)):
             parts.append(_build_slide_branch(i, W, H, motion, per_slide))
 
-        # 2) Transições xfade
+        # 2) Xfade
         last_label = "[v0]"
         if len(staged_inputs) >= 2:
             offset = per_slide - trans_dur
@@ -693,7 +695,7 @@ def gerar_video(
         else:
             final_video_label = last_label
 
-        # 3) Look orgânico + normalização final + tpad+trim para garantir duração exata
+        # 3) Look + normalização + duração final
         look_ops = []
         if (VIDEO_SAT != 1.0) or (VIDEO_CONTRAST != 1.0) or (VIDEO_GAMMA != 1.0):
             look_ops.append(f"eq=saturation={VIDEO_SAT:.3f}:contrast={VIDEO_CONTRAST:.3f}:gamma={VIDEO_GAMMA:.3f}")
@@ -715,17 +717,18 @@ def gerar_video(
             f"trim=duration={total_video:.3f},setpts=PTS-STARTPTS[vf]"
         )
 
-        # 4) Legendas: ASS para árabe (se possível), drawtext para en/pt
+        # 4) Legendas
         use_ass = (legendas and segments and _lang_is_rtl(lang_norm) and SUBS_USE_ASS_FOR_RTL)
         if use_ass:
             try:
                 font_name = os.path.splitext(os.path.basename(ARABIC_FONT))[0] or "NotoNaskhArabic"
-                ass_path = _segments_to_ass_file(H, segments, font_name, SUBS_ASS_BASE_FONTSIZE)
+                ass_path = _segments_to_ass_file(W, H, segments, font_name, SUBS_ASS_BASE_FONTSIZE)
+                force_style = f"Alignment=3,MarginR={max(28,int(W*0.06))},MarginV={max(54,int(H*0.115))}"
                 parts.append(
-                    f"[vf]subtitles=filename={_ff_q(ass_path)}:fontsdir={_ff_q(FONTS_DIR)}[vout]"
+                    f"[vf]subtitles=filename={_ff_q(ass_path)}:fontsdir={_ff_q(FONTS_DIR)}:force_style={_ff_q(force_style)}[vout]"
                 )
             except Exception as e:
-                logger.warning("Falha no ASS/RTL (%s). Voltando ao drawtext simples sem uppercase.", e)
+                logger.warning("Falha no ASS/RTL (%s). Voltando ao drawtext simples.", e)
                 font_for_sub = _pick_drawtext_font(video_style)
                 draw_chain = _build_drawtext_chain(H, style_norm, segments, font_for_sub)
                 parts.append(f"[vf]{draw_chain},format=yuv420p[vout]")
@@ -739,7 +742,7 @@ def gerar_video(
             else:
                 parts.append(f"[vf]format=yuv420p[vout]")
 
-        # 5) Áudio — segue a VOZ e casa com o total do vídeo
+        # 5) Áudio
         fade_in_dur = 0.30
         fade_out_dur = 0.60
         fade_out_start = max(0.0, total_video - fade_out_dur)
@@ -811,7 +814,7 @@ def gerar_video(
 
         filter_complex = ";".join(parts)
 
-        # salva para debug e usa como script (evita escapagem do Windows)
+        # salva script (facilita quoting no Windows)
         fc_path = os.path.join(CACHE_DIR, "last_filter.txt")
         with open(fc_path, "w", encoding="utf-8") as f:
             f.write(filter_complex.rstrip() + "\n")
@@ -820,17 +823,15 @@ def gerar_video(
         # --------- comando ffmpeg ----------
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-stats"]
 
-        # imagens (cada uma com -loop 1)
         for sp in staged_inputs:
             cmd += ["-loop", "1", "-i", sp]
 
-        # entradas de áudio
         if has_voice and voice_audio_path:
             cmd += ["-i", voice_audio_path]
         if has_bg and background_audio_path:
             cmd += ["-i", background_audio_path]
 
-        # ---------- Metadados 100% em inglês ----------
+        # Metadados (sempre inglês)
         if (content_mode or "").lower() == "tarot":
             default_tags = "tarot, fortune teller, reading, spirituality"
             genre = "Spiritual"
@@ -865,7 +866,6 @@ def gerar_video(
                 "com.apple.quicktime.location.ISO6709": META_LOCATION_ISO6709,
             })
         else:
-            # NADA de "Gerador de IA". Se estiver vazio, não adiciona a chave.
             if META_SOFTWARE_FALLBACK:
                 metadata["software"] = META_SOFTWARE_FALLBACK
 

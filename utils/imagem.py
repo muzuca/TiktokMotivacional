@@ -207,7 +207,6 @@ def _find_first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 def _system_font_candidates(names: List[str]) -> List[str]:
-    # caminhos comuns (Linux, Mac, Windows)
     base_candidates = []
     for n in names:
         base_candidates += [
@@ -219,7 +218,6 @@ def _system_font_candidates(names: List[str]) -> List[str]:
             f"/System/Library/Fonts/Supplemental/{n}",
             f"C:\\Windows\\Fonts\\{n}",
         ]
-    # alguns nomes reais específicos
     base_candidates += [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -228,7 +226,6 @@ def _system_font_candidates(names: List[str]) -> List[str]:
         "C:\\Windows\\Fonts\\arialuni.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
     ]
-    # absolutiza
     return [os.path.abspath(p) for p in base_candidates]
 
 def _abs_font_path(fname: str) -> str:
@@ -238,10 +235,8 @@ def _load_font(fname: str, size: int) -> ImageFont.FreeTypeFont:
     key = (fname, size)
     if key in _FONT_CACHE:
         return _FONT_CACHE[key]
-
     primary = _abs_font_path(fname)
     candidates = [primary] + _system_font_candidates([fname])
-
     chosen = _find_first_existing(candidates)
     try:
         if not chosen:
@@ -318,7 +313,7 @@ def _draw_line_colored(
     style: Optional[str] = None,
     stroke_w: Optional[int] = None,
 ):
-    """Desenha token a token; highlight só nas palavras marcadas."""
+    """Desenha token a token; highlight só nas palavras marcadas (modo LTR)."""
     if style is None:
         style = IMAGE_TEXT_OUTLINE_STYLE
     if stroke_w is None:
@@ -348,6 +343,43 @@ def _draw_line_colored(
 
         w = draw.textbbox((0,0), raw + (" " if i < len(tokens)-1 else ""), font=font)[2]
         cur_x += w
+
+def _draw_line_simple(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    line_text: str,
+    font: ImageFont.FreeTypeFont,
+    *,
+    rtl: bool = False,
+    fill="white",
+    style: Optional[str] = None,
+    stroke_w: int = 0,
+    right_margin: Optional[int] = None,
+    canvas_w: Optional[int] = None,
+):
+    """
+    Desenha a linha inteira (sem highlight token a token).
+    Se rtl=True, posiciona x = W - right_margin - text_width.
+    """
+    if style is None:
+        style = IMAGE_TEXT_OUTLINE_STYLE
+    if stroke_w is None:
+        stroke_w = 0
+
+    bb = draw.textbbox((0,0), line_text, font=font)
+    tw = bb[2]-bb[0]
+    if rtl and right_margin is not None and canvas_w is not None:
+        x = max(0, int(canvas_w - right_margin - tw))
+
+    if style == "stroke" and stroke_w > 0:
+        _draw_text_with_stroke(draw, (x, y), line_text, font, fill, "black", stroke_w)
+    elif style == "shadow":
+        sx, sy = IMAGE_SHADOW_OFFSET
+        draw.text((x + sx, y + sy), line_text, font=font, fill=(0,0,0,IMAGE_SHADOW_ALPHA))
+        draw.text((x, y), line_text, font=font, fill=fill)
+    else:
+        draw.text((x, y), line_text, font=font, fill=fill)
 
 # -------------------- Efeitos de fundo --------------------
 def _darken_and_vignette(img: Image.Image, base_dark_alpha: int, vig: float, softness: float, center_protect: float) -> Image.Image:
@@ -441,11 +473,6 @@ _PUNCH_WORDS = {
 }
 
 def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
-    """
-    Remove **marcas** e retorna:
-      clean: texto sem os **asteriscos**
-      words: lista de PALAVRAS destacadas (sem pontuação, minúsculas)
-    """
     segs = re.findall(r"\*\*(.+?)\*\*", s, flags=re.S)
     clean = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     words: List[str] = []
@@ -570,35 +597,50 @@ def _render_modern_block(img: Image.Image, frase: str, *, idioma: Optional[str] 
     draw = ImageDraw.Draw(img)
 
     intro, punch, hl_words = _split_for_emphasis(frase)
-    if IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar":
+    is_ar = (_idioma_norm(idioma) == "ar")
+    if IMAGE_TEXT_UPPER and not is_ar:
         intro = intro.upper()
         punch = punch.upper()
 
     base_scale = (W / 1080.0) * IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MODERN
-    left  = int(W * 0.08)
-    maxw  = int(W * 0.84)
+    left_margin  = int(W * 0.08)
+    right_margin = int(W * 0.08)
+    maxw  = int(W - left_margin - right_margin)
     y     = int(H * 0.14)
 
+    # Intro (menor)
     if intro:
         f_small, lines1 = _best_font_and_wrap(
             draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False),
             maxw, int(38*base_scale), int(70*base_scale), max_lines=2
         )
         for ln in lines1:
-            _draw_line_colored(draw, left, y, ln, f_small, set(), fill="white", hl_fill=IMAGE_HL_COLOR, style=None)
+            if is_ar:
+                _draw_line_simple(draw, 0, y, ln, f_small, rtl=True, fill="white",
+                                  style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(1, int(f_small.size*0.05)) if IMAGE_HL_STROKE else 0,
+                                  right_margin=right_margin, canvas_w=W)
+            else:
+                _draw_line_colored(draw, left_margin, y, ln, f_small, set(),
+                                   fill="white", hl_fill=IMAGE_HL_COLOR, style=None)
             y += int(f_small.size * 1.16)
         y += int(H * 0.018)
 
+    # Principal (bold)
     f_main, lines2 = _best_font_and_wrap(
         draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, bold=True),
         maxw, int(68*base_scale), int(104*base_scale), max_lines=4
     )
     for ln in lines2:
-        _draw_line_colored(
-            draw, left, y, ln, f_main, set(hl_words),
-            fill="white", hl_fill=IMAGE_HL_COLOR, style=None,
-            stroke_w=max(2, int(f_main.size * 0.055)) if IMAGE_HL_STROKE else 0
-        )
+        if is_ar:
+            _draw_line_simple(draw, 0, y, ln, f_main, rtl=True, fill="white",
+                              style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(2, int(f_main.size*0.055)) if IMAGE_HL_STROKE else 0,
+                              right_margin=right_margin, canvas_w=W)
+        else:
+            _draw_line_colored(
+                draw, left_margin, y, ln, f_main, set(hl_words),
+                fill="white", hl_fill=IMAGE_HL_COLOR, style=None,
+                stroke_w=max(2, int(f_main.size * 0.055)) if IMAGE_HL_STROKE else 0
+            )
         y += int(f_main.size * 1.10)
 
     return img.convert("RGB")
@@ -611,8 +653,11 @@ def _render_classic_serif(img: Image.Image, frase: str, *, idioma: Optional[str]
     W, H = img.size
     draw = ImageDraw.Draw(img)
 
-    text = clean.upper() if (IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar") else clean
-    maxw = int(W * 0.76)
+    is_ar = (_idioma_norm(idioma) == "ar")
+    text = clean.upper() if (IMAGE_TEXT_UPPER and not is_ar) else clean
+    left_margin  = int(W * 0.12)
+    right_margin = int(W * 0.10)
+    maxw = int(W - left_margin - right_margin)
 
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
     f_serif, lines = _best_font_and_wrap(
@@ -621,18 +666,23 @@ def _render_classic_serif(img: Image.Image, frase: str, *, idioma: Optional[str]
     )
 
     y = int(H*0.20)
-    left = int(W*0.12)
-    hl_for_draw = hl_set if (hl_set or not IMAGE_EMPHASIS_ONLY_MARKUP) else set()
-
     for ln in lines:
-        _draw_line_colored(
-            draw, left, y, ln, f_serif,
-            highlight_set=hl_for_draw,
-            fill="white",
-            hl_fill=IMAGE_HL_COLOR,
-            style=None,
-            stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0
-        )
+        if is_ar:
+            _draw_line_simple(
+                draw, 0, y, ln, f_serif, rtl=True, fill="white",
+                style=IMAGE_TEXT_OUTLINE_STYLE,
+                stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0,
+                right_margin=right_margin, canvas_w=W
+            )
+        else:
+            _draw_line_colored(
+                draw, left_margin, y, ln, f_serif,
+                highlight_set=(hl_set if (hl_set or not IMAGE_EMPHASIS_ONLY_MARKUP) else set()),
+                fill="white",
+                hl_fill=IMAGE_HL_COLOR,
+                style=None,
+                stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0
+            )
         y += int(f_serif.size * 1.18)
     return img.convert("RGB")
 
@@ -641,13 +691,14 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
     W, H = img.size
     draw = ImageDraw.Draw(img)
 
+    is_ar = (_idioma_norm(idioma) == "ar")
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MINIMAL
     big_name   = _font_for_lang("BebasNeue-Regular.ttf", idioma, bold=True)
     small_name = _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False)
 
     clean, _ = _parse_highlights_from_markdown(frase)
     two = quebrar_em_duas_linhas(clean)
-    if IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar":
+    if IMAGE_TEXT_UPPER and not is_ar:
         two = two.upper()
     parts = two.split("\n")
     l1 = parts[0].strip()
@@ -656,8 +707,16 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
     small = _load_font(small_name, max(36, int(W*0.039*scls)))
     big   = _load_font(big_name,   max(90, int(W*0.102*scls)))
 
+    right_margin = int(W*0.08)
+    left_margin  = int(W*0.08)
+
+    # Linha pequena (l1)
     b1 = draw.textbbox((0,0), l1, font=small); tw1 = b1[2]-b1[0]; th1 = b1[3]-b1[1]
-    x1 = (W - tw1)//2; y = int(H*0.20)
+    if is_ar:
+        x1 = max(0, W - right_margin - tw1)
+    else:
+        x1 = (W - tw1)//2
+    y = int(H*0.20)
 
     if IMAGE_TEXT_OUTLINE_STYLE == "stroke":
         _draw_text_with_stroke(draw, (x1, y), l1, small, "white", "black", max(1, int(small.size*0.05)))
@@ -670,7 +729,8 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
 
     y += th1 + int(H*0.02)
 
-    maxw = int(W*0.90)
+    # Quebra da big (l2) respeitando margem/RTL
+    maxw = int(W - left_margin - right_margin)
     words = l2.split(); cur=""; lines=[]
     for w in words:
         t=(cur+" "+w).strip()
@@ -683,7 +743,11 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
 
     for ln in lines:
         bb=draw.textbbox((0,0), ln, font=big); tw=bb[2]-bb[0]
-        x = (W - tw)//2
+        if is_ar:
+            x = max(0, W - right_margin - tw)
+        else:
+            x = (W - tw)//2
+
         if IMAGE_TEXT_OUTLINE_STYLE == "stroke":
             _draw_text_with_stroke(draw, (x, y), ln, big, "white", "black", max(2, int(big.size*0.05)))
         elif IMAGE_TEXT_OUTLINE_STYLE == "shadow":
