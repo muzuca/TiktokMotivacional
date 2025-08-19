@@ -4,6 +4,8 @@ __pycache__/
 cookies.txt
 cookies_us.txt
 cookies_br.txt
+cookies_eg.txt
+cookies_*.txt
 *.TEMP_MPY_wvf_snd
 audios/
 videos/
