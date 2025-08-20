@@ -316,9 +316,17 @@ def _wav_write(filename: str, pcm_bytes: bytes, channels=1, rate=24000, sample_w
         wf.setframerate(rate)
         wf.writeframes(pcm_bytes)
 
-def _tts_outname(lang: str, ext: str = "wav") -> str:
+def _tts_outname(lang_key: str, ext: str = "wav") -> str:
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    return os.path.join(TTS_DIR, f"tts_{lang}_{ts}.{ext}")
+    return os.path.join(TTS_DIR, f"tts_{lang_key}_{ts}.{ext}")
+
+def _lang_key_from(idioma: Optional[str]) -> str:
+    s = (idioma or "").strip().lower()
+    if s.startswith("pt"):
+        return "pt"
+    if s.startswith("ar"):
+        return "ar"
+    return "en"  # default EUA
 
 def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
                               voice_name: Optional[str] = None,
@@ -335,9 +343,21 @@ def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
         return None
 
     model = model or os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
-    default_voice_map = {"en": "Kore", "pt": "Sadaltager"}
-    lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
-    voice_name = voice_name or os.getenv("GEMINI_TTS_VOICE") or default_voice_map.get(lang, "Kore")
+
+    # ======= MAPA DE VOZES (pedido do cliente) =======
+    # EUA/en -> Sadachbia | PT -> Sadaltager | EG/ar -> Kore
+    lang_key = _lang_key_from(idioma)
+    default_voice_map = {
+        "en": "Sadachbia",
+        "pt": "Sadaltager",
+        "ar": "Kore",
+    }
+    # Permite overrides por env, se quiser trocar sem mexer no código
+    env_override = (
+        os.getenv(f"GEMINI_TTS_VOICE_{lang_key.upper()}") or
+        os.getenv("GEMINI_TTS_VOICE")
+    )
+    voice_name = voice_name or env_override or default_voice_map[lang_key]
 
     client = genai_new.Client(api_key=api_key)
     # aplica proxy no ambiente se necessário (para libs que não usam requests)
@@ -360,13 +380,14 @@ def gerar_narracao_tts_gemini(texto: str, idioma: str = "en",
             )
             data = resp.candidates[0].content.parts[0].inline_data.data
             pcm_bytes = base64.b64decode(data) if isinstance(data, str) else data
-            out_path = _tts_outname(lang, "wav")
+            out_path = _tts_outname(lang_key, "wav")
             _wav_write(out_path, pcm_bytes, channels=1, rate=24000, sample_width=2)
+            logger.info("🎧 TTS (Gemini): idioma=%s | voice=%s | arquivo=%s", lang_key, voice_name, out_path)
             return out_path
 
         path = _retry(tentar, tries=max_retries, on_error_msg="Falha no TTS Gemini")
         if path:
-            logger.info("🎧 TTS (Gemini) gerado: %s", path)
+            logger.info("🎧 TTS (Gemini) gerado com sucesso.")
         return path
     finally:
         _restore_env_proxy(old_env)
@@ -393,8 +414,8 @@ def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en",
         "en": os.getenv("ELEVENLABS_VOICE_EN", "y2Y5MeVPm6ZQXK64WUui"),
         "pt": os.getenv("ELEVENLABS_VOICE_PT", "rnJZLKxtlBZt77uIED10"),
     }
-    lang = "pt" if (idioma or "").lower().startswith("pt") else "en"
-    voice_id = voice_ids.get(lang, voice_ids["en"])
+    lang_key = "pt" if (idioma or "").lower().startswith("pt") else "en"
+    voice_id = voice_ids.get(lang_key, voice_ids["en"])
 
     # aplica proxy no ambiente se necessário (lib externa)
     region = _pick_proxy_region(None, idioma)
@@ -405,18 +426,19 @@ def gerar_narracao_tts_elevenlabs(texto: str, idioma: str = "en",
 
         def tentar() -> str:
             stream = client.text_to_speech.stream(text=texto, voice_id=voice_id, model_id="eleven_multilingual_v2")
-            out_path = _tts_outname(lang, "mp3")
+            out_path = _tts_outname(lang_key, "mp3")
             with open(out_path, "wb") as f:
                 for chunk in stream:
                     if isinstance(chunk, bytes) and chunk:
                         f.write(chunk)
             if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
                 raise RuntimeError("Arquivo MP3 inválido/pequeno.")
+            logger.info("🎧 TTS (ElevenLabs): idioma=%s | voice_id=%s | arquivo=%s", lang_key, voice_id, out_path)
             return out_path
 
         path = _retry(tentar, tries=max_retries, on_error_msg="Erro ElevenLabs")
         if path:
-            logger.info("🎧 TTS (ElevenLabs) gerado: %s", path)
+            logger.info("🎧 TTS (ElevenLabs) gerado com sucesso.")
         return path
     finally:
         _restore_env_proxy(old_env)
