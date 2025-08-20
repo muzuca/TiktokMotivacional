@@ -474,10 +474,14 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
     except Exception as e:
         logger.warning("Falha na limpeza pós-post: %s", e)
 
-
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
+    """
+    Dispara a rotina a cada X horas usando *relógio real* (robusto a sleep/hibernação).
+    Mantém a cadência com base no horário de INÍCIO do ciclo anterior.
+    """
     logger.info("⏱️ Modo automático: a cada %.2f horas (Ctrl+C para parar).", cada_horas)
     intervalo = float(cada_horas) * 3600.0
+
     try:
         while True:
             inicio = datetime.now()
@@ -485,27 +489,30 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
 
             ok = _executar_com_timeout((modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count))
 
+            # Próximo alvo fixo a partir do INÍCIO do ciclo
             proxima = inicio + timedelta(seconds=intervalo)
-            restante = (proxima - datetime.now()).total_seconds()
-            if restante < 0:
-                restante = 60.0
 
+            # Log imediato já com base no relógio
+            rem_now = max(0.0, (proxima - datetime.now()).total_seconds())
             logger.info("✅ Execução %s. ⏳ Próxima em ~%.0f min.",
-                        "ok" if ok else "com falha", restante / 60)
+                        "ok" if ok else "com falha", rem_now / 60)
 
-            slept = 0.0
-            hb_elapsed = 0.0
-            while slept < restante:
-                step = min(30.0, restante - slept)
-                time.sleep(step)
-                slept += step
-                hb_elapsed += step
+            # Espera até a hora do próximo ciclo, recalculando sempre pelo relógio
+            last_hb_ts = time.time()
+            while True:
+                now = datetime.now()
+                rem = (proxima - now).total_seconds()
 
-                if HEARTBEAT_SECS > 0.0 and hb_elapsed >= HEARTBEAT_SECS:
-                    rem = max(0.0, (proxima - datetime.now()).total_seconds())
+                if rem <= 0:
+                    break  # chegou a hora do próximo ciclo
+
+                step = min(30.0, rem)
+                time.sleep(max(0.1, step))
+
+                if HEARTBEAT_SECS > 0.0 and (time.time() - last_hb_ts) >= HEARTBEAT_SECS:
                     logger.info("⏳ Em execução. Faltam ~%.0f min para o próximo ciclo (alvo: %s).",
-                                rem / 60, proxima.strftime("%d/%m %H:%M:%S"))
-                    hb_elapsed = 0.0
+                                max(0.0, rem) / 60, proxima.strftime("%d/%m %H:%M:%S"))
+                    last_hb_ts = time.time()
     except KeyboardInterrupt:
         logger.info("🛑 Automático interrompido.")
 

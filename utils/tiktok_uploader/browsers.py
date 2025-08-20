@@ -38,12 +38,14 @@ def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
 
 
 def _compute_region_from_idioma(idioma: Optional[str]) -> Optional[str]:
-    """Mapeia idioma -> região do proxy."""
+    """Mapeia idioma -> região do proxy/perfil."""
     lang = _idioma_norm(idioma)
     if lang == "ar":
         return "EG"
     if lang == "en":
         return "US"
+    if lang == "pt":
+        return "BR"
     return None
 
 
@@ -162,6 +164,42 @@ def _mk_seleniumwire_options(
             logging.warning("⚠️ want_proxy=True mas PROXY vars ausentes para %s. Caindo para conexão direta.", key)
     return opts
 
+# ---------- cache/perfil por região ----------
+def _norm_region(region: Optional[str]) -> str:
+    r = (region or "").strip().upper()
+    if r in {"US", "EG", "BR"}:
+        return r
+    return "DEFAULT"
+
+def _profile_roots(region: Optional[str]) -> Tuple[str, str]:
+    """
+    Diretórios por região:
+      - base de perfis: CHROME_PROFILE_BASE (default: chrome_profiles)
+      - base de cache:  CHROME_DISK_CACHE_BASE (default: chrome_cache)
+    Gera: <base>/<REGIÃO> (ex.: chrome_profiles/US, chrome_cache/EG)
+    """
+    reg = _norm_region(region)
+    base_profile = os.getenv("CHROME_PROFILE_BASE", "chrome_profiles")
+    base_cache   = os.getenv("CHROME_DISK_CACHE_BASE", "chrome_cache")
+    user_data_dir  = os.path.join(base_profile, reg)
+    disk_cache_dir = os.path.join(base_cache, reg)
+    os.makedirs(user_data_dir, exist_ok=True)
+    os.makedirs(disk_cache_dir, exist_ok=True)
+    return user_data_dir, disk_cache_dir
+
+def _unlock_profile(user_data_dir: str) -> None:
+    """Remove locks residuais quando o Chrome é encerrado à força."""
+    try:
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "SingletonTabs"):
+            p = os.path.join(user_data_dir, name)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 
 # -------------------------------------------------------------------
 # API principal
@@ -182,8 +220,9 @@ def get_browser(
     Cria um WebDriver:
     - Se want_proxy=True => Selenium-Wire + proxy upstream (PROXY_* ou PROXY_<REG>_*).
     - Se want_proxy=False => Selenium "puro".
-    - region pode ser 'US' ou 'EG' (lerá PROXY_US_* / PROXY_EG_*). Se None, cai para PROXY_*.
+    - region pode ser 'US', 'EG' ou 'BR' (lê/perfila por região). Se None, usa heurística por idioma.
     - Define Accept-Language/--lang segundo lang_tag (ou deduz de 'idioma').
+    - Chrome/Edge: perfil e cache persistentes por região.
     """
     _silenciar_ruido()
 
@@ -213,6 +252,17 @@ def get_browser(
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument(f"--lang={lang_tag}")
+        # ===== perfil/cache por região =====
+        user_data_dir, disk_cache_dir = _profile_roots(region)
+        _unlock_profile(user_data_dir)
+        options.add_argument(f"--user-data-dir={os.path.abspath(user_data_dir)}")
+        options.add_argument(f"--disk-cache-dir={os.path.abspath(disk_cache_dir)}")
+        cache_size = os.getenv("CHROME_DISK_CACHE_SIZE", "").strip()
+        if cache_size.isdigit():
+            options.add_argument(f"--disk-cache-size={cache_size}")
+        else:
+            options.add_argument("--disk-cache-size=1073741824")  # ~1GiB
+
         if headless:
             options.add_argument("--headless=new")
             options.add_argument("--ignore-certificate-errors")
@@ -245,6 +295,9 @@ def get_browser(
             })
         except Exception:
             pass
+
+        logging.info("🗂️ Perfil Chrome: %s | Cache: %s | Região: %s | Headless: %s",
+                     os.path.abspath(user_data_dir), os.path.abspath(disk_cache_dir), _norm_region(region), headless)
         return driver
 
     # ---------------- FIREFOX ----------------
@@ -282,6 +335,17 @@ def get_browser(
         if options is None:
             options = EdgeOptions()
         options.add_argument(f"--lang={lang_tag}")
+        # ===== perfil/cache por região (Edge é Chromium) =====
+        user_data_dir, disk_cache_dir = _profile_roots(region)
+        _unlock_profile(user_data_dir)
+        options.add_argument(f"--user-data-dir={os.path.abspath(user_data_dir)}")
+        options.add_argument(f"--disk-cache-dir={os.path.abspath(disk_cache_dir)}")
+        cache_size = os.getenv("CHROME_DISK_CACHE_SIZE", "").strip()
+        if cache_size.isdigit():
+            options.add_argument(f"--disk-cache-size={cache_size}")
+        else:
+            options.add_argument("--disk-cache-size=1073741824")
+
         if headless:
             options.add_argument("--headless=new")
             options.add_argument("--ignore-certificate-errors")
@@ -314,6 +378,9 @@ def get_browser(
             })
         except Exception:
             pass
+
+        logging.info("🗂️ Perfil Edge: %s | Cache: %s | Região: %s | Headless: %s",
+                     os.path.abspath(user_data_dir), os.path.abspath(disk_cache_dir), _norm_region(region), headless)
         return driver
 
     else:

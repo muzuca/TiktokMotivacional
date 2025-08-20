@@ -15,6 +15,7 @@ import time
 import pytz
 import datetime
 import requests
+import re
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from typing import Any, Callable, Literal, Optional, List, Dict
@@ -244,6 +245,12 @@ def _float_env(name: str, default: float) -> float:
     except Exception:
         return default
 
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
 IMPLICIT_WAIT     = _int_env("IMPLICIT_WAIT_SEC",  config.get("implicit_wait", 5))
 EXPLICIT_WAIT     = _int_env("EXPLICIT_WAIT_SEC",  config.get("explicit_wait", 30))
 UPLOADING_WAIT    = _int_env("UPLOADING_WAIT_SEC", config.get("uploading_wait", 240))  # ↑ tolerante
@@ -257,6 +264,10 @@ NAV_RETRY_BACKOFF = _float_env("UPLOAD_RETRY_BACKOFF_SEC", 3.0)
 POST_MIN_GRACE_SEC           = _int_env("POST_MIN_GRACE_SEC", 20)  # mínimo desde o envio do arquivo
 POST_AFTER_ENABLED_EXTRA_SEC = _int_env("POST_AFTER_ENABLED_EXTRA_SEC", 2)   # extra após habilitar
 OVERLAYS_SETTLE_SEC          = _int_env("OVERLAYS_SETTLE_SEC", 3)   # janela p/ modais sumirem
+
+# ——— Confirmação na tela de Publicações ———
+PUBLICATIONS_WAIT_SEC        = _int_env("PUBLICATIONS_WAIT_SEC", 120)
+VERIFY_POST_IN_PUBLICATIONS  = _bool_env("VERIFY_POST_IN_PUBLICATIONS", True)
 
 # --------------------------- helpers de proxy/idioma ---------------------------
 def _idioma_norm(idioma: Optional[str]) -> str:
@@ -293,6 +304,154 @@ def _accept_header_from_tag(tag: Optional[str]) -> str:
     if tag.lower().startswith("ar"):
         return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
     return "en-US,en;q=0.9"
+
+# ============= Seletor/rotinas: confirmação na tela de Publicações =============
+# Marcadores independentes de idioma, observados no DOM do Studio
+PUB_ROW_CONTAINER_XPATH = "//div[@data-tt='components_PostInfoCell_Container']"
+PUB_ROW_LINK_XPATH      = "//a[@data-tt='components_PostInfoCell_a']"
+
+PUBLICACOES_SEARCH_XPATHES = [
+    # placeholder contendo "descri" cobre PT/ES/FR/EN (descrição / descripción / description / description)
+    "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'descri')]",
+    # algumas builds usam um SearchBar dedicado
+    "//div[contains(@class,'Search') or contains(@data-tt,'SearchBar')]//input",
+    # fallback: primeiro input visível logo abaixo do topo da lista
+    "(//div[.//text()[contains(.,'Views') or contains(.,'Visualiza') or contains(.,'Commentaires') or contains(.,'Kommentare') or contains(.,'تعليقات')]]//input)[1]",
+]
+
+def _xpath_literal(s: str) -> str:
+    """Escapa string p/ uso em XPath contains()."""
+    if "'" not in s:
+        return f"'{s}'"
+    if '"' not in s:
+        return f'"{s}"'
+    parts = []
+    for p in s.split("'"):
+        parts.append(f"'{p}'")
+        parts.append('"\'"')  # insere aspas simples
+    parts = parts[:-1]
+    return "concat(" + ",".join(parts) + ")"
+
+def _make_desc_query_snippet(description: str) -> str:
+    """
+    Trecho robusto da descrição para busca/contains:
+    - prioriza o primeiro #hashtag (estável e curto)
+    - senão, usa até 30 chars da descrição normalizada
+    """
+    description = (description or "").strip()
+    m = re.search(r"#\S+", description)
+    if m:
+        return m.group(0)
+    snippet = re.sub(r"\s+", " ", description)
+    return snippet[:30]
+
+def _find_publications_search_input(driver) -> Optional[Any]:
+    for xp in PUBLICACOES_SEARCH_XPATHES:
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            if el and el.is_enabled():
+                return el
+        except Exception:
+            pass
+    return None
+
+def _wait_publications_page(driver: WebDriver, timeout: int = 90) -> None:
+    """Espera a tela de Publicações carregar (lista ou barra de busca visível)."""
+    def _ready(d: WebDriver):
+        try:
+            # sair de qualquer iframe remanescente
+            d.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            if d.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH):
+                return True
+        except Exception:
+            pass
+        try:
+            return _find_publications_search_input(d) is not None
+        except Exception:
+            return False
+    WebDriverWait(driver, timeout).until(_ready)
+
+def _maybe_filter_publications_by_query(driver: WebDriver, query: str) -> None:
+    """Se houver campo de busca, aplica o filtro por 'query'."""
+    try:
+        search = _find_publications_search_input(driver)
+        if not search:
+            return
+        search.click()
+        try:
+            search.clear()
+        except Exception:
+            pass
+        search.send_keys(query)
+        search.send_keys(Keys.RETURN)
+        time.sleep(0.8)
+    except Exception:
+        pass
+
+def _confirm_post_in_publications(driver: WebDriver, description: str, timeout: int) -> bool:
+    """
+    Confirma que o post apareceu na lista de Publicações.
+    Retorna True se encontrar uma linha com a descrição (ou trecho) visível.
+    """
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    _wait_publications_page(driver, timeout=min(60, timeout))
+
+    query = _make_desc_query_snippet(description).strip()
+    if query:
+        _maybe_filter_publications_by_query(driver, query)
+
+    deadline = time.time() + max(10, timeout)
+    while time.time() < deadline:
+        try:
+            # tenta match direto no link de descrição (mais preciso)
+            if query:
+                qlit = _xpath_literal(query)
+                candidates = driver.find_elements(
+                    By.XPATH,
+                    f"{PUB_ROW_CONTAINER_XPATH}{PUB_ROW_LINK_XPATH.replace('//','//')}"
+                    f"[contains(normalize-space(.), {qlit})]"
+                )
+                if candidates:
+                    logger.info("✅ Post localizado na lista por trecho da descrição: %s", query)
+                    return True
+
+            # fallback: qualquer âncora/texto dentro do container que contenha o trecho
+            if query:
+                qlit = _xpath_literal(query)
+                containers = driver.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH)
+                for c in containers:
+                    try:
+                        # procura âncora/título interno
+                        a = c.find_elements(By.XPATH, f".{PUB_ROW_LINK_XPATH[1:]}")
+                        if a:
+                            if query and query in (a[0].text or ""):
+                                logger.info("✅ Post localizado (fallback) por âncora contendo o trecho.")
+                                return True
+                        if c.text and query in c.text:
+                            logger.info("✅ Post localizado (fallback) por texto do container.")
+                            return True
+                    except Exception:
+                        pass
+
+            # sem query (descrição vazia) — confirma só pela presença de linhas
+            if not query:
+                if driver.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH):
+                    logger.info("✅ Publicações carregadas; descrição vazia, assumindo sucesso.")
+                    return True
+        except Exception:
+            pass
+
+        time.sleep(1.0)
+
+    logger.warning("Não consegui confirmar o post na lista de Publicações (query='%s').", query)
+    return False
 
 # --------------------------------- API ----------------------------------------
 def upload_video(
@@ -520,6 +679,20 @@ def complete_upload_form(
     logger.info("Clicando no botão de postagem")
     _post_video(driver)
 
+    # pequena espera p/ transição
+    time.sleep(4)
+
+    # 5) (NOVO) Confirma que a tela de Publicações abriu e que a descrição apareceu
+    if VERIFY_POST_IN_PUBLICATIONS:
+        try:
+            ok = _confirm_post_in_publications(driver, description or "", timeout=PUBLICATIONS_WAIT_SEC)
+            if ok:
+                logger.info("✅ Post confirmado na tela de Publicações.")
+            else:
+                logger.warning("⚠️ Não foi possível confirmar o post na tela de Publicações dentro do tempo limite.")
+        except Exception as e:
+            logger.warning("Falha ao validar na tela de Publicações: %s", e)
+
     # grace final
     try:
         time.sleep(6)
@@ -637,6 +810,69 @@ def _wait_blocking_overlays_gone(driver: WebDriver, timeout: int = 6) -> None:
             if not _has_blocking_overlay(driver):
                 return
         time.sleep(0.5)
+
+# >>> NOVO: trata o modal "Continuar publicando?" / "Publish now" / árabe
+def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
+    """
+    Se o modal de verificação estiver visível, clica em 'Publicar agora' (ou equivalente).
+    Retorna True se clicou; False se não encontrou.
+    """
+    deadline = time.time() + max(1, wait_secs)
+
+    def _try_find_and_click() -> bool:
+        try:
+            # Primeiro busca no topo (fora do iframe)
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+        texts = ("Publicar agora", "Publish now", "انشر الآن")
+        for t in texts:
+            try:
+                btn = driver.find_element(
+                    By.XPATH,
+                    "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
+                    "//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()=$label]]",
+                )
+            except Exception:
+                # Selenium não permite param direto em XPath acima sem driver substituição;
+                # então fazemos por string:
+                try:
+                    btn = driver.find_element(
+                        By.XPATH,
+                        f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
+                        f"//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]"
+                    )
+                except Exception:
+                    btn = None
+            if btn:
+                try:
+                    driver.execute_script("arguments[0].click();", btn)
+                    time.sleep(0.8)
+                    return True
+                except Exception:
+                    pass
+
+        # Fallback: se houver um modal visível com botão primário, clica nele mesmo sem texto
+        try:
+            any_primary = driver.find_element(
+                By.XPATH,
+                "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
+                "//button[contains(@class,'TUXButton--primary')]"
+            )
+            driver.execute_script("arguments[0].click();", any_primary)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            pass
+        return False
+
+    while time.time() < deadline:
+        if _try_find_and_click():
+            logger.info("✅ Modal de verificação tratado — clicado 'Publicar agora'.")
+            return True
+        time.sleep(0.5)
+    return False
 
 def _set_description(driver: WebDriver, description: str) -> None:
     """Define a descrição do vídeo."""
@@ -924,7 +1160,7 @@ def __verify_time_picked_is_correct(driver: WebDriver, hour: int, minute: int) -
         raise Exception(msg)
 
 def _post_video(driver: WebDriver) -> None:
-    """Clica no botão de postagem (com espera paciente)."""
+    """Clica no botão de postagem (com espera paciente) e confirma modal 'Publicar agora' se aparecer."""
     try:
         post = WebDriverWait(driver, UPLOADING_WAIT).until(
             lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and
@@ -932,14 +1168,24 @@ def _post_video(driver: WebDriver) -> None:
         )
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", post)
         post.click()
-        time.sleep(5)
+        time.sleep(1.0)
     except ElementClickInterceptedException:
         logger.info("Tentando clicar no botão novamente (fallback JS)")
         driver.execute_script('document.querySelector(".TUXButton--primary").click()')
-        time.sleep(5)
+        time.sleep(1.0)
     except WebDriverException as e:
         logger.error("Erro ao clicar no botão de postagem: %s", str(e))
         raise
+
+    # >>> NOVO: se abrir o modal de verificação, confirmar 'Publicar agora'
+    try:
+        if _click_publish_now_if_modal(driver, wait_secs=30):
+            logger.info("Prosseguindo após confirmar 'Publicar agora'.")
+    except Exception:
+        pass
+
+    # pequena espera para a transição de estado
+    time.sleep(4)
 
     try:
         post_confirmation = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["post_confirmation"]))

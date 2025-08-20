@@ -18,3 +18,5 @@ venv/
 whisper_models/
 dist/
 build/
+chrome_cache/
+chrome_profiles/
