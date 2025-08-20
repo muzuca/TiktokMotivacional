@@ -14,11 +14,10 @@ from os.path import abspath, exists
 import time
 import pytz
 import datetime
-import threading
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-from typing import Any, Callable, Literal, Optional, List, Dict, Tuple
+from typing import Any, Callable, Literal, Optional, List, Dict
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 # ===== Selenium =====
@@ -41,7 +40,7 @@ from . import config
 
 # Preferimos o get_browser (com Selenium-Wire) do módulo browsers.
 try:
-    from .browsers import get_browser  # preferencial (respeita want_proxy/region/lang_tag)
+    from .browsers import get_browser  # respeita want_proxy/region/lang_tag
 except ImportError:
     # ------------------ Fallback minimalista com Selenium-Wire ------------------
     from dotenv import load_dotenv
@@ -63,7 +62,6 @@ except ImportError:
         return "en"
 
     def _want_proxy_default(idioma: Optional[str]) -> bool:
-        # proxy para EN (US) e AR (EG)
         return _norm_lang(idioma) in ("en", "ar")
 
     def _region_default(idioma: Optional[str]) -> Optional[str]:
@@ -85,12 +83,6 @@ except ImportError:
         return default
 
     def _resolve_proxy_env(region: Optional[str]):
-        """
-        Lê variáveis com suporte a região:
-          - US => PROXY_US_HOST/PORT/USER/PASS (aceita também PROXY_HOST_US/PORT_US/...)
-          - EG => PROXY_EG_HOST/PORT/USER/PASS (aceita também PROXY_HOST_EG/PORT_EG/...)
-          - default => PROXY_HOST/PORT/USER/PASS
-        """
         load_dotenv()
         reg = (region or "").upper()
         if reg == "US":
@@ -105,7 +97,6 @@ except ImportError:
             user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
             pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
             return host, port, user, pw
-        # fallback
         host = _env_first("PROXY_HOST")
         port = _env_first("PROXY_PORT")
         user = _env_first("PROXY_USER") or None
@@ -210,7 +201,6 @@ except ImportError:
             options.add_argument(f"--lang={lang_tag}")
             if headless:
                 options.add_argument("--headless=new")
-                options.add_argument("--ignore-certificate-errors")
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
             return wire_webdriver.Edge(
                 service=EdgeService(EdgeChromiumDriverManager().install()),
@@ -239,10 +229,34 @@ retries = Retry(total=0)
 session.mount("http://", HTTPAdapter(max_retries=retries))
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# --------------------------- Timeouts por .env ---------------------------
-EXPLICIT_WAIT = int(os.getenv("EXPLICIT_WAIT_SEC", str(config.get("explicit_wait", 30))))
-UPLOAD_MAX_WAIT_SEC = int(os.getenv("UPLOAD_MAX_WAIT_SEC", str(config.get("uploading_wait", 600))))
-POST_CLICK_WAIT_SEC = int(os.getenv("POST_CLICK_WAIT_SEC", "20"))
+# ========================= Timeouts/Retentativas via .env =====================
+def _int_env(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(v) if v is not None and str(v).strip() != "" else default
+    except Exception:
+        return default
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v is not None and str(v).strip() != "" else default
+    except Exception:
+        return default
+
+IMPLICIT_WAIT     = _int_env("IMPLICIT_WAIT_SEC",  config.get("implicit_wait", 5))
+EXPLICIT_WAIT     = _int_env("EXPLICIT_WAIT_SEC",  config.get("explicit_wait", 30))
+UPLOADING_WAIT    = _int_env("UPLOADING_WAIT_SEC", config.get("uploading_wait", 240))  # ↑ tolerante
+ADD_HASHTAG_WAIT  = _float_env("ADD_HASHTAG_WAIT_SEC", config.get("add_hashtag_wait", 0.5))
+POST_CLICK_WAIT   = _int_env("POST_CLICK_WAIT_SEC", 20)
+NAV_MAX_RETRIES   = _int_env("UPLOAD_NAV_RETRIES", 3)
+IFRAME_MAX_RETRY  = _int_env("UPLOAD_IFRAME_RETRIES", 2)
+NAV_RETRY_BACKOFF = _float_env("UPLOAD_RETRY_BACKOFF_SEC", 3.0)
+
+# ——— Novos tempos de “grace” e assentamento de overlays antes do Post ———
+POST_MIN_GRACE_SEC           = _int_env("POST_MIN_GRACE_SEC", 20)  # mínimo desde o envio do arquivo
+POST_AFTER_ENABLED_EXTRA_SEC = _int_env("POST_AFTER_ENABLED_EXTRA_SEC", 2)   # extra após habilitar
+OVERLAYS_SETTLE_SEC          = _int_env("OVERLAYS_SETTLE_SEC", 3)   # janela p/ modais sumirem
 
 # --------------------------- helpers de proxy/idioma ---------------------------
 def _idioma_norm(idioma: Optional[str]) -> str:
@@ -252,11 +266,9 @@ def _idioma_norm(idioma: Optional[str]) -> str:
     return "en"
 
 def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
-    """Liga o proxy para EN/EUA e também para árabe (Egito)."""
     return _idioma_norm(idioma) in ("en", "ar")
 
 def _region_from_idioma(idioma: Optional[str]) -> Optional[str]:
-    """US para inglês; EG para árabe; None para demais (usa PROXY_* default)."""
     n = _idioma_norm(idioma)
     if n == "ar": return "EG"
     if n == "en": return "US"
@@ -352,7 +364,6 @@ def upload_videos(
     logger.info("upload_videos: idioma=%s | want_proxy=%s | region=%s | lang_tag=%s",
                 idioma, want_proxy, region or "-", lang_tag)
 
-    # Se vier um browser_agent incompatível com a decisão de proxy, recria
     if browser_agent is not None:
         if want_proxy and not _is_seleniumwire_driver(browser_agent):
             logger.info("Agent sem Selenium-Wire (sem proxy). Recriando com proxy.")
@@ -379,14 +390,10 @@ def upload_videos(
         chrome_options.add_argument("--disable-popup-blocking")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-quic")
-        chrome_options.add_argument("--no-first-run")
-        chrome_options.add_argument("--no-default-browser-check")
         if headless:
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--ignore-certificate-errors")
 
-        # IMPORTANTE: get_browser (do módulo browsers OU fallback) respeita want_proxy/region/lang_tag
         driver = get_browser(
             browser,
             headless=headless,
@@ -414,7 +421,8 @@ def upload_videos(
             schedule = video.get("schedule", None)  # type: ignore
             product_id = video.get("product_id", None)  # type: ignore
 
-            logger.info("Postando %s%s", bold(video.get("path", "")), f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
+            logger.info("Postando %s%s", bold(video.get("path", "")),
+                        f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
 
             if not _check_valid_path(path):
                 logger.warning("%s é inválido, pulando", path)
@@ -427,22 +435,19 @@ def upload_videos(
                 else:
                     utc_offset = schedule.utcoffset()
                     if not (utc_offset and int(utc_offset.total_seconds()) == 0):
-                        logger.warning("%s é inválido, o horário de agendamento deve ser ingênuo (será tratado como UTC) ou ciente de UTC (offset 0). Pulando.", schedule)
+                        logger.warning("%s é inválido, o horário deve ser UTC (offset 0) ou naive (tratado como UTC). Pulando.", schedule)
                         failed.append(video)
                         continue
-
-                valid_tiktok_minute_multiple = 5
-                schedule = _get_valid_schedule_minute(schedule, valid_tiktok_minute_multiple)
+                schedule = _get_valid_schedule_minute(schedule, 5)
                 if not _check_valid_schedule(schedule):
-                    logger.warning("%s é inválido, o horário de agendamento deve ser pelo menos 20 minutos no futuro e no máximo 10 dias, pulando", schedule)
+                    logger.warning("%s é inválido (>=20min e <=10d; múltiplos de 5m). Pulando.", schedule)
                     failed.append(video)
                     continue
 
             complete_upload_form(
                 driver, path, description, schedule, skip_split_window,
                 product_id, num_retries, headless=headless,
-                idioma=idioma, lang_tag=lang_tag,  # >>> usado para ajustar ?lang= na URL
-                *args, **kwargs
+                idioma=idioma, lang_tag=lang_tag
             )
 
         except WebDriverException as e:
@@ -480,50 +485,42 @@ def complete_upload_form(
     lang_tag: Optional[str] = None,
     **kwargs
 ) -> None:
-    """Realiza o upload de um vídeo."""
-    logger.info(f"Navegando para a página de upload: {config['paths']['upload']}")
-    _go_to_upload(driver, lang_tag=lang_tag)
+    """Realiza o upload de um vídeo — tolerante a latência, com “grace” e anticlique precoce."""
+    _nav_with_retries(driver, lang_tag=lang_tag)     # entra na página correta
+    _maybe_close_cookie_banner(driver)               # fecha banner se houver
+    _ensure_upload_ui(driver)                        # entra no iframe (se existir) e valida o input
 
-    upload_complete_event = threading.Event()
-    upload_exc: List[Exception] = []
+    # 1) Envia o arquivo e espera início real (preview/input preenchido)
+    send_ts = _set_video(driver, path=path, num_retries=max(1, num_retries))
 
-    def _uploader():
-        logger.info("Fazendo upload do arquivo de vídeo")
-        try:
-            try:
-                _change_to_upload_iframe(driver)
-            except Exception:
-                pass
-            _set_video(driver, path=path, **kwargs)
-        except Exception as e:
-            upload_exc.append(e)
-        finally:
-            upload_complete_event.set()
-
-    upload_thread = threading.Thread(target=_uploader, daemon=True)
-    upload_thread.start()
-
-    # aguarda o início real do upload ou falha
-    signaled = upload_complete_event.wait(UPLOAD_MAX_WAIT_SEC)
-    if not signaled:
-        raise TimeoutException(f"Timeout esperando início do upload após {UPLOAD_MAX_WAIT_SEC}s")
-    if upload_exc:
-        raise upload_exc[0]
-
+    # 2) Metadados
     logger.info("Definindo descrição")
     _set_description(driver, description)
     if schedule:
         logger.info("Definindo agendamento")
         _set_schedule_video(driver, schedule)
     if product_id:
-        logger.info(f"Tentando adicionar link de produto para ID: {product_id}")
         _add_product_link(driver, product_id)
 
-    time.sleep(2)
+    # 3) Espera botão habilitar (paciente), aplica 'grace' + settle de overlays
+    _wait_post_enabled(driver, timeout=UPLOADING_WAIT)
+
+    elapsed = time.time() - send_ts
+    remaining = max(0, POST_MIN_GRACE_SEC - int(elapsed))
+    if remaining > 0:
+        logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio do arquivo)...", remaining)
+        time.sleep(remaining)
+
+    if POST_AFTER_ENABLED_EXTRA_SEC > 0:
+        time.sleep(POST_AFTER_ENABLED_EXTRA_SEC)
+
+    _wait_blocking_overlays_gone(driver, timeout=OVERLAYS_SETTLE_SEC)
+
+    # 4) Posta
     logger.info("Clicando no botão de postagem")
     _post_video(driver)
 
-    # pequeno grace period
+    # grace final
     try:
         time.sleep(6)
         driver.delete_all_cookies()
@@ -542,38 +539,104 @@ def _apply_lang_to_url(url: str, lang_tag: Optional[str]) -> str:
     except Exception:
         return url
 
-def _go_to_upload(driver: WebDriver, *, lang_tag: Optional[str] = None) -> None:
-    """Navega para a página de upload (forçando ?lang=<lang_tag> se fornecido)."""
+def _nav_with_retries(driver: WebDriver, *, lang_tag: Optional[str] = None) -> None:
+    """Navega até a página de upload com tentativas limitadas (sem refresh infinito)."""
     target = _apply_lang_to_url(config["paths"]["upload"], lang_tag)
-    if driver.current_url != target:
-        driver.get(target)
-        logger.info(f"Navegou para: {driver.current_url}")
-    else:
-        _refresh_with_alert(driver)
+    for attempt in range(1, NAV_MAX_RETRIES + 1):
+        try:
+            if driver.current_url != target:
+                driver.get(target)
+                logger.info(f"Navegou para: {driver.current_url}")
+            WebDriverWait(driver, EXPLICIT_WAIT).until(EC.presence_of_element_located((By.ID, "root")))
+            driver.switch_to.default_content()
+            return
+        except TimeoutException:
+            logger.warning("Timeout abrindo upload (tentativa %d/%d). Retentando em %.1fs...",
+                           attempt, NAV_MAX_RETRIES, NAV_RETRY_BACKOFF)
+            time.sleep(NAV_RETRY_BACKOFF)
+        except WebDriverException as e:
+            logger.warning("Falha de navegação (tentativa %d/%d): %s", attempt, NAV_MAX_RETRIES, e)
+            time.sleep(NAV_RETRY_BACKOFF)
+    raise TimeoutException("Não consegui abrir a página de upload após múltiplas tentativas.")
 
-    root_selector = EC.presence_of_element_located((By.ID, "root"))
-    WebDriverWait(driver, EXPLICIT_WAIT).until(root_selector)
-    driver.switch_to.default_content()
+def _ensure_upload_ui(driver: WebDriver) -> None:
+    """
+    Entra no iframe (se existir) e valida que o input de upload está disponível.
+    Evita refresh-loop: apenas tenta algumas vezes e erra de forma clara.
+    """
+    for attempt in range(1, IFRAME_MAX_RETRY + 1):
+        try:
+            driver.switch_to.default_content()
+            try:
+                iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(
+                    EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
+                )
+                driver.switch_to.frame(iframe)
+                logger.info("Entrou no iframe de upload")
+            except TimeoutException:
+                driver.switch_to.default_content()
+
+            WebDriverWait(driver, EXPLICIT_WAIT).until(
+                EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["upload_video"]))
+            )
+            return
+        except TimeoutException:
+            logger.warning("Upload UI não disponível (tentativa %d/%d).", attempt, IFRAME_MAX_RETRY)
+            time.sleep(NAV_RETRY_BACKOFF)
+    raise TimeoutException("UI de upload não apareceu (iframe/input).")
 
 def _change_to_upload_iframe(driver: WebDriver) -> None:
     """Alterna para o iframe da página de upload (se existir)."""
     try:
-        iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
-        iframe = WebDriverWait(driver, EXPLICIT_WAIT).until(iframe_selector)
-        driver.switch_to.frame(iframe)
-    except Exception:
-        # fallback genérico: procura por iframes com 'upload'/'creator' no src/name
         driver.switch_to.default_content()
-        frames = driver.find_elements(By.TAG_NAME, "iframe")
-        for fr in frames:
-            try:
-                src = (fr.get_attribute("src") or "").lower()
-                name = (fr.get_attribute("name") or "").lower()
-                if ("creator" in src) or ("upload" in src) or ("creator" in name) or ("upload" in name):
-                    driver.switch_to.frame(fr)
-                    return
-            except Exception:
-                continue
+        iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
+        iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(iframe_selector)
+        driver.switch_to.frame(iframe)
+    except TimeoutException:
+        driver.switch_to.default_content()
+
+def _maybe_close_cookie_banner(driver: WebDriver) -> None:
+    try:
+        _remove_cookies_window(driver)
+    except Exception:
+        pass
+
+def _wait_post_enabled(driver: WebDriver, timeout: int = 30) -> None:
+    """Espera até o botão 'Post' ficar habilitado (data-disabled=false)."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and
+                      el.get_attribute("data-disabled") == "false"
+        )
+    except Exception:
+        pass
+
+# ---------- overlays/modais que podem bloquear o clique ----------
+def _has_blocking_overlay(driver: WebDriver) -> bool:
+    try:
+        dialogs = driver.find_elements(By.XPATH, '//*[@role="dialog" and not(@aria-hidden="true")]')
+        for d in dialogs:
+            if d.is_displayed():
+                return True
+    except Exception:
+        pass
+    try:
+        modals = driver.find_elements(By.XPATH, '//*[contains(@class,"TUXModal") or contains(@class,"TUXAlert")]')
+        for m in modals:
+            if m.is_displayed():
+                return True
+    except Exception:
+        pass
+    return False
+
+def _wait_blocking_overlays_gone(driver: WebDriver, timeout: int = 6) -> None:
+    deadline = time.time() + max(0, timeout)
+    while time.time() < deadline:
+        if not _has_blocking_overlay(driver):
+            time.sleep(0.5)
+            if not _has_blocking_overlay(driver):
+                return
+        time.sleep(0.5)
 
 def _set_description(driver: WebDriver, description: str) -> None:
     """Define a descrição do vídeo."""
@@ -583,21 +646,17 @@ def _set_description(driver: WebDriver, description: str) -> None:
     description = (description or "").encode("utf-8", "ignore").decode("utf-8")
     saved_description = description
 
-    WebDriverWait(driver, EXPLICIT_WAIT).until(
+    WebDriverWait(driver, IMPLICIT_WAIT).until(
         EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["description"]))
     )
 
     desc = driver.find_element(By.XPATH, config["selectors"]["upload"]["description"])
 
     desc.click()
-    WebDriverWait(driver, EXPLICIT_WAIT).until(lambda d: desc.text != "")
-
+    time.sleep(0.2)
     desc.send_keys(Keys.END)
     _clear(desc)
-    WebDriverWait(driver, EXPLICIT_WAIT).until(lambda d: desc.text == "")
-
-    desc.click()
-    time.sleep(1)
+    time.sleep(0.2)
 
     try:
         words = description.split(" ")
@@ -605,15 +664,14 @@ def _set_description(driver: WebDriver, description: str) -> None:
             if word and word[0] == "#":
                 desc.send_keys(word)
                 desc.send_keys(" " + Keys.BACKSPACE)
-                WebDriverWait(driver, EXPLICIT_WAIT).until(
+                WebDriverWait(driver, IMPLICIT_WAIT).until(
                     EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["mention_box"]))
                 )
-                time.sleep(config["add_hashtag_wait"])
+                time.sleep(ADD_HASHTAG_WAIT)
                 desc.send_keys(Keys.ENTER)
             elif word and word[0] == "@":
                 logger.info("- Adicionando Menção: %s", word)
-                desc.send_keys(word)
-                desc.send_keys(" ")
+                desc.send_keys(word + " ")
                 time.sleep(1)
                 desc.send_keys(Keys.BACKSPACE)
 
@@ -643,9 +701,7 @@ def _set_description(driver: WebDriver, description: str) -> None:
                                 break
 
                         if not found:
-                            logger.info("Sem correspondência. Aguardando %.1f segundos...", waiting_interval)
                             time.sleep(waiting_interval)
-
             else:
                 desc.send_keys((word or "") + " ")
     except Exception as exception:
@@ -660,162 +716,106 @@ def _clear(element) -> None:
     except Exception:
         pass
 
-# --------------------------- NOVOS helpers robustos ---------------------------
-def _find_upload_input(driver: WebDriver) -> Any:
-    """Procura o input de vídeo com fallbacks robustos."""
-    # 1) seletor do config (preferido)
+# ------------------ upload síncrono e tolerante a latência --------------------
+def _wait_upload_started(driver: WebDriver, start_timeout: int) -> bool:
+    """
+    Aguarda sinal de que o upload foi aceito/iniciado:
+      - elemento de confirmação/preview
+      - OU input[type=file] contém arquivo (files.length > 0)
+    Retorna True se detectou início; False caso contrário.
+    """
+    deadline = time.time() + max(5, start_timeout)
+    while time.time() < deadline:
+        try:
+            el = driver.find_elements(By.XPATH, config["selectors"]["upload"]["process_confirmation"])
+            if el:
+                return True
+        except Exception:
+            pass
+
+        try:
+            upload_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["upload_video"])
+            got_files = driver.execute_script("return arguments[0].files && arguments[0].files.length > 0;", upload_box)
+            if got_files:
+                return True
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+    return False
+
+def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs) -> float:
+    """Define o vídeo para upload — sem thread, sem fechar guia e com revalidação de contexto.
+       Retorna o timestamp (epoch) do momento em que o arquivo foi enviado (send_keys)."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max(1, num_retries) + 1):
+        logger.info("Fazendo upload do arquivo de vídeo (tentativa %d/%d)", attempt, num_retries)
+        try:
+            _change_to_upload_iframe(driver)  # garante contexto correto
+
+            WebDriverWait(driver, EXPLICIT_WAIT).until(
+                EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["upload_video"]))
+            )
+            upload_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["upload_video"])
+            upload_box.send_keys(path)
+            send_ts = time.time()
+
+            if _wait_upload_started(driver, start_timeout=UPLOADING_WAIT):
+                logger.info("✅ Upload iniciou/preview detectado.")
+                return send_ts
+
+            last_exc = TimeoutException(f"Timeout esperando início do upload após {UPLOADING_WAIT}s")
+            logger.warning(str(last_exc))
+
+            try: driver.switch_to.default_content()
+            except Exception: pass
+            try: _ensure_upload_ui(driver)
+            except Exception: pass
+
+        except Exception as exception:
+            last_exc = exception
+            logger.warning("Falha ao anexar vídeo (tentativa %d/%d): %s", attempt, num_retries, exception)
+            try: driver.switch_to.default_content()
+            except Exception: pass
+            try: _ensure_upload_ui(driver)
+            except Exception: pass
+
+        time.sleep(min(10, NAV_RETRY_BACKOFF * attempt))
+
+    raise FailedToUpload(last_exc or Exception("Falha ao anexar vídeo."))
+
+def _remove_cookies_window(driver) -> None:
+    """Remove a janela de cookies se estiver aberta."""
     try:
-        WebDriverWait(driver, EXPLICIT_WAIT).until(
-            EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["upload_video"]))
+        cookies_banner = WebDriverWait(driver, IMPLICIT_WAIT).until(
+            EC.presence_of_element_located((By.TAG_NAME, config["selectors"]["upload"]["cookies_banner"]["banner"]))
         )
-        return driver.find_element(By.XPATH, config["selectors"]["upload"]["upload_video"])
+        item = WebDriverWait(driver, IMPLICIT_WAIT).until(
+            EC.visibility_of(cookies_banner.shadow_root.find_element(By.CSS_SELECTOR, config["selectors"]["upload"]["cookies_banner"]["button"]))
+        )
+        decline_button = WebDriverWait(driver, IMPLICIT_WAIT).until(
+            EC.element_to_be_clickable(item.find_elements(By.TAG_NAME, "button")[0])
+        )
+        decline_button.click()
+        logger.info("Banner de cookies fechado")
     except Exception:
         pass
 
-    # 2) fallbacks genéricos
-    candidates: List[Tuple[str, str]] = [
-        ("css", "input[type='file'][accept*='video']"),
-        ("xpath", "//input[@type='file' and contains(@accept,'video')]"),
-        ("xpath", "//input[@type='file' and not(@accept)]"),
-        ("xpath", "//input[contains(@id,'upload') and @type='file']"),
-        ("xpath", "//input[contains(@class,'upload') and @type='file']"),
-    ]
-    for kind, selector in candidates:
-        try:
-            if kind == "css":
-                el = driver.find_element(By.CSS_SELECTOR, selector)
-            else:
-                el = driver.find_element(By.XPATH, selector)
-            return el
-        except Exception:
-            continue
-    raise NoSuchElementException("Input de upload de vídeo não encontrado (nem com fallbacks).")
-
-def _wait_upload_started(driver: WebDriver, timeout: int = UPLOAD_MAX_WAIT_SEC) -> None:
-    """Espera sinal concreto de que o upload começou/arquivo foi aceito."""
-    def _ready(d: WebDriver) -> bool:
-        # 1) Botão Post habilitado?
-        try:
-            el = d.find_element(By.XPATH, config["selectors"]["upload"]["post"])
-            if el.get_attribute("data-disabled") == "false":
-                return True
-        except Exception:
-            pass
-        # 2) Preview/thumbnail/canvas
-        try:
-            if d.find_elements(By.XPATH, "//video") or \
-               d.find_elements(By.XPATH, "//div[contains(@class,'video')]/video") or \
-               d.find_elements(By.XPATH, "//canvas[contains(@class,'cover')]") or \
-               d.find_elements(By.XPATH, "//*[contains(@class,'thumbnail') or contains(@class,'preview')]"):
-                return True
-        except Exception:
-            pass
-        # 3) Percentual > 0%
-        try:
-            perc = d.find_elements(By.XPATH, "//*[contains(text(),'%') and not(contains(text(),'0%'))]")
-            if perc:
-                return True
-        except Exception:
-            pass
-        return False
-
-    WebDriverWait(driver, timeout).until(_ready)
-
-# --------------------------- SUBSTITUIÇÃO crítica ---------------------------
-def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs) -> None:
-    """Define o vídeo para upload (com iframe + confirmação real de início)."""
-    path = abspath(path)
-    if not exists(path):
-        raise RuntimeError(f"Caminho inválido: {path}")
-
-    last_err: Optional[Exception] = None
-
-    for attempt in range(1, num_retries + 1):
-        try:
-            logger.info("Fazendo upload do arquivo de vídeo (tentativa %d/%d)", attempt, num_retries)
-            try:
-                _change_to_upload_iframe(driver)
-            except Exception:
-                pass
-
-            upload_box = _find_upload_input(driver)
-
-            # alguns inputs ficam ocultos; tornar visível evita intercepts
-            try:
-                driver.execute_script("arguments[0].style.display='block'; arguments[0].style.opacity=1;", upload_box)
-            except Exception:
-                pass
-
-            upload_box.send_keys(path)
-
-            # Espera real: preview/percentual/post habilitado
-            _wait_upload_started(driver, timeout=UPLOAD_MAX_WAIT_SEC)
-            logger.info("✅ Upload iniciou/preview detectado.")
-            return
-
-        except TimeoutException as e:
-            last_err = e
-            logger.warning("Ocorreu TimeoutException: %s", str(e))
-        except Exception as e:
-            last_err = e
-            logger.warning("Falha ao anexar o vídeo (tentativa %d/%d): %s", attempt, num_retries, e)
-
-        # recovery entre tentativas
-        try:
-            driver.switch_to.default_content()
-            driver.refresh()
-            time.sleep(2.0)
-            try:
-                _change_to_upload_iframe(driver)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        time.sleep(2.0 + attempt)
-
-    raise last_err or FailedToUpload("Não foi possível anexar o arquivo de vídeo (permaneceu em 0%).")
-
-# --------------------------- restantes (mantidos) ---------------------------
-def _remove_cookies_window(driver) -> None:
-    """Remove a janela de cookies se estiver aberta."""
-    logger.info("Removendo janela de cookies")
-    cookies_banner = WebDriverWait(driver, EXPLICIT_WAIT).until(
-        EC.presence_of_element_located((By.TAG_NAME, config["selectors"]["upload"]["cookies_banner"]["banner"]))
-    )
-
-    item = WebDriverWait(driver, EXPLICIT_WAIT).until(
-        EC.visibility_of(cookies_banner.shadow_root.find_element(By.CSS_SELECTOR, config["selectors"]["upload"]["cookies_banner"]["button"]))
-    )
-
-    decline_button = WebDriverWait(driver, EXPLICIT_WAIT).until(
-        EC.element_to_be_clickable(item.find_elements(By.TAG_NAME, "button")[0])
-    )
-
-    decline_button.click()
-
 def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = True, duet: bool = True, *args, **kwargs) -> None:
-    """Define as configurações de interatividade do vídeo."""
     try:
         logger.info("Definindo configurações de interatividade")
-
         comment_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["comment"])
         stitch_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["stitch"])
         duet_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["duet"])
-
-        if comment ^ comment_box.is_selected():
-            comment_box.click()
-        if stitch ^ stitch_box.is_selected():
-            stitch_box.click()
-        if duet ^ duet_box.is_selected():
-            duet_box.click()
-
+        if comment ^ comment_box.is_selected(): comment_box.click()
+        if stitch ^ stitch_box.is_selected(): stitch_box.click()
+        if duet ^ duet_box.is_selected(): duet_box.click()
     except NoSuchElementException as e:
-        logger.warning("Elementos de interatividade não encontrados: %s. Ignorando configuração.", str(e))
+        logger.warning("Elementos de interatividade não encontrados: %s. Ignorando.", str(e))
     except Exception as e:
-        logger.error("Falha ao definir configurações de interatividade: %s", str(e))
+        logger.error("Falha ao definir interatividade: %s", str(e))
 
 def _set_schedule_video(driver: WebDriver, schedule: datetime.datetime) -> None:
-    """Define o agendamento do vídeo."""
     logger.info("Definindo agendamento")
 
     driver_timezone = __get_driver_timezone(driver)
@@ -837,13 +837,12 @@ def _set_schedule_video(driver: WebDriver, schedule: datetime.datetime) -> None:
 
 def __date_picker(driver: WebDriver, month: int, day: int) -> None:
     logger.info("Selecionando data")
-
     condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["date_picker"]))
-    date_picker = WebDriverWait(driver, EXPLICIT_WAIT).until(condition)
+    date_picker = WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
     date_picker.click()
 
     condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["calendar"]))
-    WebDriverWait(driver, EXPLICIT_WAIT).until(condition)
+    WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
 
     calendar_month = driver.find_element(By.XPATH, config["selectors"]["schedule"]["calendar_month"]).text
     n_calendar_month = datetime.datetime.strptime(calendar_month, "%B").month
@@ -885,11 +884,11 @@ def __time_picker(driver: WebDriver, hour: int, minute: int) -> None:
     logger.info("Selecionando horário")
 
     condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker"]))
-    time_picker = WebDriverWait(driver, EXPLICIT_WAIT).until(condition)
+    time_picker = WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
     time_picker.click()
 
     condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker_container"]))
-    WebDriverWait(driver, EXPLICIT_WAIT).until(condition)
+    WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
 
     hour_options = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_hours"])
     minute_options = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_minutes"])
@@ -925,49 +924,38 @@ def __verify_time_picked_is_correct(driver: WebDriver, hour: int, minute: int) -
         raise Exception(msg)
 
 def _post_video(driver: WebDriver) -> None:
-    """Clica no botão de postagem somente quando upload realmente pronto."""
-    logger.info("Clicando no botão de postagem")
-
-    def _ready_to_post(d: WebDriver):
-        try:
-            post = d.find_element(By.XPATH, config["selectors"]["upload"]["post"])
-            enabled = post.get_attribute("data-disabled") == "false"
-        except Exception:
-            return None
-        has_preview = bool(
-            d.find_elements(By.XPATH, "//video") or
-            d.find_elements(By.XPATH, "//div[contains(@class,'video')]/video") or
-            d.find_elements(By.XPATH, "//canvas[contains(@class,'cover')]") or
-            d.find_elements(By.XPATH, "//*[contains(@class,'thumbnail') or contains(@class,'preview')]")
-        )
-        return post if (enabled and has_preview) else None
-
-    post = WebDriverWait(driver, UPLOAD_MAX_WAIT_SEC).until(_ready_to_post)
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", post)
+    """Clica no botão de postagem (com espera paciente)."""
     try:
+        post = WebDriverWait(driver, UPLOADING_WAIT).until(
+            lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and
+                      el.get_attribute("data-disabled") == "false" and el
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", post)
         post.click()
+        time.sleep(5)
     except ElementClickInterceptedException:
         logger.info("Tentando clicar no botão novamente (fallback JS)")
         driver.execute_script('document.querySelector(".TUXButton--primary").click()')
-    time.sleep(min(POST_CLICK_WAIT_SEC, 20))
+        time.sleep(5)
+    except WebDriverException as e:
+        logger.error("Erro ao clicar no botão de postagem: %s", str(e))
+        raise
 
     try:
         post_confirmation = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["post_confirmation"]))
-        WebDriverWait(driver, 20).until(post_confirmation)
+        WebDriverWait(driver, POST_CLICK_WAIT).until(post_confirmation)
         logger.info("Vídeo postado com sucesso")
     except TimeoutException:
-        logger.warning("Confirmação de postagem não encontrada em 20 segundos. Prosseguindo assumindo sucesso.")
+        logger.warning("Confirmação de postagem não encontrada em %ds. Prosseguindo assumindo sucesso.", POST_CLICK_WAIT)
     except WebDriverException as e:
         logger.error("Falha ao confirmar postagem: %s", str(e))
         raise FailedToUpload("Postagem não confirmada devido a erro no WebDriver")
 
 # --------------------------- validações/utilitários ---------------------------
 def _check_valid_path(path: str) -> bool:
-    """Retorna se o tipo de arquivo é suportado pelo TikTok."""
     return exists(path) and path.split(".")[-1].lower() in config["supported_file_types"]
 
 def _get_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
-    """Ajusta o minuto para múltiplos aceitos pelo TikTok."""
     if _is_valid_schedule_minute(schedule.minute, valid_multiple):
         return schedule
     return _set_valid_schedule_minute(schedule, valid_multiple)
@@ -984,17 +972,14 @@ def _set_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int)
     return schedule + datetime.timedelta(minutes=add)
 
 def _check_valid_schedule(schedule: datetime.datetime) -> bool:
-    """Retorna se o agendamento é suportado pelo TikTok."""
     valid_tiktok_minute_multiple = 5
     margin_to_complete_upload_form = 5
-
     datetime_utc_now = pytz.UTC.localize(datetime.datetime.utcnow())
     min_datetime_tiktok_valid = datetime_utc_now + datetime.timedelta(minutes=15 + margin_to_complete_upload_form)
     max_datetime_tiktok_valid = datetime_utc_now + datetime.timedelta(days=10)
     return min_datetime_tiktok_valid <= schedule <= max_datetime_tiktok_valid and _is_valid_schedule_minute(schedule.minute, valid_tiktok_minute_multiple)
 
 def _get_splice_index(nearest_mention: int, nearest_hashtag: int, description: str) -> int:
-    """Retorna o índice para dividir a descrição."""
     if nearest_mention == -1 and nearest_hashtag == -1:
         return len(description)
     elif nearest_hashtag == -1:
@@ -1004,7 +989,6 @@ def _get_splice_index(nearest_mention: int, nearest_hashtag: int, description: s
     return min(nearest_mention, nearest_hashtag)
 
 def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> List[VideoDict]:
-    """Converte lista de dicionários de vídeos para formato interno."""
     if not videos_list_of_dictionaries:
         raise RuntimeError("Nenhum vídeo para upload")
 
@@ -1052,7 +1036,6 @@ def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> L
     return return_list
 
 def __get_driver_timezone(driver: WebDriver) -> Any:
-    """Retorna o fuso horário do driver."""
     timezone_str = driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone")
     return pytz.timezone(timezone_str)
 
@@ -1062,7 +1045,7 @@ def _refresh_with_alert(driver: WebDriver) -> None:
         WebDriverWait(driver, EXPLICIT_WAIT).until(EC.alert_is_present())
         driver.switch_to.alert.accept()
     except Exception as e:
-        logger.warning("Exceção ao atualizar alerta: %s", str(e))
+        logger.debug("Sem alert ao atualizar: %s", e)
 
 # -------------------------------- exceções ------------------------------------
 class DescriptionTooLong(Exception):
@@ -1077,7 +1060,6 @@ class FailedToUpload(Exception):
 
 # -------------------------- link de produto (opcional) ------------------------
 def _add_product_link(driver: WebDriver, product_id: str) -> None:
-    """Adiciona o link do produto ao vídeo usando o ID fornecido."""
     logger.info(f"Tentando adicionar link de produto para ID: {product_id}")
     try:
         wait = WebDriverWait(driver, 20)
