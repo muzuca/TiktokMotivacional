@@ -453,7 +453,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
 
     # 4) TikTok
     try:
-        postar_no_tiktok_e_renomear(
+        ok = postar_no_tiktok_e_renomear(
             descricao_personalizada=frase,
             imagem_base=imagem_base,
             imagem_final=imagem_capa,
@@ -461,16 +461,19 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
             idioma=idioma
         )
     except Exception as e:
+        ok = False
         logger.exception("❌ Falha ao postar no TikTok: %s", e)
 
     # >>> Limpeza PÓS-POST
     try:
-        _limpar_pos_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
-        logger.info("🧹 Limpeza pós-post concluída.")
+        if ok:
+            _limpar_pos_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
+            logger.info("🧹 Limpeza pós-post concluída.")
+        else:
+            logger.warning("⚠️ Upload não confirmado: preservando imagens para retry.")
     except Exception as e:
         logger.warning("Falha na limpeza pós-post: %s", e)
 
-    logger.info("✅ Execução concluída.")
 
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
     logger.info("⏱️ Modo automático: a cada %.2f horas (Ctrl+C para parar).", cada_horas)
