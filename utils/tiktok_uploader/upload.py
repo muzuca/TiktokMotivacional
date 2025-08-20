@@ -32,7 +32,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
 )
-from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webdriver import WebDriver  # type: ignore
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 
 # ===== App modules =====
@@ -268,6 +268,7 @@ OVERLAYS_SETTLE_SEC          = _int_env("OVERLAYS_SETTLE_SEC", 3)   # janela p/ 
 # ——— Confirmação na tela de Publicações ———
 PUBLICATIONS_WAIT_SEC        = _int_env("PUBLICATIONS_WAIT_SEC", 120)
 VERIFY_POST_IN_PUBLICATIONS  = _bool_env("VERIFY_POST_IN_PUBLICATIONS", True)
+DEFAULT_BEGIN_WORDS          = _int_env("PUBLICATIONS_DESC_BEGIN_WORDS", 2)  # <<<< novo
 
 # --------------------------- helpers de proxy/idioma ---------------------------
 def _idioma_norm(idioma: Optional[str]) -> str:
@@ -306,9 +307,9 @@ def _accept_header_from_tag(tag: Optional[str]) -> str:
     return "en-US,en;q=0.9"
 
 # ============= Seletor/rotinas: confirmação na tela de Publicações =============
-# Marcadores independentes de idioma, observados no DOM do Studio
 PUB_ROW_CONTAINER_XPATH = "//div[@data-tt='components_PostInfoCell_Container']"
-PUB_ROW_LINK_XPATH      = "//a[@data-tt='components_PostInfoCell_a']"
+# relativo ao container:
+PUB_ROW_LINK_REL_XPATH  = ".//a[@data-tt='components_PostInfoCell_a']"
 
 PUBLICACOES_SEARCH_XPATHES = [
     # placeholder contendo "descri" cobre PT/ES/FR/EN (descrição / descripción / description / description)
@@ -328,22 +329,9 @@ def _xpath_literal(s: str) -> str:
     parts = []
     for p in s.split("'"):
         parts.append(f"'{p}'")
-        parts.append('"\'"')  # insere aspas simples
+        parts.append('"\'"')
     parts = parts[:-1]
     return "concat(" + ",".join(parts) + ")"
-
-def _make_desc_query_snippet(description: str) -> str:
-    """
-    Trecho robusto da descrição para busca/contains:
-    - prioriza o primeiro #hashtag (estável e curto)
-    - senão, usa até 30 chars da descrição normalizada
-    """
-    description = (description or "").strip()
-    m = re.search(r"#\S+", description)
-    if m:
-        return m.group(0)
-    snippet = re.sub(r"\s+", " ", description)
-    return snippet[:30]
 
 def _find_publications_search_input(driver) -> Optional[Any]:
     for xp in PUBLICACOES_SEARCH_XPATHES:
@@ -359,7 +347,6 @@ def _wait_publications_page(driver: WebDriver, timeout: int = 90) -> None:
     """Espera a tela de Publicações carregar (lista ou barra de busca visível)."""
     def _ready(d: WebDriver):
         try:
-            # sair de qualquer iframe remanescente
             d.switch_to.default_content()
         except Exception:
             pass
@@ -391,10 +378,45 @@ def _maybe_filter_publications_by_query(driver: WebDriver, query: str) -> None:
     except Exception:
         pass
 
-def _confirm_post_in_publications(driver: WebDriver, description: str, timeout: int) -> bool:
+# ------------------ NOVO: snippet do INÍCIO da descrição (parametrizável) ------------------
+
+def _snippet_from_beginning(description: str, begin_words: int = DEFAULT_BEGIN_WORDS, max_chars: int = 60) -> str:
     """
-    Confirma que o post apareceu na lista de Publicações.
-    Retorna True se encontrar uma linha com a descrição (ou trecho) visível.
+    Pega as N primeiras **palavras reais** do início da descrição (ignorando tokens que
+    começam com # ou @). Normaliza espaços e remove aspas que atrapalham XPath.
+    """
+    if not description:
+        return ""
+    tokens = [t for t in re.split(r"\s+", description.strip()) if t]
+    keep: List[str] = []
+    for t in tokens:
+        # ignorar hashtags/menções no começo
+        if t.startswith("#") or t.startswith("@"):
+            if not keep:
+                continue
+        keep.append(t)
+        if len(keep) >= max(1, begin_words):
+            break
+    snippet = " ".join(keep).strip()
+    # limpar aspas e colapsar espaços
+    snippet = snippet.replace('"', " ").replace("'", " ")
+    snippet = re.sub(r"\s+", " ", snippet)
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars].rstrip()
+    return snippet
+
+# -------------------------------------------------------------------------------------------
+
+def _confirm_post_in_publications(
+    driver: WebDriver,
+    description: str,
+    timeout: int,
+    *,
+    begin_words: int = DEFAULT_BEGIN_WORDS
+) -> bool:
+    """
+    Confirma que o post apareceu na lista de Publicações buscando um trecho do
+    INÍCIO da descrição (N palavras). Busca de forma case-insensitive em texto e em @title.
     """
     try:
         driver.switch_to.default_content()
@@ -403,54 +425,47 @@ def _confirm_post_in_publications(driver: WebDriver, description: str, timeout: 
 
     _wait_publications_page(driver, timeout=min(60, timeout))
 
-    query = _make_desc_query_snippet(description).strip()
-    if query:
-        _maybe_filter_publications_by_query(driver, query)
+    snippet = _snippet_from_beginning(description or "", begin_words=begin_words).strip()
+    if snippet:
+        _maybe_filter_publications_by_query(driver, snippet)
 
     deadline = time.time() + max(10, timeout)
+    snippet_lower = snippet.lower()
+
     while time.time() < deadline:
         try:
-            # tenta match direto no link de descrição (mais preciso)
-            if query:
-                qlit = _xpath_literal(query)
-                candidates = driver.find_elements(
-                    By.XPATH,
-                    f"{PUB_ROW_CONTAINER_XPATH}{PUB_ROW_LINK_XPATH.replace('//','//')}"
-                    f"[contains(normalize-space(.), {qlit})]"
-                )
-                if candidates:
-                    logger.info("✅ Post localizado na lista por trecho da descrição: %s", query)
-                    return True
+            containers = driver.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH)
+            for c in containers:
+                try:
+                    # texto visível da linha
+                    text = (c.text or "")
+                    # e possível título/tooltip no link principal
+                    link_titles = []
+                    for a in c.find_elements(By.XPATH, PUB_ROW_LINK_REL_XPATH):
+                        try:
+                            t = a.get_attribute("title") or ""
+                            if t:
+                                link_titles.append(t)
+                        except Exception:
+                            pass
+                    haystack = (text + " " + " ".join(link_titles)).lower()
+                    if snippet_lower and snippet_lower in haystack:
+                        logger.info("✅ Post localizado na lista por início da descrição: %r", snippet)
+                        return True
+                except Exception:
+                    pass
 
-            # fallback: qualquer âncora/texto dentro do container que contenha o trecho
-            if query:
-                qlit = _xpath_literal(query)
-                containers = driver.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH)
-                for c in containers:
-                    try:
-                        # procura âncora/título interno
-                        a = c.find_elements(By.XPATH, f".{PUB_ROW_LINK_XPATH[1:]}")
-                        if a:
-                            if query and query in (a[0].text or ""):
-                                logger.info("✅ Post localizado (fallback) por âncora contendo o trecho.")
-                                return True
-                        if c.text and query in c.text:
-                            logger.info("✅ Post localizado (fallback) por texto do container.")
-                            return True
-                    except Exception:
-                        pass
+            # sem snippet (descrição vazia) — confirma só pela presença de linhas
+            if not snippet and containers:
+                logger.info("✅ Publicações carregadas; descrição vazia, assumindo sucesso.")
+                return True
 
-            # sem query (descrição vazia) — confirma só pela presença de linhas
-            if not query:
-                if driver.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH):
-                    logger.info("✅ Publicações carregadas; descrição vazia, assumindo sucesso.")
-                    return True
         except Exception:
             pass
 
         time.sleep(1.0)
 
-    logger.warning("Não consegui confirmar o post na lista de Publicações (query='%s').", query)
+    logger.warning("Não consegui confirmar o post na lista (início=%r) em %ds.", snippet, timeout)
     return False
 
 # --------------------------------- API ----------------------------------------
@@ -467,6 +482,7 @@ def upload_video(
     proxy: Optional[ProxyDict] = None,
     product_id: Optional[str] = None,
     idioma: str = "auto",
+    begin_words: Optional[int] = None,   # <<<< novo
     *args,
     **kwargs,
 ) -> List[VideoDict]:
@@ -493,6 +509,7 @@ def upload_video(
         auth,
         proxy,
         idioma=idioma,
+        begin_words=begin_words,   # <<<< novo
         *args,
         **kwargs,
     )
@@ -508,6 +525,7 @@ def upload_videos(
     num_retries: int = 1,
     skip_split_window: bool = False,
     idioma: str = "auto",
+    begin_words: Optional[int] = None,   # <<<< novo
     *args,
     **kwargs,
 ) -> List[VideoDict]:
@@ -573,6 +591,9 @@ def upload_videos(
 
     failed: List[VideoDict] = []
 
+    # define begin_words efetivo
+    eff_begin_words = begin_words if (begin_words is not None and begin_words > 0) else DEFAULT_BEGIN_WORDS
+
     for video in videos:
         try:
             path = abspath(video.get("path", "."))  # type: ignore
@@ -606,7 +627,8 @@ def upload_videos(
             complete_upload_form(
                 driver, path, description, schedule, skip_split_window,
                 product_id, num_retries, headless=headless,
-                idioma=idioma, lang_tag=lang_tag
+                idioma=idioma, lang_tag=lang_tag,
+                begin_words=eff_begin_words,  # <<<< novo
             )
 
         except WebDriverException as e:
@@ -642,6 +664,7 @@ def complete_upload_form(
     *,
     idioma: Optional[str] = None,
     lang_tag: Optional[str] = None,
+    begin_words: int = DEFAULT_BEGIN_WORDS,  # <<<< novo
     **kwargs
 ) -> None:
     """Realiza o upload de um vídeo — tolerante a latência, com “grace” e anticlique precoce."""
@@ -682,10 +705,15 @@ def complete_upload_form(
     # pequena espera p/ transição
     time.sleep(4)
 
-    # 5) (NOVO) Confirma que a tela de Publicações abriu e que a descrição apareceu
+    # 5) Confirma na tela de Publicações com snippet do INÍCIO da descrição
     if VERIFY_POST_IN_PUBLICATIONS:
         try:
-            ok = _confirm_post_in_publications(driver, description or "", timeout=PUBLICATIONS_WAIT_SEC)
+            ok = _confirm_post_in_publications(
+                driver,
+                description or "",
+                timeout=PUBLICATIONS_WAIT_SEC,
+                begin_words=max(1, begin_words),
+            )
             if ok:
                 logger.info("✅ Post confirmado na tela de Publicações.")
             else:
@@ -831,20 +859,11 @@ def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
             try:
                 btn = driver.find_element(
                     By.XPATH,
-                    "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
-                    "//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()=$label]]",
+                    f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
+                    f"//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]"
                 )
             except Exception:
-                # Selenium não permite param direto em XPath acima sem driver substituição;
-                # então fazemos por string:
-                try:
-                    btn = driver.find_element(
-                        By.XPATH,
-                        f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
-                        f"//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]"
-                    )
-                except Exception:
-                    btn = None
+                btn = None
             if btn:
                 try:
                     driver.execute_script("arguments[0].click();", btn)
@@ -1160,7 +1179,8 @@ def __verify_time_picked_is_correct(driver: WebDriver, hour: int, minute: int) -
         raise Exception(msg)
 
 def _post_video(driver: WebDriver) -> None:
-    """Clica no botão de postagem (com espera paciente) e confirma modal 'Publicar agora' se aparecer."""
+    """Clica no botão de postagem (com espera paciente) e confirma modal 'Publicar agora' se aparecer.
+       Observação: pulamos a confirmação inline e confiamos na verificação posterior em Publicações."""
     try:
         post = WebDriverWait(driver, UPLOADING_WAIT).until(
             lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and
@@ -1177,7 +1197,7 @@ def _post_video(driver: WebDriver) -> None:
         logger.error("Erro ao clicar no botão de postagem: %s", str(e))
         raise
 
-    # >>> NOVO: se abrir o modal de verificação, confirmar 'Publicar agora'
+    # >>> Trata modal "Publicar agora", se aparecer
     try:
         if _click_publish_now_if_modal(driver, wait_secs=30):
             logger.info("Prosseguindo após confirmar 'Publicar agora'.")
@@ -1187,19 +1207,12 @@ def _post_video(driver: WebDriver) -> None:
     # pequena espera para a transição de estado
     time.sleep(4)
 
-    try:
-        post_confirmation = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["post_confirmation"]))
-        WebDriverWait(driver, POST_CLICK_WAIT).until(post_confirmation)
-        logger.info("Vídeo postado com sucesso")
-    except TimeoutException:
-        logger.warning("Confirmação de postagem não encontrada em %ds. Prosseguindo assumindo sucesso.", POST_CLICK_WAIT)
-    except WebDriverException as e:
-        logger.error("Falha ao confirmar postagem: %s", str(e))
-        raise FailedToUpload("Postagem não confirmada devido a erro no WebDriver")
+    # 👇 Removido: checagem inline por elemento de confirmação (era ruidosa e inconsistente)
+    logger.info("Post enviado. Pulando confirmação inline; iremos confirmar via tela de Publicações.")
 
 # --------------------------- validações/utilitários ---------------------------
 def _check_valid_path(path: str) -> bool:
-    return exists(path) and path.split(".")[-1].lower() in config["supported_file_types"]
+    return exists(path) and path.split(".")[ -1].lower() in config["supported_file_types"]
 
 def _get_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
     if _is_valid_schedule_minute(schedule.minute, valid_multiple):

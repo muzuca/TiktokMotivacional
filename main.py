@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import random
 import shutil
 from glob import glob
+import re  # <- para normalizar hashtags
 
 # === Ajusta CWD quando empacotado para ler .env/cookies ao lado do .exe ===
 if getattr(sys, 'frozen', False):
@@ -31,7 +32,12 @@ ENV_PATH = find_dotenv(usecwd=True)
 load_dotenv(ENV_PATH, override=True)
 
 # Só depois do .env carregado, importamos os utilitários que lêem variáveis
-from utils.frase import gerar_prompt_paisagem, gerar_frase_motivacional, gerar_slug
+from utils.frase import (
+    gerar_prompt_paisagem,
+    gerar_frase_motivacional,
+    gerar_slug,
+    gerar_hashtags_virais,   # <- NOVO
+)
 from utils.imagem import gerar_imagem_com_frase, escrever_frase_na_imagem, montar_slides_pexels
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
@@ -103,6 +109,41 @@ IMAGENS_SLIDES_TXT = os.path.join(IMAGENS_DIR, "slides_txt")
 AUDIOS_DIR = "audios"
 AUDIOS_TTS_DIR = os.path.join(AUDIOS_DIR, "tts")
 CACHE_DIR = "cache"
+
+# ====== Hashtags: usar sempre as do Gemini ======
+HASHTAGS_TOP_N = 3  # quantidade fixa que vamos usar
+
+def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N):
+    """
+    Aceita lista ou string; garante prefixo '#', remove duplicadas e limita a k.
+    """
+    out = []
+    seen = set()
+
+    def _push(h: str):
+        h = (h or "").strip()
+        if not h:
+            return
+        if not h.startswith("#"):
+            h = "#" + re.sub(r"^\W+", "", h)
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+
+    if isinstance(hashtags, str):
+        # tenta extrair #palavras; se não houver, divide por espaços
+        found = re.findall(r"#\w+", hashtags)
+        tokens = found if found else re.split(r"\s+", hashtags.strip())
+        for t in tokens:
+            _push(t)
+    else:
+        try:
+            for t in hashtags:
+                _push(str(t))
+        except Exception:
+            pass
+
+    return out[:k]
 
 # --------------------- limpeza ---------------------
 def _safe_unlink(path: str):
@@ -375,6 +416,17 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         prompt_imagem = gerar_prompt_paisagem(idioma)
         frase = gerar_frase_motivacional(idioma)
 
+    # 0) Hashtags virais SEMPRE pelo Gemini (simples, sem env)
+    try:
+        hashtags_raw = gerar_hashtags_virais(frase, idioma=idioma, n=HASHTAGS_TOP_N)
+        hashtags_list = _normalize_hashtags(hashtags_raw, k=HASHTAGS_TOP_N)  # ok manter; é redundante mas inofensivo
+        desc_tiktok = (frase + (" " + " ".join(hashtags_list) if hashtags_list else "")).strip()
+    except Exception as e:
+        logger.warning("Falha ao gerar hashtags (seguirei sem): %s", e)
+        hashtags_list = []
+
+    logger.info("🏷️ Hashtags (Gemini): %s", " ".join(hashtags_list) if hashtags_list else "(nenhuma)")
+
     slug_img = gerar_slug(prompt_imagem)
     slug_frase = gerar_slug(frase)
     imagem_base = os.path.join(IMAGENS_DIR, f"{slug_img}.jpg")
@@ -419,7 +471,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         gerar_video(
             imagem_capa,
             video_final,
-            preset="hd",
+            preset="fullhd",
             idioma=idioma,
             tts_engine=tts_engine,
             legendas=legendas,
@@ -434,7 +486,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         gerar_video(
             imagem_capa,
             video_final,
-            preset="hd",
+            preset="fullhd",
             idioma=idioma,
             tts_engine=tts_engine,
             legendas=legendas,
@@ -451,10 +503,11 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
     except Exception as e:
         logger.warning("Falha na limpeza pré-post: %s", e)
 
-    # 4) TikTok
+    # 4) TikTok — descrição = frase + hashtags do Gemini
     try:
+        desc_tiktok = (frase + (" " + " ".join(hashtags_list) if hashtags_list else "")).strip()
         ok = postar_no_tiktok_e_renomear(
-            descricao_personalizada=frase,
+            descricao_personalizada=desc_tiktok,
             imagem_base=imagem_base,
             imagem_final=imagem_capa,
             video_final=video_final,

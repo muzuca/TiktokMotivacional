@@ -26,7 +26,6 @@ PASTA_AUDIOS = "audios"
 _STRIP_FLAG = os.getenv("STRIP_MARKDOWN_IN_DESC", "1").strip().lower()
 STRIP_MARKDOWN_IN_DESC = _STRIP_FLAG not in ("0", "false", "no", "off")
 
-
 def _normalizar_idioma(v: Optional[str]) -> str:
     """Normaliza a entrada do idioma para 'en', 'pt-br', 'ar' ou 'auto'."""
     s = (v or "").strip().lower()
@@ -38,44 +37,52 @@ def _normalizar_idioma(v: Optional[str]) -> str:
         return "ar"
     return "auto"
 
+# --- helper para deduplicar hashtags mantendo ordem ---
+_HASHTAG_RE = re.compile(r'(?<!\S)#([^\s#]+)', flags=re.UNICODE)
 
-_MD_PATTERNS = (
-    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),   # **bold**
-    (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),   # *italic*
-    (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),   # __underline__
-    (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),   # _italic_
-    (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),   # ~~strike~~
-    (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),   # `code`
-)
+def _dedupe_hashtags_in_desc(desc: str, max_n: Optional[int] = None) -> str:
+    """
+    Remove hashtags duplicadas (case-insensitive) mantendo a ordem da 1ª ocorrência.
+    Remove as hashtags do corpo e as recoloca no final, já deduplicadas.
+    """
+    if not desc:
+        return ""
 
-def _strip_markdown(texto: str) -> str:
-    """Remove marcações básicas de Markdown e normaliza espaços."""
-    s = (texto or "")
-    for pat, rep in _MD_PATTERNS:
-        s = pat.sub(rep, s)
-    # Normaliza aspas “ ” ’
-    s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
-    # Colapsa espaços múltiplos
-    s = re.sub(r"\s{2,}", " ", s)
-    return s.strip()
+    # captura todas as hashtags (com #)
+    tags_encontradas = ["#" + m.group(1) for m in _HASHTAG_RE.finditer(desc)]
 
+    # dedup (case-insensitive) preservando ordem
+    seen = set()
+    ordered = []
+    for t in tags_encontradas:
+        k = t.lower()
+        if k not in seen and len(t) > 1:
+            seen.add(k)
+            ordered.append(t)
+
+    if isinstance(max_n, int) and max_n >= 0:
+        ordered = ordered[:max_n]
+
+    # remove do texto base e recoloca no final
+    base = _HASHTAG_RE.sub("", desc)
+    base = re.sub(r"\s{2,}", " ", base).strip()
+
+    return (base + " " + " ".join(ordered)).strip() if ordered else base
+
+# ------------------------------------------------------
 
 def obter_ultimo_video(pasta=PASTA_VIDEOS):
-    """
-    Encontra o vídeo mais recente na pasta de vídeos (baseado na data de modificação).
-    """
+    """Encontra o vídeo mais recente na pasta de vídeos (baseado na data de modificação)."""
     try:
         arquivos = [os.path.join(pasta, f) for f in os.listdir(pasta) if f.endswith(".mp4")]
         if not arquivos:
             raise FileNotFoundError(f"❌ Nenhum vídeo novo encontrado em {pasta}.")
-        
         ultimo_video = max(arquivos, key=os.path.getmtime)
         logger.info("📹 Último vídeo encontrado: %s", ultimo_video)
         return ultimo_video
     except Exception as e:
         logger.error("❌ Erro ao buscar último vídeo: %s", str(e))
         return None
-
 
 def postar_no_tiktok_e_renomear(
     descricao_personalizada=None,
@@ -119,19 +126,7 @@ def postar_no_tiktok_e_renomear(
         return False
 
     try:
-        # Hashtags conforme idioma (env-first)
-        hashtags_en = os.getenv("HASHTAGS_EN", " #Motivation #Inspiration #TikTokMotivational")
-        hashtags_pt = os.getenv("HASHTAGS_PT_BR", " #Motivacao #Inspiracao #TikTokMotivacional")
-        hashtags_ar = os.getenv("HASHTAGS_AR_EG", " #تاروت #قراءة_تاروت #ابراج #طاقة #توقعات")
-
-        if idioma_norm == "pt-br":
-            hashtags = hashtags_pt
-        elif idioma_norm == "ar":
-            hashtags = hashtags_ar
-        else:
-            hashtags = hashtags_en
-
-        # Monta a descrição e limpa markdown, se habilitado
+        # Descrição base: vem do main já com hashtags do Gemini
         if descricao_personalizada:
             base_desc = descricao_personalizada
         else:
@@ -142,13 +137,15 @@ def postar_no_tiktok_e_renomear(
             else:
                 base_desc = "Motivational content of the day!"
 
+        # Limpa markdown, se habilitado
         if STRIP_MARKDOWN_IN_DESC:
             cleaned = _strip_markdown(base_desc)
             if cleaned != base_desc:
                 logger.debug("🧹 Limpando markdown da descrição: '%s' -> '%s'", base_desc, cleaned)
             base_desc = cleaned
 
-        description = (base_desc + " " + hashtags).strip()
+        # >>> Sem hashtags fixas. Apenas deduplica as que já vieram (ex.: do Gemini via main.py)
+        description = _dedupe_hashtags_in_desc(base_desc)  # se quiser limitar: max_n=3
 
         schedule = None
         if agendar:
@@ -217,3 +214,25 @@ def postar_no_tiktok_e_renomear(
     finally:
         logger.info("⏳ Aguardando 5 segundos antes de finalizar...")
         time.sleep(5)
+
+# Removida a leitura de variáveis HASHTAGS_* e a concatenação de hashtags fixas.
+
+_MD_PATTERNS = (
+    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),   # **bold**
+    (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),   # *italic*
+    (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),   # __underline__
+    (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),   # _italic_
+    (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),   # ~~strike~~
+    (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),   # `code`
+)
+
+def _strip_markdown(texto: str) -> str:
+    """Remove marcações básicas de Markdown e normaliza espaços."""
+    s = (texto or "")
+    for pat, rep in _MD_PATTERNS:
+        s = pat.sub(rep, s)
+    # Normaliza aspas “ ” ’
+    s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
+    # Colapsa espaços múltiplos
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()

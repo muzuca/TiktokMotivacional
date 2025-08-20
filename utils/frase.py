@@ -161,6 +161,109 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
     return "".join(tokens)
 
 # -----------------------------------------------------------------------------#
+# Hashtags virais (NOVO)
+# -----------------------------------------------------------------------------#
+def _sanitize_hashtag(tag: str, lang: str) -> str:
+    """Normaliza uma hashtag: começa com '#', remove espaços e símbolos.
+       Em PT/EN remove acentuação; em AR mantém script árabe."""
+    if not tag:
+        return ""
+    t = tag.strip()
+    if t.startswith("#"):
+        t = t[1:]
+    # tirar espaços/pontuação
+    t = re.sub(r"\s+", "", t)
+    # em PT/EN, remover acentos e não-alfanumérico
+    if lang in ("pt", "en"):
+        t = unicodedata.normalize("NFD", t)
+        t = t.encode("ascii", "ignore").decode("ascii")
+        t = re.sub(r"[^A-Za-z0-9_]", "", t)
+        t = t.lower()
+    else:
+        # em árabe: remover apenas símbolos estranhos e números ocidentais repetidos
+        t = re.sub(r"[^\w\u0600-\u06FF_]+", "", t, flags=re.UNICODE)
+    t = t[:30]  # limite de segurança
+    return f"#{t}" if t else ""
+
+def _dedupe_hashtags(tags: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for t in tags:
+        key = t.lower()
+        if t and key not in seen:
+            seen.add(key)
+            out.append(t)
+    return out
+
+def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3, plataforma: str = "tiktok") -> List[str]:
+    """
+    Retorna N hashtags virais para o conteúdo informado, no idioma desejado,
+    priorizando TikTok. Usa Gemini e normaliza o resultado.
+    """
+    lang = _lang_tag(idioma)
+    n = max(1, int(n or 3))
+
+    if not os.getenv("GEMINI_API_KEY"):
+        logger.warning("GEMINI_API_KEY ausente — usando fallback de hashtags.")
+        if lang == "pt":
+            base = ["#motivacao", "#inspiracao", "#mindset"]
+        elif lang == "ar":
+            base = ["#تحفيز", "#الهام", "#عقلية"]
+        else:
+            base = ["#motivation", "#inspiration", "#mindset"]
+        return base[:n]
+
+    # Prompt no idioma certo
+    if lang == "pt":
+        prompt = (
+            f"Você é um especialista em crescimento no TikTok. "
+            f"Dado o conteúdo abaixo, gere EXATAMENTE {n} hashtags curtas e virais "
+            f"em português do Brasil, específicas para esse conteúdo. "
+            f"Sem explicações. Não inclua espaços, pontuação nem emojis. "
+            f"Evite acentos nas hashtags (use 'motivacao', não 'motivação'). "
+            f"Retorne APENAS um array JSON de strings iniciadas por #.\n\n"
+            f"CONTEÚDO:\n{conteudo.strip()[:1000]}"
+        )
+    elif lang == "ar":
+        prompt = (
+            f"أنت خبير نمو على تيك توك. "
+            f"بناءً على المحتوى أدناه، أنشئ بالضبط {n} وسوماً قصيرة ورائجة "
+            f"ومناسبة للمحتوى، باللغة العربية. "
+            f"بدون شروح. لا مسافات أو علامات ترقيم أو رموز. "
+            f"أعد فقط مصفوفة JSON من سلاسل تبدأ بـ #.\n\n"
+            f"المحتوى:\n{conteudo.strip()[:1000]}"
+        )
+    else:
+        prompt = (
+            f"You are a TikTok growth expert. "
+            f"Given the content below, generate EXACTLY {n} short, viral, content-specific hashtags "
+            f"in English. No explanations. No spaces, punctuation, or emojis. "
+            f"Return ONLY a JSON array of strings starting with #.\n\n"
+            f"CONTENT:\n{conteudo.strip()[:1000]}"
+        )
+
+    raw_list = _ask_json_list(prompt, temperature=0.9, tries=3)
+    # Sanitiza + deduplica
+    tags = [_sanitize_hashtag(t, lang) for t in raw_list]
+    tags = [t for t in tags if len(t) >= 2]
+    tags = _dedupe_hashtags(tags)
+    if len(tags) < n:
+        # completa com fallback
+        fallback = []
+        if lang == "pt":
+            fallback = ["#motivacao", "#inspiracao", "#mindset", "#disciplina", "#foco"]
+        elif lang == "ar":
+            fallback = ["#تحفيز", "#الهام", "#انجاز", "#انضباط", "#تركيز"]
+        else:
+            fallback = ["#motivation", "#inspiration", "#mindset", "#discipline", "#focus"]
+        for f in fallback:
+            if len(tags) >= n:
+                break
+            if f.lower() not in {x.lower() for x in tags}:
+                tags.append(f)
+    return tags[:n]
+
+# -----------------------------------------------------------------------------#
 # Geradores (Motivacional – existentes)
 # -----------------------------------------------------------------------------#
 def gerar_prompt_paisagem(idioma: str = "en") -> str:
