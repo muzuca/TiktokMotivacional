@@ -1,4 +1,4 @@
-# main.py
+# main.py — menu em 3 etapas + roteamento; Veo3 fica todo em utils/veo3.py
 import os
 import sys
 import time
@@ -7,7 +7,16 @@ from datetime import datetime, timedelta
 import random
 import shutil
 from glob import glob
-import re  # <- para normalizar hashtags
+import re  # normalização de hashtags
+from concurrent.futures import ProcessPoolExecutor, TimeoutError
+import multiprocessing
+import atexit
+import faulthandler
+
+try:
+    import psutil  # opcional (recomendado)
+except Exception:
+    psutil = None
 
 # === Ajusta CWD quando empacotado para ler .env/cookies ao lado do .exe ===
 if getattr(sys, 'frozen', False):
@@ -15,16 +24,6 @@ if getattr(sys, 'frozen', False):
         os.chdir(os.path.dirname(sys.executable))
     except Exception:
         pass
-
-# ====== Robustez extra (timeout/cleanup/watchdog) ======
-from concurrent.futures import ProcessPoolExecutor, TimeoutError
-import multiprocessing
-import atexit
-import faulthandler
-try:
-    import psutil  # opcional (recomendado)
-except Exception:
-    psutil = None
 
 # >>> Carrega o .env o mais cedo possível e com override
 from dotenv import load_dotenv, find_dotenv
@@ -36,20 +35,28 @@ from utils.frase import (
     gerar_prompt_paisagem,
     gerar_frase_motivacional,
     gerar_slug,
-    gerar_hashtags_virais,   # <- NOVO
+    gerar_hashtags_virais,
 )
 from utils.imagem import gerar_imagem_com_frase, escrever_frase_na_imagem, montar_slides_pexels
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
-# (Tarot – Fase 4: se já existir, usa; senão, mantém motivacional)
+# (Tarot – se existir)
 try:
     from utils.frase import gerar_prompt_tarot, gerar_frase_tarot_curta
     _HAVE_TAROT_FUNCS = True
 except Exception:
     _HAVE_TAROT_FUNCS = False
 
-# LOG_LEVEL do .env (INFO default)
+# (Veo3 – toda a lógica fica neste módulo; o main só encaminha)
+try:
+    from utils.veo3 import executar_interativo as veo3_executar_interativo
+    from utils.veo3 import postar_em_intervalo as veo3_postar_em_intervalo
+    _HAVE_VEO3 = True
+except Exception:
+    _HAVE_VEO3 = False
+
+# ====== LOG ======
 LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -86,6 +93,7 @@ try:
 except Exception as _e:
     logger.debug("Watchdog desativado: %s", _e)
 
+# ====== Opções visuais do pipeline atual ======
 STYLE_OPTIONS = {
     "1": ("classic", "Clássico legível (Montserrat/Inter, branco + stroke)"),
     "2": ("modern",  "Modernão (Bebas/Alta, caps, discreto)"),
@@ -93,7 +101,6 @@ STYLE_OPTIONS = {
     "4": ("mono",    "Monoespaçada minimalista"),
     "5": ("clean",   "Clean sem stroke (peso médio)"),
 }
-
 MOTION_OPTIONS = {
     "1": ("none",          "Sem movimento"),
     "2": ("kenburns_in",   "Zoom in (Ken Burns)"),
@@ -102,7 +109,6 @@ MOTION_OPTIONS = {
     "5": ("pan_ud",        "Pan up→down"),
     "0": ("random",        "Aleatório (entre movimentos)"),
 }
-
 DEFAULT_SLIDES_COUNT = int(os.getenv("SLIDES_COUNT", "4"))
 IMAGENS_DIR = "imagens"
 IMAGENS_SLIDES_TXT = os.path.join(IMAGENS_DIR, "slides_txt")
@@ -110,39 +116,28 @@ AUDIOS_DIR = "audios"
 AUDIOS_TTS_DIR = os.path.join(AUDIOS_DIR, "tts")
 CACHE_DIR = "cache"
 
-# ====== Hashtags: usar sempre as do Gemini ======
-HASHTAGS_TOP_N = 3  # quantidade fixa que vamos usar
+# ====== Hashtags (sempre 3) ======
+HASHTAGS_TOP_N = 3
 
 def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N):
-    """
-    Aceita lista ou string; garante prefixo '#', remove duplicadas e limita a k.
-    """
-    out = []
-    seen = set()
-
+    """Garante prefixo '#', remove duplicadas e limita a k."""
+    out, seen = [], set()
     def _push(h: str):
         h = (h or "").strip()
-        if not h:
-            return
+        if not h: return
         if not h.startswith("#"):
             h = "#" + re.sub(r"^\W+", "", h)
         if h not in seen:
-            seen.add(h)
-            out.append(h)
-
+            seen.add(h); out.append(h)
     if isinstance(hashtags, str):
-        # tenta extrair #palavras; se não houver, divide por espaços
         found = re.findall(r"#\w+", hashtags)
         tokens = found if found else re.split(r"\s+", hashtags.strip())
-        for t in tokens:
-            _push(t)
+        for t in tokens: _push(t)
     else:
         try:
-            for t in hashtags:
-                _push(str(t))
+            for t in hashtags: _push(str(t))
         except Exception:
             pass
-
     return out[:k]
 
 # --------------------- limpeza ---------------------
@@ -155,31 +150,26 @@ def _safe_unlink(path: str):
         logger.debug("não consegui remover '%s': %s", path, e)
 
 def _limpar_pre_post(imagem_base: str, imagem_capa: str):
-    # 1) audios raiz e tts
+    # 1) áudios
     for d in (AUDIOS_TTS_DIR, AUDIOS_DIR):
         if os.path.isdir(d):
             for nome in os.listdir(d):
                 p = os.path.join(d, nome)
                 if os.path.isfile(p):
                     _safe_unlink(p)
-
-    # 2) cache/*.txt
+    # 2) cache
     if os.path.isdir(CACHE_DIR):
         for txt in glob(os.path.join(CACHE_DIR, "*.txt")):
             _safe_unlink(txt)
-
-    # 3) imagens/slides_txt (diretório inteiro)
+    # 3) imagens/slides_txt
     shutil.rmtree(IMAGENS_SLIDES_TXT, ignore_errors=True)
-
     # 4) imagens/* exceto capa e base
     keep = {os.path.abspath(imagem_base), os.path.abspath(imagem_capa)}
     if os.path.isdir(IMAGENS_DIR):
         for nome in os.listdir(IMAGENS_DIR):
             p = os.path.join(IMAGENS_DIR, nome)
-            if os.path.isdir(p):
-                continue
-            if os.path.abspath(p) in keep:
-                continue
+            if os.path.isdir(p): continue
+            if os.path.abspath(p) in keep: continue
             _safe_unlink(p)
 
 def _limpar_pos_post(imagem_base: str, imagem_capa: str):
@@ -193,23 +183,19 @@ def _cleanup_browsers(policy: str = None):
     policy = (policy or CHROME_CLEANUP_POLICY).strip().lower()
     if policy not in {"none", "drivers_only", "children", "match", "all"}:
         policy = "drivers_only"
-
     killed = 0
     for p in psutil.process_iter(attrs=["pid", "name", "cmdline", "ppid"]):
         try:
             name = (p.info.get("name") or "").lower()
             if "chromedriver" in name:
                 if policy in {"drivers_only", "children", "match", "all"}:
-                    p.kill()
-                    killed += 1
+                    p.kill(); killed += 1
                 continue
-
-            if "chrome" == name or name == "chrome.exe" or name.startswith("chrome"):
-                if policy == "none" or policy == "drivers_only":
+            if "chrome" == name or name.startswith("chrome"):
+                if policy in {"none", "drivers_only"}:
                     continue
                 if policy == "all":
                     p.kill(); killed += 1; continue
-
                 if policy == "children":
                     try:
                         parents = p.parents()
@@ -218,7 +204,6 @@ def _cleanup_browsers(policy: str = None):
                     if any("chromedriver" in (pp.name() or "").lower() for pp in parents):
                         p.kill(); killed += 1
                     continue
-
                 if policy == "match" and CHROME_KILL_MATCH:
                     cmd = " ".join(p.info.get("cmdline") or [])
                     if CHROME_KILL_MATCH.lower() in cmd.lower():
@@ -228,11 +213,8 @@ def _cleanup_browsers(policy: str = None):
             continue
         except Exception:
             continue
-
     if killed:
         logger.info("🧹 Cleanup browsers (%s): %d processo(s) finalizado(s).", policy, killed)
-    else:
-        logger.debug("🧹 Cleanup browsers (%s): nada a fazer.", policy)
 
 def _run_rotina_once(args_tuple) -> bool:
     try:
@@ -275,7 +257,14 @@ def _executar_com_timeout(args_tuple) -> bool:
             dur = time.time() - start
             logging.info("⏲️ Duração do ciclo: %.1fs", dur)
 
-# --------------------- UI ---------------------
+# --------------------- UI (menus) ---------------------
+def _menu_modo_execucao() -> str:
+    print("\nO que você deseja fazer?")
+    print("1. Postar agora (uma vez) *padrão")
+    print("2. Postar automaticamente a cada X horas")
+    op = input("Escolha 1 ou 2: ").strip()
+    return op if op in ("1","2") else "1"
+
 def _selecionar_idioma() -> str:
     print("\nEscolha o país para referência da língua das mensagens:")
     print("1. EUA (Inglês) *padrão")
@@ -285,28 +274,38 @@ def _selecionar_idioma() -> str:
     if op not in ("1", "2", "3"):
         print("Opção inválida! Usando EUA (Inglês) como padrão.")
         op = "1"
-    return "en" if op == "1" else ("pt-br" if op == "2" else "ar")
+    return "en" if op == "1" else ("pt-br" if op == "2" else "ar-eg")
 
-def _selecionar_modo_conteudo() -> str:
-    env_default = (os.getenv("CONTENT_MODE", "motivacional") or "motivacional").strip().lower()
-    padr = "Motivacional" if env_default != "tarot" else "Cartomante"
-    print("\nEscolha o tipo de conteúdo:")
-    print(f"1. Motivacional {'*padrão' if env_default != 'tarot' else ''}")
-    print(f"2. Cartomante {'*padrão' if env_default == 'tarot' else ''}")
-    op = input("Digite o número da opção: ").strip()
-    if op == "2":
-        return "tarot"
-    if op != "1" and env_default in ("motivacional", "tarot"):
-        print(f"Opção inválida! Usando {padr} como padrão.")
-        return env_default
-    return "motivacional"
+def _submenu_conteudo_por_idioma(idioma: str):
+    """
+    Retorna (tipo, persona|None)
+      tipo: 'motivacional' | 'tarot' | 'veo3'
+      persona: 'luisa' | 'yasmina' | None
+    """
+    if idioma == "ar-eg":
+        print("\nSelecione o conteúdo (Árabe):")
+        print("1. Motivacional")
+        print("2. Cartomante")  
+        print("3. Veo3 (Yasmina)")
+        op = input("Digite 1, 2 ou 3: ").strip()
+        if op == "3": return ("veo3", "yasmina")
+        return ("tarot", None) if op == "2" else ("motivacional", None)
 
-def _menu_modo_execucao() -> str:
-    print("\nO que você deseja fazer?")
-    print("1. Postar agora (uma vez) *padrão")
-    print("2. Postar automaticamente a cada X horas")
-    op = input("Escolha uma opção: ").strip()
-    return op if op in ("1","2") else "1"
+    if idioma == "pt-br":
+        print("\nSelecione o conteúdo (Brasil):")
+        print("1. Motivacional")
+        print("2. Cartomante")
+        print("3. Veo3 (Luisa)")
+        op = input("Digite 1, 2 ou 3: ").strip()
+        if op == "3": return ("veo3", "luisa")
+        return ("tarot", None) if op == "2" else ("motivacional", None)
+
+    # en — mantém as duas opções que você já tem hoje
+    print("\nSelecione o conteúdo (EUA):")
+    print("1. Motivacional")
+    print("2. Cartomante")
+    op = input("Digite 1 ou 2: ").strip()
+    return ("tarot", None) if op == "2" else ("motivacional", None)
 
 def _ler_intervalo_horas() -> float:
     while True:
@@ -400,7 +399,7 @@ def _map_video_style_to_image_template(style_key: str) -> str:
         return "modern_block"
     return "minimal_center"
 
-# --------------------- pipeline ---------------------
+# --------------------- pipeline (motivacional/tarot) ---------------------
 def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
     os.makedirs(IMAGENS_DIR, exist_ok=True)
     os.makedirs("videos", exist_ok=True)
@@ -408,7 +407,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
 
     logger.info("Gerando conteúdos (%s | modo=%s)...", idioma, modo_conteudo)
 
-    # Seleção do prompt/frase conforme modo — FALLBACK seguro
+    # prompt/frase
     if modo_conteudo == "tarot" and _HAVE_TAROT_FUNCS:
         prompt_imagem = gerar_prompt_tarot(idioma)
         frase = gerar_frase_tarot_curta(idioma)
@@ -416,16 +415,15 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         prompt_imagem = gerar_prompt_paisagem(idioma)
         frase = gerar_frase_motivacional(idioma)
 
-    # 0) Hashtags virais SEMPRE pelo Gemini (simples, sem env)
+    # hashtags
     try:
         hashtags_raw = gerar_hashtags_virais(frase, idioma=idioma, n=HASHTAGS_TOP_N)
-        hashtags_list = _normalize_hashtags(hashtags_raw, k=HASHTAGS_TOP_N)  # ok manter; é redundante mas inofensivo
+        hashtags_list = _normalize_hashtags(hashtags_raw, k=HASHTAGS_TOP_N)
         desc_tiktok = (frase + (" " + " ".join(hashtags_list) if hashtags_list else "")).strip()
     except Exception as e:
         logger.warning("Falha ao gerar hashtags (seguirei sem): %s", e)
         hashtags_list = []
-
-    logger.info("🏷️ Hashtags (Gemini): %s", " ".join(hashtags_list) if hashtags_list else "(nenhuma)")
+        desc_tiktok = frase
 
     slug_img = gerar_slug(prompt_imagem)
     slug_frase = gerar_slug(frase)
@@ -433,13 +431,13 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
     imagem_capa = os.path.join(IMAGENS_DIR, f"{slug_frase}.jpg")
     video_final = os.path.join("videos", f"{slug_frase}.mp4")
 
-    # 1) capa
+    # capa
     gerar_imagem_com_frase(prompt=prompt_imagem, arquivo_saida=imagem_base)
     template_img = _map_video_style_to_image_template(video_style)
     logger.info("🖌️ Template da imagem selecionado: %s (derivado de '%s')", template_img, video_style)
     escrever_frase_na_imagem(imagem_base, frase, imagem_capa, template=template_img, idioma=idioma)
 
-    # 2) slides do Pexels e replicar o MESMO texto em todas
+    # slides
     try:
         slides_raw = montar_slides_pexels(prompt_imagem, count=max(1, slides_count), primeira_imagem=imagem_capa)
     except Exception as e:
@@ -466,7 +464,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
 
     logger.info("🖼️ Slides com texto (%d): %s", len(slides_com_texto), " | ".join(slides_com_texto))
 
-    # 3) vídeo — tenta passar content_mode; se a função não aceitar, reexecuta sem quebrar
+    # vídeo
     try:
         gerar_video(
             imagem_capa,
@@ -496,16 +494,15 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
             transition=None
         )
 
-    # >>> Limpeza PRÉ-POST
+    # limpeza pré-post
     try:
         _limpar_pre_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
         logger.info("🧹 Limpeza pré-post concluída.")
     except Exception as e:
         logger.warning("Falha na limpeza pré-post: %s", e)
 
-    # 4) TikTok — descrição = frase + hashtags do Gemini
+    # postar
     try:
-        desc_tiktok = (frase + (" " + " ".join(hashtags_list) if hashtags_list else "")).strip()
         ok = postar_no_tiktok_e_renomear(
             descricao_personalizada=desc_tiktok,
             imagem_base=imagem_base,
@@ -517,7 +514,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         ok = False
         logger.exception("❌ Falha ao postar no TikTok: %s", e)
 
-    # >>> Limpeza PÓS-POST
+    # limpeza pós-post
     try:
         if ok:
             _limpar_pos_post(imagem_base=imagem_base, imagem_capa=imagem_capa)
@@ -528,47 +525,33 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         logger.warning("Falha na limpeza pós-post: %s", e)
 
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
-    """
-    Dispara a rotina a cada X horas usando *relógio real* (robusto a sleep/hibernação).
-    Mantém a cadência com base no horário de INÍCIO do ciclo anterior.
-    """
+    """Executa a rotina a cada X horas usando relógio real (robusto a sleep/hibernação)."""
     logger.info("⏱️ Modo automático: a cada %.2f horas (Ctrl+C para parar).", cada_horas)
     intervalo = float(cada_horas) * 3600.0
-
     try:
         while True:
             inicio = datetime.now()
             logger.info("🟢 Nova execução (%s).", inicio.strftime("%d/%m %H:%M:%S"))
-
             ok = _executar_com_timeout((modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count))
-
-            # Próximo alvo fixo a partir do INÍCIO do ciclo
             proxima = inicio + timedelta(seconds=intervalo)
-
-            # Log imediato já com base no relógio
             rem_now = max(0.0, (proxima - datetime.now()).total_seconds())
-            logger.info("✅ Execução %s. ⏳ Próxima em ~%.0f min.",
-                        "ok" if ok else "com falha", rem_now / 60)
-
-            # Espera até a hora do próximo ciclo, recalculando sempre pelo relógio
+            logger.info("✅ Execução %s. ⏳ Próxima em ~%.0f min.", "ok" if ok else "com falha", rem_now / 60)
             last_hb_ts = time.time()
             while True:
                 now = datetime.now()
                 rem = (proxima - now).total_seconds()
-
                 if rem <= 0:
-                    break  # chegou a hora do próximo ciclo
-
+                    break
                 step = min(30.0, rem)
                 time.sleep(max(0.1, step))
-
                 if HEARTBEAT_SECS > 0.0 and (time.time() - last_hb_ts) >= HEARTBEAT_SECS:
-                    logger.info("⏳ Em execução. Faltam ~%.0f min para o próximo ciclo (alvo: %s).",
-                                max(0.0, rem) / 60, proxima.strftime("%d/%m %H:%M:%S"))
+                    logger.info("⏳ Em execução. Faltam ~%.0f min (alvo: %s).",
+                                max(0.0, rem) / 60, proxima.strftime("%d/%m %Y %H:%M:%S"))
                     last_hb_ts = time.time()
     except KeyboardInterrupt:
         logger.info("🛑 Automático interrompido.")
 
+# --------------------- MAIN ---------------------
 if __name__ == "__main__":
     # Necessário no Windows quando empacotado
     try:
@@ -581,10 +564,33 @@ if __name__ == "__main__":
     if env_motion not in valid_motions:
         env_motion = "none"
 
-    # === Sequência do menu (conforme solicitado) ===
-    idioma = _selecionar_idioma()
-    modo_conteudo = _selecionar_modo_conteudo()
+    # === 1) Ação: postar agora ou automático ===
     modo_exec = _menu_modo_execucao()
+
+    # === 2) Idioma ===
+    idioma = _selecionar_idioma()
+
+    # === 3) Conteúdo dependente do idioma (e desvio p/ Veo3) ===
+    tipo, persona = _submenu_conteudo_por_idioma(idioma)
+
+    # ---------------- Veo3: o main apenas encaminha ----------------
+    if tipo == "veo3":
+        if not _HAVE_VEO3:
+            print("\n❌ O módulo utils/veo3.py não foi encontrado. Crie-o e exponha:")
+            print("   - executar_interativo(persona: str, idioma: str) -> None")
+            print("   - postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None")
+            sys.exit(1)
+
+        if modo_exec == "2":
+            # modo automático para Veo3: o módulo veo3 cuida do loop e dos prompts (assunto, #cenas etc.)
+            intervalo_horas = _ler_intervalo_horas()
+            veo3_postar_em_intervalo(persona=persona, idioma=idioma, cada_horas=intervalo_horas)
+        else:
+            # modo "postar agora": o módulo veo3 faz as perguntas específicas (assunto, #cenas, teste da 1ª cena etc.)
+            veo3_executar_interativo(persona=persona, idioma=idioma)
+        sys.exit(0)
+
+    # ---------------- Pipeline atual (motivacional/tarot) ----------------
     if modo_exec == "2":
         intervalo_horas = _ler_intervalo_horas()
     else:
@@ -596,7 +602,7 @@ if __name__ == "__main__":
     motion = _selecionar_motion(env_motion)
     slides_count = _selecionar_qtd_fotos(DEFAULT_SLIDES_COUNT)
 
-    args_tuple = (modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count)
+    args_tuple = (tipo, idioma, tts_engine, legendas, video_style, motion, slides_count)
 
     if modo_exec == "1":
         _executar_com_timeout(args_tuple)
