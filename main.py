@@ -1,4 +1,3 @@
-# main.py — menu em 3 etapas + roteamento; Veo3 fica todo em utils/veo3.py
 import os
 import sys
 import time
@@ -66,6 +65,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ====== Config de robustez via .env ======
+def _int_env(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(v) if v is not None and str(v).strip() != "" else default
+    except Exception:
+        return default
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v is not None and str(v).strip() != "" else default
+    except Exception:
+        return default
+
 ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))   # timeout duro por execução
 HANG_WATCHDOG_SECS    = int(float(os.getenv("HANG_WATCHDOG_SECS", "600")))  # dump de stack periódico
 
@@ -178,6 +191,10 @@ def _limpar_pos_post(imagem_base: str, imagem_capa: str):
 
 # --------------------- helpers robustez ---------------------
 def _cleanup_browsers(policy: str = None):
+    """
+    Mantém o comportamento seguro: por padrão, fecha apenas chromedrivers (policy=drivers_only).
+    Outras políticas (children/match/all) continuam disponíveis via .env, mas não são o default.
+    """
     if not psutil:
         return
     policy = (policy or CHROME_CLEANUP_POLICY).strip().lower()
@@ -256,6 +273,42 @@ def _executar_com_timeout(args_tuple) -> bool:
         finally:
             dur = time.time() - start
             logging.info("⏲️ Duração do ciclo: %.1fs", dur)
+
+# ========================= JITTER “HUMANO” =========================
+HUMAN_JITTER_MIN_SEC  = _int_env("HUMAN_INTERVAL_JITTER_MIN_SEC", -900)  # -15min
+HUMAN_JITTER_MAX_SEC  = _int_env("HUMAN_INTERVAL_JITTER_MAX_SEC",  900)  # +15min
+START_JITTER_MIN_SEC  = _int_env("HUMAN_START_JITTER_MIN_SEC", 0)        # 0 => desativado
+START_JITTER_MAX_SEC  = _int_env("HUMAN_START_JITTER_MAX_SEC", 0)
+
+def _human_next_interval_seconds(base_hours: float) -> int:
+    """
+    Retorna o intervalo do próximo ciclo em segundos:
+      base_hours*3600  +/- jitter aleatório inteiro em segundos.
+    O jitter é granular (p.ex. 354s, 543s...).
+    """
+    lo = HUMAN_JITTER_MIN_SEC
+    hi = HUMAN_JITTER_MAX_SEC
+    if lo > hi:
+        lo, hi = hi, lo
+    offset = random.randint(lo, hi)
+    base = max(60, int(base_hours * 3600))
+    nxt = base + offset
+    if nxt < 60:
+        nxt = 60
+    return nxt
+
+def _maybe_sleep_start_jitter():
+    lo = max(0, START_JITTER_MIN_SEC)
+    hi = max(0, START_JITTER_MAX_SEC)
+    if hi <= 0:
+        return 0
+    if lo > hi:
+        lo, hi = hi, lo
+    sl = random.randint(lo, hi)
+    if sl > 0:
+        logger.info("⏳ Jitter inicial: aguardando %ds antes do primeiro ciclo...", sl)
+        time.sleep(sl)
+    return sl
 
 # --------------------- UI (menus) ---------------------
 def _menu_modo_execucao() -> str:
@@ -525,17 +578,31 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         logger.warning("Falha na limpeza pós-post: %s", e)
 
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, slides_count: int):
-    """Executa a rotina a cada X horas usando relógio real (robusto a sleep/hibernação)."""
-    logger.info("⏱️ Modo automático: a cada %.2f horas (Ctrl+C para parar).", cada_horas)
-    intervalo = float(cada_horas) * 3600.0
+    """Executa a rotina a cada ~X horas com jitter humano (granular em segundos)."""
+    logger.info("⏱️ Modo automático base: %.2f h (Ctrl+C para parar). Jitter: [%ds, %ds].",
+                cada_horas, HUMAN_JITTER_MIN_SEC, HUMAN_JITTER_MAX_SEC)
+
+    # Jitter inicial opcional (entre execuções paralelas)
+    _maybe_sleep_start_jitter()
+
     try:
         while True:
             inicio = datetime.now()
             logger.info("🟢 Nova execução (%s).", inicio.strftime("%d/%m %H:%M:%S"))
+
             ok = _executar_com_timeout((modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count))
-            proxima = inicio + timedelta(seconds=intervalo)
+
+            # calcula NEXT com jitter em segundos (positivo/negativo)
+            intervalo_next = _human_next_interval_seconds(cada_horas)
+            proxima = inicio + timedelta(seconds=intervalo_next)
+
+            # status
             rem_now = max(0.0, (proxima - datetime.now()).total_seconds())
-            logger.info("✅ Execução %s. ⏳ Próxima em ~%.0f min.", "ok" if ok else "com falha", rem_now / 60)
+            logger.info("✅ Execução %s. ⏳ Próxima em ~%.0f min (~%ds). Alvo: %s",
+                        "ok" if ok else "com falha",
+                        rem_now / 60, int(rem_now), proxima.strftime("%d/%m %Y %H:%M:%S"))
+
+            # espera com heartbeat
             last_hb_ts = time.time()
             while True:
                 now = datetime.now()
@@ -545,8 +612,8 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
                 step = min(30.0, rem)
                 time.sleep(max(0.1, step))
                 if HEARTBEAT_SECS > 0.0 and (time.time() - last_hb_ts) >= HEARTBEAT_SECS:
-                    logger.info("⏳ Em execução. Faltam ~%.0f min (alvo: %s).",
-                                max(0.0, rem) / 60, proxima.strftime("%d/%m %Y %H:%M:%S"))
+                    logger.info("⏳ Em execução. Faltam ~%.0f min (~%ds). Alvo: %s.",
+                                max(0.0, rem) / 60, int(max(0.0, rem)), proxima.strftime("%d/%m %Y %H:%M:%S"))
                     last_hb_ts = time.time()
     except KeyboardInterrupt:
         logger.info("🛑 Automático interrompido.")
@@ -582,11 +649,10 @@ if __name__ == "__main__":
             sys.exit(1)
 
         if modo_exec == "2":
-            # modo automático para Veo3: o módulo veo3 cuida do loop e dos prompts (assunto, #cenas etc.)
+            # modo automático para Veo3: o módulo veo3 cuida do loop/prompts.
             intervalo_horas = _ler_intervalo_horas()
             veo3_postar_em_intervalo(persona=persona, idioma=idioma, cada_horas=intervalo_horas)
         else:
-            # modo "postar agora": o módulo veo3 faz as perguntas específicas (assunto, #cenas, teste da 1ª cena etc.)
             veo3_executar_interativo(persona=persona, idioma=idioma)
         sys.exit(0)
 

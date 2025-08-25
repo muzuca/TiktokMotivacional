@@ -1,5 +1,7 @@
+# utils/tiktok_uploader/browsers.py
 import logging
 import os
+import uuid
 from typing import Optional, Tuple
 
 from dotenv import load_dotenv
@@ -147,6 +149,10 @@ def _mk_seleniumwire_options(
             r".*\.tiktokcdn\.com.*",
             r".*\.ttwstatic\.com.*",
         ],
+        # 👇 evita colisão entre instâncias (proxy interno do Selenium-Wire)
+        "port": 0,
+        "addr": "127.0.0.1",
+        "auto_config": True,
     }
     if use_proxy:
         if host and port:
@@ -164,25 +170,30 @@ def _mk_seleniumwire_options(
             logging.warning("⚠️ want_proxy=True mas PROXY vars ausentes para %s. Caindo para conexão direta.", key)
     return opts
 
-# ---------- cache/perfil por região ----------
+# ---------- cache/perfil por região + instância ----------
 def _norm_region(region: Optional[str]) -> str:
     r = (region or "").strip().upper()
     if r in {"US", "EG", "BR"}:
         return r
     return "DEFAULT"
 
+def _instance_tag() -> str:
+    tag = (os.getenv("INSTANCE_TAG") or "").strip()
+    return tag if tag else uuid.uuid4().hex[:8]
+
 def _profile_roots(region: Optional[str]) -> Tuple[str, str]:
     """
-    Diretórios por região:
+    Diretórios por região E instância:
       - base de perfis: CHROME_PROFILE_BASE (default: chrome_profiles)
       - base de cache:  CHROME_DISK_CACHE_BASE (default: chrome_cache)
-    Gera: <base>/<REGIÃO> (ex.: chrome_profiles/US, chrome_cache/EG)
+    Gera: <base>/<REGIÃO>/<INSTANCE_TAG>
     """
     reg = _norm_region(region)
+    tag = _instance_tag()
     base_profile = os.getenv("CHROME_PROFILE_BASE", "chrome_profiles")
     base_cache   = os.getenv("CHROME_DISK_CACHE_BASE", "chrome_cache")
-    user_data_dir  = os.path.join(base_profile, reg)
-    disk_cache_dir = os.path.join(base_cache, reg)
+    user_data_dir  = os.path.join(base_profile, reg, tag)
+    disk_cache_dir = os.path.join(base_cache, reg, tag)
     os.makedirs(user_data_dir, exist_ok=True)
     os.makedirs(disk_cache_dir, exist_ok=True)
     return user_data_dir, disk_cache_dir
@@ -220,9 +231,9 @@ def get_browser(
     Cria um WebDriver:
     - Se want_proxy=True => Selenium-Wire + proxy upstream (PROXY_* ou PROXY_<REG>_*).
     - Se want_proxy=False => Selenium "puro".
-    - region pode ser 'US', 'EG' ou 'BR' (lê/perfila por região). Se None, usa heurística por idioma.
+    - region pode ser 'US', 'EG' ou 'BR'. Se None, usa heurística por idioma.
     - Define Accept-Language/--lang segundo lang_tag (ou deduz de 'idioma').
-    - Chrome/Edge: perfil e cache persistentes por região.
+    - Chrome/Edge: perfil e cache persistentes por **instância** (evita lock ao rodar em paralelo).
     """
     _silenciar_ruido()
 
@@ -251,8 +262,9 @@ def get_browser(
         options.add_argument("--disable-popup-blocking")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--remote-debugging-pipe")  # 👈 evita porta
         options.add_argument(f"--lang={lang_tag}")
-        # ===== perfil/cache por região =====
+        # ===== perfil/cache por instância =====
         user_data_dir, disk_cache_dir = _profile_roots(region)
         _unlock_profile(user_data_dir)
         options.add_argument(f"--user-data-dir={os.path.abspath(user_data_dir)}")
@@ -275,14 +287,14 @@ def get_browser(
 
             sw_opts = _mk_seleniumwire_options(True, region)
             driver = wire_webdriver.Chrome(
-                service=ChromeService(ChromeDriverManager().install()),
+                service=ChromeService(ChromeDriverManager().install(), port=0),  # 👈 porta aleatória
                 options=options,
                 seleniumwire_options=sw_opts,
             )
         else:
             logging.info("Conexão direta (sem proxy/upstream).")
             driver = std_webdriver.Chrome(
-                service=ChromeService(ChromeDriverManager().install()),
+                service=ChromeService(ChromeDriverManager().install(), port=0),  # 👈 porta aleatória
                 options=options,
             )
 
@@ -293,6 +305,13 @@ def get_browser(
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": "try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e) {}"
             })
+        except Exception:
+            pass
+
+        try:
+            pid = getattr(getattr(driver, "service", None), "process", None)
+            pid = getattr(pid, "pid", None)
+            setattr(driver, "_tm_instance", {"tag": _instance_tag(), "pid": pid})
         except Exception:
             pass
 
@@ -319,14 +338,14 @@ def get_browser(
 
             sw_opts = _mk_seleniumwire_options(True, region)
             return wire_webdriver.Firefox(
-                service=FirefoxService(GeckoDriverManager().install()),
+                service=FirefoxService(GeckoDriverManager().install(), port=0),  # 👈 aleatória
                 options=options,
                 seleniumwire_options=sw_opts,
             )
         else:
             logging.info("Conexão direta (sem proxy/upstream).")
             return std_webdriver.Firefox(
-                service=FirefoxService(GeckoDriverManager().install()),
+                service=FirefoxService(GeckoDriverManager().install(), port=0),  # 👈 aleatória
                 options=options,
             )
 
@@ -334,8 +353,9 @@ def get_browser(
     elif name == "edge":
         if options is None:
             options = EdgeOptions()
+        options.add_argument("--remote-debugging-pipe")
         options.add_argument(f"--lang={lang_tag}")
-        # ===== perfil/cache por região (Edge é Chromium) =====
+        # ===== perfil/cache por instância =====
         user_data_dir, disk_cache_dir = _profile_roots(region)
         _unlock_profile(user_data_dir)
         options.add_argument(f"--user-data-dir={os.path.abspath(user_data_dir)}")
@@ -358,14 +378,14 @@ def get_browser(
 
             sw_opts = _mk_seleniumwire_options(True, region)
             driver = wire_webdriver.Edge(
-                service=EdgeService(EdgeChromiumDriverManager().install()),
+                service=EdgeService(EdgeChromiumDriverManager().install(), port=0),  # 👈 aleatória
                 options=options,
                 seleniumwire_options=sw_opts,
             )
         else:
             logging.info("Conexão direta (sem proxy/upstream).")
             driver = std_webdriver.Edge(
-                service=EdgeService(EdgeChromiumDriverManager().install()),
+                service=EdgeService(EdgeChromiumDriverManager().install(), port=0),  # 👈 aleatória
                 options=options,
             )
 
@@ -376,6 +396,13 @@ def get_browser(
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": "try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e) {}"
             })
+        except Exception:
+            pass
+
+        try:
+            pid = getattr(getattr(driver, "service", None), "process", None)
+            pid = getattr(pid, "pid", None)
+            setattr(driver, "_tm_instance", {"tag": _instance_tag(), "pid": pid})
         except Exception:
             pass
 
