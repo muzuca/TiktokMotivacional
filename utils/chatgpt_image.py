@@ -4,17 +4,14 @@ import time
 import shutil
 import glob
 import logging
+import json
 from PIL import Image
 import undetected_chromedriver as uc
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException, InvalidCookieDomainException
 
 logger = logging.getLogger(__name__)
-
-# Lê as variáveis do .env no topo
-CHROME_PROFILE_PATH = os.getenv("CHROME_USER_PROFILE_PATH", "").strip()
-CHATGPT_HEADLESS = os.getenv("CHATGPT_HEADLESS", "1").strip().lower() in ("1", "true", "yes", "on")
-
 
 def _wait_for_file_download(download_dir: str, timeout: int = 180) -> str:
     """Aguarda um novo arquivo .png ou .webp aparecer na pasta e estar completo."""
@@ -30,9 +27,8 @@ def _wait_for_file_download(download_dir: str, timeout: int = 180) -> str:
             valid_new_files = [f for f in new_files if not f.endswith(('.tmp', '.crdownload'))]
             if valid_new_files:
                 latest_file = max(valid_new_files, key=os.path.getmtime)
-                time.sleep(2.5) # Espera para garantir que a escrita terminou
-                size = os.path.getsize(latest_file)
-                if size > 1024:  # > 1KB
+                time.sleep(2.5)
+                if os.path.exists(latest_file) and os.path.getsize(latest_file) > 1024:
                     logger.info(f"Download concluído: {os.path.basename(latest_file)}")
                     return latest_file
         time.sleep(1)
@@ -41,62 +37,86 @@ def _wait_for_file_download(download_dir: str, timeout: int = 180) -> str:
 
 def gerar_imagem_chatgpt(prompt: str, cookies_path: str, arquivo_saida: str) -> bool:
     """
-    Usa undetected-chromedriver e um perfil de usuário para gerar uma imagem no ChatGPT.
+    Usa um navegador limpo e injeta cookies para autenticação.
     """
-    if not CHROME_PROFILE_PATH:
-        raise ValueError("CHROME_USER_PROFILE_PATH não está definido no arquivo .env. Este caminho é necessário.")
-
-    logger.info(f"Usando perfil do Chrome em: {CHROME_PROFILE_PATH}")
-
+    headless = os.getenv("CHATGPT_HEADLESS", "1").strip().lower() in ("1", "true", "yes", "on")
     temp_download_dir = os.path.abspath(os.path.join("cache", "chatgpt_downloads"))
     os.makedirs(temp_download_dir, exist_ok=True)
 
     opts = uc.ChromeOptions()
     opts.add_argument("--log-level=3")
-    # --- NOVA LINHA PARA DEFINIR O TAMANHO DA JANELA ---
-    opts.add_argument("--window-size=800,900") # Largura x Altura
+    # A linha --window-size foi removida daqui, pois não é confiável.
     opts.add_experimental_option("prefs", {
         "download.default_directory": temp_download_dir
     })
 
     driver = None
     try:
-        logger.info(f"Iniciando automação do ChatGPT (Headless: {CHATGPT_HEADLESS})...")
-        driver = uc.Chrome(options=opts, user_data_dir=CHROME_PROFILE_PATH, headless=CHATGPT_HEADLESS, use_subprocess=True)
+        logger.info(f"Iniciando automação com cookies (Headless: {headless})...")
+        driver = uc.Chrome(options=opts, headless=headless)
         
-        driver.get("https://chatgpt.com/")
-        logger.info("Página do ChatGPT carregada com sucesso.")
+        # --- CORREÇÃO DEFINITIVA PARA O TAMANHO DA JANELA ---
+        # Este comando é executado após o navegador iniciar, sendo mais confiável.
+        logger.info("Redimensionando a janela para 800x600...")
+        driver.set_window_size(800, 600)
+        # --- FIM DA CORREÇÃO ---
 
-        logger.info("Aguardando o campo de texto (div contenteditable)...")
-        prompt_textarea = WebDriverWait(driver, 45).until(
+        driver.set_page_load_timeout(60)
+        
+        logger.info("Navegando para o ChatGPT...")
+        driver.get("https://chatgpt.com/")
+        time.sleep(2)
+
+        if not os.path.exists(cookies_path) or os.path.getsize(cookies_path) < 10:
+             raise FileNotFoundError(f"Arquivo de cookies '{cookies_path}' não encontrado ou vazio. Execute 'python setup_cookies.py' para criá-lo.")
+        
+        try:
+            with open(cookies_path, 'r', encoding='utf-8') as f:
+                cookies = json.load(f)
+        except json.JSONDecodeError:
+            logger.error(f"ERRO CRÍTICO: O arquivo '{cookies_path}' não está no formato JSON válido.")
+            raise ValueError(f"Formato de cookie inválido. Execute 'python setup_cookies.py' para gerar o arquivo correto.")
+
+        logger.info(f"Carregando {len(cookies)} cookies do arquivo '{cookies_path}'...")
+        for cookie in cookies:
+            if 'sameSite' in cookie:
+                del cookie['sameSite']
+            if 'domain' in cookie and 'chatgpt.com' in cookie['domain']:
+                try:
+                    driver.add_cookie(cookie)
+                except Exception:
+                    pass # Ignora cookies que não podem ser adicionados
+        
+        logger.info("Cookies injetados. Atualizando a página para aplicar a sessão...")
+        driver.get("https://chatgpt.com/")
+        
+        wait = WebDriverWait(driver, 45)
+        
+        logger.info("Aguardando o campo de texto visível (div)...")
+        prompt_input_area = wait.until(
             EC.presence_of_element_located((uc.By.CSS_SELECTOR, "div#prompt-textarea[contenteditable='true']"))
         )
-        logger.info("Campo de texto encontrado.")
+        logger.info("Campo de texto visível encontrado.")
         
-        prompt_textarea.click()
-        time.sleep(0.5)
-
-        # --- PROMPT MELHORADO ---
         full_prompt = (
             f"Generate a single photorealistic image with an aspect ratio of 9:16, based on the following theme: '{prompt}'. "
             "Do not add any text or logos to the image. Focus on a cinematic and high-quality visual."
         )
         
         driver.execute_script(
-            "arguments[0].innerText = arguments[1]; arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", 
-            prompt_textarea, 
-            full_prompt
+            "arguments[0].innerHTML = arguments[1];", 
+            prompt_input_area, 
+            f'<p>{full_prompt}</p>'
         )
         time.sleep(1)
 
-        submit_button = WebDriverWait(driver, 10).until(
+        submit_button = wait.until(
             EC.element_to_be_clickable((uc.By.CSS_SELECTOR, "button[data-testid='send-button']"))
         )
         submit_button.click()
         logger.info("Prompt enviado. Aguardando geração da imagem...")
-        
+
         download_button_selector = "button[aria-label='Download this image'], button[aria-label='Baixar essa imagem']"
-        
         download_button = WebDriverWait(driver, 240).until(
             EC.presence_of_element_located((uc.By.CSS_SELECTOR, download_button_selector))
         )
@@ -117,7 +137,7 @@ def gerar_imagem_chatgpt(prompt: str, cookies_path: str, arquivo_saida: str) -> 
     except Exception as e:
         logger.error(f"❌ Erro durante a automação do ChatGPT: {e}")
         if driver:
-            error_screenshot_path = os.path.join("cache", "chatgpt_error.png")
+            error_screenshot_path = os.path.join("cache", f"chatgpt_error_{int(time.time())}.png")
             driver.save_screenshot(error_screenshot_path)
             logger.error(f"Screenshot de erro salvo em: {error_screenshot_path}")
         return False
