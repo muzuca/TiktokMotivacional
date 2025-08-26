@@ -35,12 +35,14 @@ GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "45"))
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_phrases.json")
+# NOVO CACHE PARA FRASES LONGAS (NARRAÇÃO)
+LONG_PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_long_phrases.json")
 
 
-def load_used_phrases() -> Set[str]:
-    if os.path.exists(PHRASES_CACHE_FILE):
+def load_used_phrases(cache_file: str) -> Set[str]:
+    if os.path.exists(cache_file):
         try:
-            with open(PHRASES_CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
                 return set(data)
@@ -49,12 +51,12 @@ def load_used_phrases() -> Set[str]:
     return set()
 
 
-def save_used_phrases(used_phrases: Set[str]) -> None:
+def save_used_phrases(used_phrases: Set[str], cache_file: str) -> None:
     try:
-        with open(PHRASES_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(sorted(list(used_phrases)), f, ensure_ascii=False)
     except Exception as e:
-        logger.warning("Não foi possível salvar cache de frases: %s", e)
+        logger.warning("Não foi possível salvar cache de frases em %s: %s", os.path.basename(cache_file), e)
 
 # -----------------------------------------------------------------------------#
 # Helpers
@@ -116,17 +118,12 @@ def _ask_json_list(prompt: str, temperature: float = 1.0, tries: int = 3) -> Lis
                             out.append(c)
                 if out:
                     return out
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Falha ao pedir lista JSON ao Gemini (tentativa %d/%d): %s", attempt + 1, tries, e)
         time.sleep(0.8 * (attempt + 1))
     return []
 
 def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str:
-    """
-    Garante UM único **destaque** de 1–2 palavras.
-    Se não houver, marca automaticamente últimas 1–2 palavras de conteúdo.
-    Se houver muitos, remove todos e aplica só um no final.
-    """
     sw = _PT_SW if lang == "pt" else _EN_SW
     base = _clean_line(text)
 
@@ -160,29 +157,39 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
     tokens[i1] = tokens[i1] + "**"
     return "".join(tokens)
 
+def gerar_slug(frase: str) -> str:
+    frase_limpa = re.sub(r'[\*\.:\?!,"\'`´’]', '', frase.lower())
+    palavras = frase_limpa.split()
+    slug = "_".join(palavras[:6])
+    return slug[:40]
+
+def quebrar_em_duas_linhas(frase: str) -> str:
+    palavras = frase.split()
+    if len(palavras) < 4:
+        return frase
+    ponto_de_quebra = (len(palavras) + 1) // 2
+    linha1 = " ".join(palavras[:ponto_de_quebra])
+    linha2 = " ".join(palavras[ponto_de_quebra:])
+    return f"{linha1}\n{linha2}"
+
 # -----------------------------------------------------------------------------#
-# Hashtags virais (NOVO)
+# Hashtags
 # -----------------------------------------------------------------------------#
 def _sanitize_hashtag(tag: str, lang: str) -> str:
-    """Normaliza uma hashtag: começa com '#', remove espaços e símbolos.
-       Em PT/EN remove acentuação; em AR mantém script árabe."""
     if not tag:
         return ""
     t = tag.strip()
     if t.startswith("#"):
         t = t[1:]
-    # tirar espaços/pontuação
     t = re.sub(r"\s+", "", t)
-    # em PT/EN, remover acentos e não-alfanumérico
     if lang in ("pt", "en"):
         t = unicodedata.normalize("NFD", t)
         t = t.encode("ascii", "ignore").decode("ascii")
         t = re.sub(r"[^A-Za-z0-9_]", "", t)
         t = t.lower()
     else:
-        # em árabe: remover apenas símbolos estranhos e números ocidentais repetidos
         t = re.sub(r"[^\w\u0600-\u06FF_]+", "", t, flags=re.UNICODE)
-    t = t[:30]  # limite de segurança
+    t = t[:30]
     return f"#{t}" if t else ""
 
 def _dedupe_hashtags(tags: List[str]) -> List[str]:
@@ -196,469 +203,183 @@ def _dedupe_hashtags(tags: List[str]) -> List[str]:
     return out
 
 def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3, plataforma: str = "tiktok") -> List[str]:
-    """
-    Retorna N hashtags virais para o conteúdo informado, no idioma desejado,
-    priorizando TikTok. Usa Gemini e normaliza o resultado.
-    """
     lang = _lang_tag(idioma)
     n = max(1, int(n or 3))
 
     if not os.getenv("GEMINI_API_KEY"):
         logger.warning("GEMINI_API_KEY ausente — usando fallback de hashtags.")
-        if lang == "pt":
-            base = ["#motivacao", "#inspiracao", "#mindset"]
-        elif lang == "ar":
-            base = ["#تحفيز", "#الهام", "#عقلية"]
-        else:
-            base = ["#motivation", "#inspiration", "#mindset"]
+        if lang == "pt": base = ["#motivacao", "#inspiracao", "#mindset"]
+        elif lang == "ar": base = ["#تحفيز", "#الهام", "#عقلية"]
+        else: base = ["#motivation", "#inspiration", "#mindset"]
         return base[:n]
-
-    # Prompt no idioma certo
+    
     if lang == "pt":
-        prompt = (
-            f"Você é um especialista em crescimento no TikTok. "
-            f"Dado o conteúdo abaixo, gere EXATAMENTE {n} hashtags curtas e virais "
-            f"em português do Brasil, específicas para esse conteúdo. "
-            f"Sem explicações. Não inclua espaços, pontuação nem emojis. "
-            f"Evite acentos nas hashtags (use 'motivacao', não 'motivação'). "
-            f"Retorne APENAS um array JSON de strings iniciadas por #.\n\n"
-            f"CONTEÚDO:\n{conteudo.strip()[:1000]}"
-        )
+        prompt = (f"Você é um especialista em crescimento no TikTok. Dado o conteúdo abaixo, gere EXATAMENTE {n} hashtags curtas e virais em português do Brasil, específicas para esse conteúdo. Sem explicações. Não inclua espaços, pontuação nem emojis. Evite acentos. Retorne APENAS um array JSON de strings iniciadas por #.\n\nCONTEÚDO:\n{conteudo.strip()[:1000]}")
     elif lang == "ar":
-        prompt = (
-            f"أنت خبير نمو على تيك توك. "
-            f"بناءً على المحتوى أدناه، أنشئ بالضبط {n} وسوماً قصيرة ورائجة "
-            f"ومناسبة للمحتوى، باللغة العربية. "
-            f"بدون شروح. لا مسافات أو علامات ترقيم أو رموز. "
-            f"أعد فقط مصفوفة JSON من سلاسل تبدأ بـ #.\n\n"
-            f"المحتوى:\n{conteudo.strip()[:1000]}"
-        )
+        prompt = (f"أنت خبير نمو على تيك توك. بناءً على المحتوى أدناه، أنشئ بالضبط {n} وسوماً قصيرة ورائجة ومناسبة للمحتوى، باللغة العربية. بدون شروح. لا مسافات أو علامات ترقيم أو رموز. أعد فقط مصفوفة JSON من سلاسل تبدأ بـ #.\n\nالمحتوى:\n{conteudo.strip()[:1000]}")
     else:
-        prompt = (
-            f"You are a TikTok growth expert. "
-            f"Given the content below, generate EXACTLY {n} short, viral, content-specific hashtags "
-            f"in English. No explanations. No spaces, punctuation, or emojis. "
-            f"Return ONLY a JSON array of strings starting with #.\n\n"
-            f"CONTENT:\n{conteudo.strip()[:1000]}"
-        )
+        prompt = (f"You are a TikTok growth expert. Given the content below, generate EXACTLY {n} short, viral, content-specific hashtags in English. No explanations. No spaces, punctuation, or emojis. Return ONLY a JSON array of strings starting with #.\n\nCONTENT:\n{conteudo.strip()[:1000]}")
 
     raw_list = _ask_json_list(prompt, temperature=0.9, tries=3)
-    # Sanitiza + deduplica
-    tags = [_sanitize_hashtag(t, lang) for t in raw_list]
-    tags = [t for t in tags if len(t) >= 2]
-    tags = _dedupe_hashtags(tags)
+    tags = _dedupe_hashtags([_sanitize_hashtag(t, lang) for t in raw_list if t])
+    
     if len(tags) < n:
-        # completa com fallback
-        fallback = []
-        if lang == "pt":
-            fallback = ["#motivacao", "#inspiracao", "#mindset", "#disciplina", "#foco"]
-        elif lang == "ar":
-            fallback = ["#تحفيز", "#الهام", "#انجاز", "#انضباط", "#تركيز"]
-        else:
-            fallback = ["#motivation", "#inspiration", "#mindset", "#discipline", "#focus"]
+        if lang == "pt": fallback = ["#motivacao", "#inspiracao", "#mindset", "#disciplina", "#foco"]
+        elif lang == "ar": fallback = ["#تحفيز", "#الهام", "#انجاز", "#انضباط", "#تركيز"]
+        else: fallback = ["#motivation", "#inspiration", "#mindset", "#discipline", "#focus"]
         for f in fallback:
-            if len(tags) >= n:
-                break
-            if f.lower() not in {x.lower() for x in tags}:
-                tags.append(f)
+            if len(tags) >= n: break
+            if f.lower() not in {x.lower() for x in tags}: tags.append(f)
     return tags[:n]
 
 # -----------------------------------------------------------------------------#
-# Geradores (Motivacional – existentes)
+# Geradores de Prompt de Imagem
 # -----------------------------------------------------------------------------#
-def gerar_prompt_paisagem(idioma: str = "en") -> str:
+def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "en") -> List[str]:
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ GEMINI_API_KEY não configurada.")
-        return "Mountains at sunrise" if _lang_tag(idioma) == "en" else "Montanhas ao nascer do sol"
+        return [f"{tema}, variação {i+1}" for i in range(quantidade)]
 
-    used = load_used_phrases()
     lang = _lang_tag(idioma)
-
-    for attempt in range(3):
-        try:
-            logger.info("Gerando prompt de paisagem (%s). Tentativa %d/3", lang, attempt+1)
-            prompt_text = (
-                "Create 14 short descriptions of beautiful landscapes. "
-                "Each line ≤ 7 words. Return ONLY a JSON array of strings."
-                if lang == "en" else
-                "Crie 14 descrições curtas de paisagens bonitas. "
-                "Cada linha ≤ 7 palavras. Retorne APENAS um array JSON de strings."
-            )
-            descricoes = _ask_json_list(prompt_text, temperature=0.9, tries=3)
-            descricoes = [d for d in descricoes if len(d.split()) <= 7]
-            novas = [d for d in descricoes if _md5(d) not in used]
-            if novas:
-                escolha = random.choice(novas)
-                used.add(_md5(escolha)); save_used_phrases(used)
-                logger.info("📷 Prompt gerado para imagem: %s", escolha)
-                return escolha
-            time.sleep(0.6 * (attempt + 1))
-        except Exception as e:
-            logger.warning("Falha ao gerar prompt: %s", e)
-            time.sleep(0.6 * (attempt + 1))
-
-    return "Mountains at sunrise" if lang == "en" else "Montanhas ao nascer do sol"
-
-
-def gerar_frase_motivacional(idioma: str = "en") -> str:
-    """
-    Curta, porém um pouco maior (9–20 palavras), com 1 destaque **...**
-    e uma pausa natural (vírgula/reticências/traço) perto do meio.
-    """
-    if not os.getenv("GEMINI_API_KEY"):
-        logger.error("❌ GEMINI_API_KEY não configurada.")
-        return "Você é mais forte do que imagina." if _lang_tag(idioma) == "pt" else "You are stronger than you think."
-
-    used = load_used_phrases()
-    lang = _lang_tag(idioma)
-
-    prompt_text = (
-        "Write 16 motivational short sentences in English. "
-        "Each must have 9–20 words, natural and non-cliché. "
-        "Include EXACTLY ONE emphasis span using **double asterisks** around 1–2 impactful words near the end. "
-        "Optionally include a comma, dash (—) or ellipsis (…) to suggest a break. "
-        "No hashtags or quotes. Return ONLY a JSON array of strings."
-        if lang == "en" else
-        "Escreva 16 frases motivacionais em português. "
-        "Cada uma deve ter entre 9 e 20 palavras, naturais e sem clichês. "
-        "Inclua EXATAMENTE UM destaque usando **duas-asteriscos** envolvendo 1–2 palavras marcantes, perto do final. "
-        "Opcionalmente use uma vírgula, travessão (—) ou reticências (…) para sugerir pausa. "
-        "Sem hashtags ou aspas. Retorne APENAS um array JSON de strings."
-    )
-
-    items = _ask_json_list(prompt_text, temperature=0.95, tries=3)
-
-    pool: List[str] = []
-    for s in items:
-        s = _clean_line(s)
-        s = _ensure_single_emphasis(s, lang, prefer_last_n=2)
-        wc = _count_words_no_markup(s)
-        if 9 <= wc <= 20:
-            pool.append(s)
-
-    if not pool:
-        base = "A vida é curta demais — faça hoje o que aproxima dos seus sonhos" \
-            if lang == "pt" else \
-            "Life is short — do today what moves you closer to your dreams"
-        pool = [_ensure_single_emphasis(base, lang)]
-
-    random.shuffle(pool)
-    for cand in pool:
-        key = _md5(_strip_emph(cand))
-        if key not in used:
-            used.add(key); save_used_phrases(used)
-            logger.info("🧠 Frase motivacional escolhida: %s", cand)
-            return cand
-
-    return pool[0]
-
-
-# Longa (motivacional – mantida)
-def _gen_call(prompt: str, generation_config: dict) -> Optional[str]:
-    try:
-        resp = model.generate_content(
-            prompt,
-            generation_config=generation_config,
-            request_options={"timeout": GEMINI_TIMEOUT_SEC},
+    
+    if lang == 'pt':
+        prompt_text = (
+            f"Crie uma lista de {quantidade} descrições de imagem curtas e variadas para um gerador de imagens de IA, com o tema '{tema}'. "
+            "As descrições devem ser fotorrealistas, cinematográficas, com ângulos de câmera diferentes (close-up, plano médio, etc.) e adequadas para um vídeo vertical (9:16). "
+            "Cada descrição deve ter no máximo 15 palavras. Retorne APENAS um array JSON de strings."
         )
-        return getattr(resp, "text", None)
-    except TypeError:
-        try:
-            resp = model.generate_content(prompt, generation_config=generation_config)
-            return getattr(resp, "text", None)
-        except Exception:
-            return None
-    except Exception:
-        return None
+    else:
+        prompt_text = (
+            f"Create a list of {quantidade} short and varied image descriptions for an AI image generator, themed around '{tema}'. "
+            "The descriptions should be photorealistic, cinematic, with different camera angles (e.g., close-up, medium shot), and suitable for a vertical video (9:16). "
+            "Each description must be 15 words or less. Return ONLY a JSON array of strings."
+        )
 
-def _ask_gemini_list(prompt: str, temperature: float = 1.05, tries: int = 3, sleep_base: float = 1.0) -> List[str]:
-    for attempt in range(tries):
-        try:
-            raw = _gen_call(prompt, {"response_mime_type":"application/json","temperature":temperature,"top_p":0.95}) or ""
-            lst = []
-            try:
-                data = json.loads(raw)
-                if isinstance(data, list):
-                    lst = [ _clean_line(x) for x in data if isinstance(x, str) and _clean_line(x)]
-            except Exception:
-                pass
-            if lst:
-                return lst
-            txt = _gen_call(prompt, {"temperature":temperature,"top_p":0.95}) or ""
-            lines = [_clean_line(l) for l in txt.split("\n") if _clean_line(l)]
-            if lines:
-                return lines
-        except Exception:
-            pass
-        time.sleep(sleep_base*(2**attempt))
-    return []
+    descricoes = _ask_json_list(prompt_text, temperature=1.0, tries=3)
+    
+    if descricoes and len(descricoes) >= quantidade:
+        logger.info(f"✅ {len(descricoes)} prompts de imagem gerados para o tema '{tema}'.")
+        return descricoes[:quantidade]
 
-def _collect_long_candidates(lang: str, target_total: int = 12, batch_size: int = 4, max_calls: int = 4) -> List[str]:
-    prompts = {
-        "en": ("Write {n} distinct motivational mini-speeches in English. "
-               "Each MUST have 40–55 words (~20 seconds narration). "
-               "Avoid clichés and previous phrasing; vary imagery, rhythm, and structure. "
-               "Return ONLY a JSON array of strings."),
-        "pt": ("Escreva {n} mini-discursos motivacionais em português. "
-               "Cada um DEVE ter entre 40 e 55 palavras (~20 segundos de narração). "
-               "Evite clichês e repetições; varie imagens, ritmo e estrutura. "
-               "Retorne APENAS um array JSON de strings.")
-    }
-    prompt_tpl = prompts["en" if lang == "en" else "pt"]
-    all_items: List[str] = []
-    calls = min(max_calls, max(1, (target_total + batch_size - 1) // batch_size))
-    for _ in range(calls):
-        items = _ask_gemini_list(prompt_tpl.format(n=batch_size), temperature=1.05, tries=3)
-        for it in items:
-            itc = _clean_line(it)
-            if itc and itc not in all_items:
-                all_items.append(itc)
-        if len(all_items) >= target_total:
-            break
-    return all_items
+    logger.warning("Não foi possível gerar a quantidade desejada de prompts. Usando fallback.")
+    return [f"{tema}, cinematic, high detail, variation {i+1}" for i in range(quantidade)]
 
-def _pick_new(pool: List[str], used: Set[str], prefix: str, min_words: int, max_words: int) -> Optional[str]:
-    cand = [p for p in pool if min_words <= len(p.split()) <= max_words]
-    random.shuffle(cand)
-    for c in cand:
-        key = f"{prefix}{_md5(c)}"
-        if key not in used:
-            return c
-    return None
-
-def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
-    if not os.getenv("GEMINI_API_KEY"):
-        logger.error("❌ GEMINI_API_KEY não configurada.")
-        return ("Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos."
-                if _lang_tag(idioma) == "pt"
-                else "You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams.")
-
-    used = load_used_phrases()
-    prefix = "LONG::"
-    lang = _lang_tag(idioma)
-    if lang == "ar":
-        return "استقبل رسائل الكون بقلب هادئ. تذكّر: كل اختيار اليوم يغيّر مصيرك. ثق بحدسك وامضِ بخطوات واثقة."
-
-    for round_idx in range(1, 4):
-        try:
-            logger.info("Gerando frases motivacionais longas (%s). Rodada %d/3", "EN" if lang == "en" else "PT-BR", round_idx)
-            candidates = _collect_long_candidates(lang=lang, target_total=12, batch_size=4, max_calls=4)
-            candidates = [_clean_line(c) for c in candidates if _clean_line(c)]
-            ideal = [c for c in candidates if 40 <= len(c.split()) <= 55]
-            tolerant = [c for c in candidates if 35 <= len(c.split()) <= 65]
-
-            def pick(pool: List[str]) -> Optional[str]:
-                return _pick_new(pool, used, prefix=prefix, min_words=35, max_words=65)
-
-            chosen = pick(ideal) or pick(tolerant)
-            if not chosen:
-                extra = _collect_long_candidates(lang=lang, target_total=4, batch_size=4, max_calls=1)
-                extra = [_clean_line(c) for c in extra if _clean_line(c)]
-                extra_ideal = [c for c in extra if 40 <= len(c.split()) <= 55]
-                extra_tol = [c for c in extra if 35 <= len(c.split()) <= 65]
-                chosen = pick(extra_ideal) or pick(extra_tol)
-
-            if chosen:
-                used.add(f"{prefix}{_md5(chosen)}"); save_used_phrases(used)
-                logger.info("🧠 Frase motivacional longa escolhida: %s", chosen[:100] + "..." if len(chosen) > 100 else chosen)
-                return chosen
-
-            time.sleep(1.2 * round_idx)
-        except Exception as e:
-            logger.warning("Rodada %d falhou: %s", round_idx, e)
-            time.sleep(1.2 * round_idx)
-
-    return ("Você é mais forte do que imagina. Respire fundo e siga em frente todos os dias, superando desafios para realizar seus sonhos."
-            if lang == "pt"
-            else "You are stronger than you think. Take a deep breath and push forward every day, overcoming challenges to achieve your dreams.")
+def gerar_prompt_paisagem(idioma: str = "en") -> str:
+    prompts = gerar_prompts_de_imagem_variados("paisagem bonita", 1, idioma)
+    return prompts[0] if prompts else "Montanhas ao nascer do sol"
 
 # -----------------------------------------------------------------------------#
-# Tarot (Fase 4)
+# Geradores de Frase Principal
+# -----------------------------------------------------------------------------#
+def gerar_frase_motivacional(idioma: str = "en") -> str:
+    lang = _lang_tag(idioma)
+    
+    if lang == "pt":
+        prompt_text = "Crie 3 frases motivacionais curtas e de impacto (6-12 palavras). Marque a palavra-chave principal com **negrito**. Retorne APENAS um array JSON de strings."
+    elif lang == "ar":
+        prompt_text = "أنشئ 3 جمل تحفيزية قصيرة ومؤثرة (6-12 كلمة). ضع الكلمة الرئيسية **بخط عريض**. أعد فقط مصفوفة JSON من السلاسل."
+    else:
+        prompt_text = "Create 3 short, impactful motivational phrases (6-12 words). Mark the main keyword with **bold**. Return ONLY a JSON array of strings."
+
+    used_phrases = load_used_phrases(PHRASES_CACHE_FILE)
+    phrases = _ask_json_list(prompt_text, temperature=1.2, tries=5)
+    
+    valid_phrases = [
+        _ensure_single_emphasis(p, lang) for p in phrases if 6 <= _count_words_no_markup(p) <= 12 and _md5(p) not in used_phrases
+    ]
+    
+    if valid_phrases:
+        chosen = random.choice(valid_phrases)
+        used_phrases.add(_md5(chosen))
+        save_used_phrases(used_phrases, PHRASES_CACHE_FILE)
+        return _clean_line(chosen)
+
+    return "Você tem o **poder** de criar a vida que deseja." if lang == "pt" else "You have the **power** to create the life you desire."
+
+# --- FUNÇÃO ATUALIZADA ---
+def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
+    """Gera uma frase longa para narração, garantindo que seja inédita."""
+    lang = _lang_tag(idioma)
+
+    if lang == "pt":
+        prompt_text = "Crie 3 frases motivacionais longas para narração (15 a 25 palavras), com tom inspirador. Retorne APENAS um array JSON de strings."
+        fallback = "Acredite no poder dos seus sonhos e na força da sua determinação para alcançar o impossível."
+    elif lang == "ar":
+        prompt_text = "أنشئ 3 جمل تحفيزية طويلة للتعليق الصوتي (15 إلى 25 كلمة)، بنبرة ملهمة. أعد فقط مصفوفة JSON من السلاسل."
+        fallback = "آمن بقوة أحلامك وبقوة عزيمتك لتحقيق المستحيل."
+    else:
+        prompt_text = "Create 3 long motivational phrases for narration (15 to 25 words), with an inspiring tone. Return ONLY a JSON array of strings."
+        fallback = "Believe in the power of your dreams and the strength of your determination to achieve the impossible."
+    
+    used_long_phrases = load_used_phrases(LONG_PHRASES_CACHE_FILE)
+    phrases = _ask_json_list(prompt_text, temperature=1.1, tries=4)
+    
+    valid_phrases = [
+        p for p in phrases if 15 <= _count_words_no_markup(p) <= 25 and _md5(p) not in used_long_phrases
+    ]
+    
+    if valid_phrases:
+        chosen = random.choice(valid_phrases)
+        used_long_phrases.add(_md5(chosen))
+        save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
+        logger.info("Frase longa inédita selecionada para narração.")
+        return _clean_line(chosen)
+
+    logger.warning("Nenhuma frase longa inédita foi gerada, usando fallback.")
+    return fallback
+
+# -----------------------------------------------------------------------------#
+# Tarot
 # -----------------------------------------------------------------------------#
 def gerar_prompt_tarot(idioma: str = "en") -> str:
-    """
-    Prompt curto para Pexels/planos de fundo (sempre em inglês p/ melhor match).
-    Conteúdo: mesa de cartas, velas, atmosfera mística, vertical/cinematic.
-    """
-    if not os.getenv("GEMINI_API_KEY"):
-        logger.warning("GEMINI_API_KEY ausente — usando prompt tarot padrão.")
-        return "tarot table, candlelight, mystic fortune teller hands shuffling cards, purple velvet, cinematic, vertical"
-
-    used = load_used_phrases()
-    prefix = "PROMPT_TAROT::"
-
-    prompt_text = (
-        "Create 16 short visual queries for stock images about tarot/fortune-telling. "
-        "Each query <= 12 words, English, concrete nouns/visual cues only, vertical/cinematic vibe. "
-        "Return ONLY a JSON array of strings."
-    )
-    items = _ask_json_list(prompt_text, temperature=0.9, tries=3)
-    items = [i for i in items if len(i.split()) <= 12]
-
-    random.shuffle(items)
-    for it in items:
-        key = prefix + _md5(it)
-        if key not in used:
-            used.add(key); save_used_phrases(used)
-            logger.info("🔮 Prompt tarot gerado: %s", it)
-            return it
-
-    return "tarot table, candlelight, mystic fortune teller hands, purple velvet, cinematic, vertical"
+    lang = _lang_tag(idioma)
+    if lang == 'pt':
+        return 'Uma mesa de tarô com cartas espalhadas, iluminação mística, cristais e velas, close-up'
+    elif lang == 'ar':
+        return 'طاولة تاروت مع بطاقات منتشرة، إضاءة غامضة، بلورات وشموع، لقطة مقربة'
+    return 'A tarot table with cards spread out, mystical lighting, crystals and candles, close-up shot'
 
 def gerar_frase_tarot_curta(idioma: str = "en") -> str:
-    """
-    Frase curta para capa/descrição. Sem markdown, sem hashtags.
-    """
     lang = _lang_tag(idioma)
-    if not os.getenv("GEMINI_API_KEY"):
-        return ("A carta certa aparece quando você está pronto." if lang == "pt"
-                else ("البطاقة المناسبة تظهر حين يكون قلبك مستعدًا." if lang == "ar"
-                else "The right card appears when your heart is ready."))
-
-    used = load_used_phrases()
-    prefix = "TAROT_SHORT::"
-
-    if lang == "ar":
-        prompt = (
-            "اكتب 16 جملة قصيرة مستوحاة من قراءة التاروت باللهجة العربية المفهومة في مصر. "
-            "كل جملة بين 6 و 14 كلمة، بلا علامات تنصيص ولا وسوم. "
-            "تكون روحانية ولطيفة وتدعو للتأمل بلا وعود حتمية. "
-            "أعد فقط مصفوفة JSON من السلاسل."
-        )
-    elif lang == "pt":
-        prompt = (
-            "Escreva 16 frases curtas inspiradas em leitura de tarô, em português do Brasil. "
-            "Cada uma com 6–14 palavras, sem aspas e sem hashtags; tom místico, gentil, sem promessas determinísticas. "
-            "Retorne APENAS um array JSON de strings."
-        )
-    else:
-        prompt = (
-            "Write 16 short tarot-inspired lines in English. "
-            "Each 6–14 words, no quotes, no hashtags; mystical, gentle, non-deterministic. "
-            "Return ONLY a JSON array of strings."
-        )
-
-    items = _ask_json_list(prompt, temperature=0.95, tries=3)
-    random.shuffle(items)
-    for it in items:
-        key = prefix + _md5(it)
-        if key not in used:
-            used.add(key); save_used_phrases(used)
-            logger.info("🃏 Frase tarot curta: %s", it)
-            return it
-
-    # fallbacks
-    if lang == "ar":
-        return "اسمع همس قلبك… الرسالة أوضح مما تظن."
     if lang == "pt":
-        return "Ouça o sussurro do seu coração — a mensagem está mais perto do que imagina."
-    return "Listen to the whisper within — your message is closer than you think."
+        prompt_text = "Crie 3 frases curtas (6-10 palavras) no estilo de uma cartomante revelando um conselho. Use palavras como 'as cartas revelam', 'o destino mostra'. Marque a palavra-chave com **negrito**. Retorne um array JSON de strings."
+    elif lang == "ar":
+        prompt_text = "أنشئ 3 جمل قصيرة (6-10 كلمات) بأسلوب قارئة تاروت تكشف عن نصيحة. استخدم كلمات مثل 'الكروت تكشف'، 'القدر يظهر'. ضع الكلمة الرئيسية **بخط عريض**. أعد مصفوفة JSON من السلاسل."
+    else:
+        prompt_text = "Create 3 short phrases (6-10 words) in the style of a fortune teller revealing advice. Use words like 'the cards reveal', 'destiny shows'. Mark the keyword with **bold**. Return a JSON array of strings."
+    
+    phrases = _ask_json_list(prompt_text, temperature=1.1)
+    if phrases:
+        return _ensure_single_emphasis(random.choice(phrases), lang)
+    return "As cartas revelam um novo **caminho** para você."
 
+# --- FUNÇÃO ATUALIZADA ---
 def gerar_frase_tarot_longa(idioma: str = "en") -> str:
-    """
-    Narração ~12–20 s, tom místico e gentil. Sem markdown/hashtags.
-    """
+    """Gera uma frase longa de tarot para narração, garantindo que seja inédita."""
     lang = _lang_tag(idioma)
-    if not os.getenv("GEMINI_API_KEY"):
-        return ("Hoje, o tarô revela uma passagem de clareza: respire, acolha o que chega e libere o que pesa. "
-                "Seu caminho brilha quando você honra sua intuição e dá um passo de cada vez.")
-    used = load_used_phrases()
-    prefix = "TAROT_LONG::"
-
-    if lang == "ar":
-        prompt = (
-            "اكتب 8 مقاطع قصيرة مستوحاة من قراءة التاروت بالعربية المفهومة في مصر. "
-            "طول كل مقطع 40–55 كلمة تقريبًا، نبرة روحانية ولطيفة وغير حتمية، بدون وعود مطلقة. "
-            "بدون علامات تنصيص وبدون هاشتاجات. "
-            "أعد فقط مصفوفة JSON من السلاسل."
-        )
-    elif lang == "pt":
-        prompt = (
-            "Escreva 8 textos curtos inspirados em leitura de tarô, em português do Brasil. "
-            "Cada um com 40–55 palavras (~20s), tom místico, acolhedor e não determinístico, sem promessas absolutas. "
-            "Sem aspas e sem hashtags. Retorne APENAS um array JSON de strings."
-        )
-    else:
-        prompt = (
-            "Write 8 short tarot-inspired narrations in English. "
-            "Each 40–55 words (~20s), mystical, gentle, non-deterministic, no absolute promises. "
-            "No quotes and no hashtags. Return ONLY a JSON array of strings."
-        )
-
-    items = _ask_json_list(prompt, temperature=1.02, tries=3)
-    items = [_clean_line(x) for x in items if _clean_line(x)]
-    random.shuffle(items)
-    for it in items:
-        wc = len(it.split())
-        if 35 <= wc <= 65:
-            key = prefix + _md5(it)
-            if key not in used:
-                used.add(key); save_used_phrases(used)
-                logger.info("🔮 Frase tarot longa escolhida (%d palavras).", wc)
-                return it
-
-    # fallback simples
-    if lang == "ar":
-        return ("تنصحك الرسالة اليوم بالهدوء والإصغاء لنبض قلبك. ما تبحث عنه يقترب حين تتقبل إشارات الكون "
-                "بدون استعجال. خطوة صغيرة بنية صادقة تغيّر المزاج والاتجاه. دع الضوء يرشدك، وستعرف متى تتحرك.")
     if lang == "pt":
-        return ("A mensagem de hoje convida ao silêncio e à escuta da sua intuição. Quando você acolhe os sinais "
-                "sem pressa, o caminho clareia. Um passo sincero muda o ritmo e a direção. Confie no brilho que já "
-                "habita em você, e avance quando o coração disser sim.")
-    return ("Today’s message invites quiet and listening. As you welcome subtle signs without haste, the path clears. "
-            "A sincere small step shifts your rhythm and direction. Trust the light already within you, and move when your heart says yes.")
+        prompt_text = "Crie 3 mensagens enigmáticas e inspiradoras de 15 a 25 palavras, como uma cartomante falando. Retorne APENAS um array JSON de strings."
+        fallback = "A energia do universo conspira a seu favor, ouça os sussurros do destino que te guiam."
+    elif lang == "ar":
+        prompt_text = "أنشئ 3 رسائل غامضة وملهمة من 15 إلى 25 كلمة، كأنها من قارئة تاروت. أعد فقط مصفوفة JSON من السلاسل."
+        fallback = "طاقة الكون تتآمر لصالحك، استمع إلى همسات القدر التي ترشدك."
+    else:
+        prompt_text = "Create 3 enigmatic and inspiring messages of 15 to 25 words, like a fortune teller speaking. Return ONLY a JSON array of strings."
+        fallback = "The energy of the universe conspires in your favor; listen to the whispers of fate that guide you."
+    
+    used_long_phrases = load_used_phrases(LONG_PHRASES_CACHE_FILE)
+    phrases = _ask_json_list(prompt_text, temperature=1.1, tries=4)
+    
+    valid_phrases = [
+        p for p in phrases if 15 <= _count_words_no_markup(p) <= 25 and _md5(p) not in used_long_phrases
+    ]
+    
+    if valid_phrases:
+        chosen = random.choice(valid_phrases)
+        used_long_phrases.add(_md5(chosen))
+        save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
+        logger.info("Frase longa de tarot inédita selecionada para narração.")
+        return _clean_line(chosen)
 
-# -----------------------------------------------------------------------------#
-# Utilidades
-# -----------------------------------------------------------------------------#
-def quebrar_em_duas_linhas(frase: str) -> str:
-    palavras = frase.split()
-    n = len(palavras)
-    if n <= 4:
-        return frase
-
-    candidatos = range(2, n - 1)
-
-    def comp_len(ws: List[str]) -> int:
-        return sum(len(w) for w in ws) + max(0, len(ws) - 1)
-
-    pequenos = {
-        "e","ou","de","da","do","das","dos","em","no","na","nos","nas","por","pra","para",
-        "o","a","os","as","um","uma","que","se","com"
-    }
-    pontos = {".", ",", ";", "!", "?", "—", "-", "–", ":"}
-
-    melhor_div = None
-    menor_dif = float('inf')
-
-    for i in candidatos:
-        linha1 = palavras[:i]
-        linha2 = palavras[i:]
-        len1 = comp_len(linha1)
-        len2 = comp_len(linha2)
-        dif = abs(len1 - len2)
-        if linha1[-1].lower().strip("".join(pontos)) in pequenos: dif += 8
-        if linha2[0].lower().strip("".join(pontos)) in pequenos:  dif += 10
-        if any(linha1[-1].endswith(p) for p in pontos):           dif -= 5
-        if dif < menor_dif:
-            menor_dif = dif
-            melhor_div = i
-
-    if melhor_div is None:
-        return frase
-    return f'{" ".join(palavras[:melhor_div])}\n{" ".join(palavras[melhor_div:])}'
-
-def gerar_slug(texto: str, limite: int = 30) -> str:
-    try:
-        base = (texto or "").strip()
-        texto_ascii = unicodedata.normalize('NFD', base).encode('ascii', 'ignore').decode('utf-8')
-        texto_ascii = re.sub(r'[^a-zA-Z0-9\s]', '', texto_ascii)
-        texto_ascii = texto_ascii.strip().lower().replace(" ", "_")
-        slug = texto_ascii[:limite]
-        if not slug:
-            slug = f"slug_{int(time.time())}"
-        logger.info("🔗 Slug gerado: %s", slug)
-        return slug
-    except Exception as e:
-        logger.error("Erro ao gerar slug: %s", e)
-        return f"slug_{int(time.time())}"
+    logger.warning("Nenhuma frase longa de tarot inédita foi gerada, usando fallback.")
+    return fallback

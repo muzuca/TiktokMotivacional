@@ -9,15 +9,24 @@ from typing import List, Optional, Tuple, Iterable
 import requests
 try:
     from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry  # type: ignore
-except Exception:  # pragma: no cover
-    from requests.adapters import HTTPAdapter  # type: ignore
-    Retry = None  # type: ignore
+    from urllib3.util.retry import Retry
+except Exception:
+    from requests.adapters import HTTPAdapter
+    Retry = None
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 from dotenv import load_dotenv
 
 from utils.frase import quebrar_em_duas_linhas
+
+# --- NOVA IMPORTAÇÃO ---
+# Importa a função de automação do arquivo específico
+try:
+    from utils.chatgpt_image import gerar_imagem_chatgpt
+    _HAVE_CHATGPT_AUTOMATION = True
+except ImportError:
+    _HAVE_CHATGPT_AUTOMATION = False
+# --------------------
 
 load_dotenv()
 
@@ -41,7 +50,10 @@ os.makedirs(IMAGENS_DIR, exist_ok=True)
 
 USER_AGENT = "TiktokMotivacional/1.0 (+https://local)"
 
-# -------------------- ENV HELPERS --------------------
+# ... (todo o resto do seu arquivo imagem.py, de _env_float até o final, permanece o mesmo)
+# ... (cole todo o conteúdo de _env_float até _slug aqui)
+
+# --- INÍCIO DO CONTEÚDO EXISTENTE (NÃO MODIFICADO) ---
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -71,24 +83,20 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 def _env_color(name: str, default: str) -> Tuple[int, int, int]:
     s = (os.getenv(name, default) or "").strip()
     if s.startswith("#") and len(s) == 7:
-        return tuple(int(s[i:i+2], 16) for i in (1, 3, 5))  # type: ignore
+        return tuple(int(s[i:i+2], 16) for i in (1, 3, 5))
     try:
         r, g, b = [int(x) for x in s.split(",")]
         return (r, g, b)
     except Exception:
         return (243, 179, 74)
 
-# -------------------- Parâmetros de imagem --------------------
 IMAGE_DARK_ENABLE = _env_bool("IMAGE_DARK_ENABLE", True)
-
 IMAGE_DARK_MODERN  = _clamp(_env_float("IMAGE_DARK_MODERN", 0.14), 0.0, 0.95)
 IMAGE_DARK_CLASSIC = _clamp(_env_float("IMAGE_DARK_CLASSIC", 0.16), 0.0, 0.95)
 IMAGE_DARK_MINIMAL = _clamp(_env_float("IMAGE_DARK_MINIMAL", 0.15), 0.0, 0.95)
-
 IMAGE_VIGNETTE_STRENGTH   = _clamp(_env_float("IMAGE_VIGNETTE_STRENGTH", 0.06), 0.0, 0.95)
 IMAGE_VIGNETTE_SOFTNESS   = _clamp(_env_float("IMAGE_VIGNETTE_SOFTNESS", 0.72), 0.0, 1.0)
 IMAGE_DARK_CENTER_PROTECT = _clamp(_env_float("IMAGE_DARK_CENTER_PROTECT", 0.80), 0.0, 1.0)
-
 IMAGE_TEXT_SCALE   = _clamp(_env_float("IMAGE_TEXT_SCALE", 1.20), 0.5, 2.0)
 IMAGE_TEXT_UPPER   = _env_bool("IMAGE_TEXT_UPPER", True)
 IMAGE_HL_COLOR     = _env_color("IMAGE_HL_COLOR", "#F3B34A")
@@ -96,8 +104,6 @@ IMAGE_HL_STROKE    = _env_bool("IMAGE_HL_STROKE", True)
 IMAGE_FORCE_EMPHASIS = _env_bool("IMAGE_FORCE_EMPHASIS", False)
 IMAGE_EMPHASIS_LAST_WORDS = max(1, _env_int("IMAGE_EMPHASIS_LAST_WORDS", 1))
 IMAGE_EMPHASIS_ONLY_MARKUP = _env_bool("IMAGE_EMPHASIS_ONLY_MARKUP", True)
-
-# Aparência do contorno
 IMAGE_TEXT_OUTLINE_STYLE = os.getenv("IMAGE_TEXT_OUTLINE_STYLE", "shadow").strip().lower()
 IMAGE_STROKE_WIDTH       = _env_int("IMAGE_STROKE_WIDTH", 2)
 try:
@@ -106,25 +112,18 @@ try:
 except Exception:
     IMAGE_SHADOW_OFFSET = (2, 3)
 IMAGE_SHADOW_ALPHA = _env_int("IMAGE_SHADOW_ALPHA", 170)
-
-# Ajuste fino por template
 IMAGE_TEXT_SCALE_CLASSIC = _clamp(_env_float("IMAGE_TEXT_SCALE_CLASSIC", 1.0), 0.5, 2.0)
 IMAGE_TEXT_SCALE_MODERN  = _clamp(_env_float("IMAGE_TEXT_SCALE_MODERN",  1.0), 0.5, 2.0)
 IMAGE_TEXT_SCALE_MINIMAL = _clamp(_env_float("IMAGE_TEXT_SCALE_MINIMAL", 1.0), 0.5, 2.0)
-
 IMAGE_LOG_PROXY   = _env_bool("IMAGE_LOG_PROXY", False)
 IMAGE_VERBOSE_LOG = _env_bool("IMAGE_VERBOSE_LOG", False)
-
-# --------- Proxy por região (DEFAULT/EG) ----------
 PROXY_AUTO_BY_LANG = os.getenv("PROXY_AUTO_BY_LANG", "1").strip().lower() not in ("0", "false", "no")
-DEFAULT_PROXY_REGION = (os.getenv("DEFAULT_PROXY_REGION", "") or "").upper() or None  # ex: 'US'|'EG'|None
-
+DEFAULT_PROXY_REGION = (os.getenv("DEFAULT_PROXY_REGION", "") or "").upper() or None
 def _idioma_norm(idioma: Optional[str]) -> str:
     s = (idioma or "pt").lower()
     if s.startswith("ar"): return "ar"
     if s.startswith("pt"): return "pt"
     return "en"
-
 def _proxy_url_from_env(prefix: str) -> Optional[str]:
     host = os.getenv(f"{prefix}_HOST", "").strip()
     port = os.getenv(f"{prefix}_PORT", "").strip()
@@ -134,17 +133,13 @@ def _proxy_url_from_env(prefix: str) -> Optional[str]:
         return None
     auth = f"{user}:{pw}@" if (user or pw) else ""
     return f"http://{auth}{host}:{port}"
-
 def _pick_proxy_region(explicit_region: Optional[str], idioma: Optional[str]) -> Optional[str]:
     if explicit_region:
         return explicit_region.upper()
     if PROXY_AUTO_BY_LANG and _idioma_norm(idioma) == "ar":
         return "EG"
     return DEFAULT_PROXY_REGION
-
-from requests.adapters import HTTPAdapter
 _SESSIONS: dict[str, requests.Session] = {}
-
 def _make_session(region: Optional[str] = None) -> requests.Session:
     s = requests.Session()
     if Retry is not None:
@@ -154,7 +149,6 @@ def _make_session(region: Optional[str] = None) -> requests.Session:
     else:
         s.mount("https://", HTTPAdapter())
         s.mount("http://", HTTPAdapter())
-
     prefix = "PROXY_EG" if (region or "").upper() == "EG" else "PROXY"
     url = _proxy_url_from_env(prefix)
     if url:
@@ -163,16 +157,13 @@ def _make_session(region: Optional[str] = None) -> requests.Session:
             logger.info("🌐 Proxy %s habilitado", (region or "DEFAULT"))
     else:
         logger.debug("🌐 Proxy desabilitado (%s)", (region or "DEFAULT"))
-
     s.headers.update({"User-Agent": USER_AGENT})
     return s
-
 def _get_session(region: Optional[str]) -> requests.Session:
     key = (region or "DEFAULT").upper()
     if key not in _SESSIONS:
         _SESSIONS[key] = _make_session(region)
     return _SESSIONS[key]
-
 def load_used_images():
     if os.path.exists(IMAGES_CACHE_FILE):
         try:
@@ -181,31 +172,52 @@ def load_used_images():
         except Exception:
             return set()
     return set()
-
 def save_used_images(s):
     with open(IMAGES_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(list(s), f)
-
 def _slug(s: str, maxlen: int = 28) -> str:
     import re as _re
     s = s.lower().strip()
     s = _re.sub(r"[^a-z0-9]+", "_", s)
     s = _re.sub(r"_+", "_", s).strip("_")
     return s[:maxlen] or "img"
+# --- FIM DO CONTEÚDO EXISTENTE ---
 
-# -------------------- Fontes / medidas --------------------
+
+# --- NOVA FUNÇÃO "PONTE" (WRAPPER) ---
+def gerar_imagem_dalle(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None):
+    """
+    Wrapper para chamar a automação de geração de imagem do ChatGPT.
+    """
+    if not _HAVE_CHATGPT_AUTOMATION:
+        raise ImportError("A função 'gerar_imagem_chatgpt' não pôde ser importada de 'utils/chatgpt_image.py'")
+    
+    # O caminho para os cookies é lido do .env, conforme a implementação original de chatgpt_image.py
+    cookies_filename = os.getenv("COOKIES_CHATGPT_FILENAME", "cookies_chatgpt.txt")
+    
+    # A função gerar_imagem_chatgpt já lê as outras variáveis de ambiente necessárias (CHROME_USER_PROFILE_PATH, etc)
+    success = gerar_imagem_chatgpt(prompt=prompt, cookies_path=cookies_filename, arquivo_saida=arquivo_saida)
+    
+    if not success:
+        raise RuntimeError("A automação do ChatGPT falhou ao gerar a imagem.")
+    
+    logger.info("✅ Imagem DALL-E/ChatGPT gerada e salva via automação.")
+
+
+# ... (todo o resto do seu arquivo imagem.py, de _FONT_CACHE até o final, permanece aqui)
+# ... (cole todo o conteúdo de _FONT_CACHE até montar_slides_pexels aqui)
+
+
+# --- INÍCIO DO CONTEÚDO EXISTENTE (NÃO MODIFICADO) ---
 ARABIC_FONT_IMAGE_REG  = os.getenv("ARABIC_FONT_IMAGE_REG",  "NotoNaskhArabic-Regular.ttf")
 ARABIC_FONT_IMAGE_BOLD = os.getenv("ARABIC_FONT_IMAGE_BOLD", "NotoNaskhArabic-Bold.ttf")
-
 _FONT_CACHE: dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
 _logged_fonts: set[Tuple[str, int]] = set()
-
 def _find_first_existing(paths: List[str]) -> Optional[str]:
     for p in paths:
         if p and os.path.isfile(p):
             return p
     return None
-
 def _system_font_candidates(names: List[str]) -> List[str]:
     base_candidates = []
     for n in names:
@@ -227,10 +239,8 @@ def _system_font_candidates(names: List[str]) -> List[str]:
         "C:\\Windows\\Fonts\\arial.ttf",
     ]
     return [os.path.abspath(p) for p in base_candidates]
-
 def _abs_font_path(fname: str) -> str:
     return os.path.abspath(os.path.join(FONTS_DIR, fname))
-
 def _load_font(fname: str, size: int) -> ImageFont.FreeTypeFont:
     key = (fname, size)
     if key in _FONT_CACHE:
@@ -253,12 +263,9 @@ def _load_font(fname: str, size: int) -> ImageFont.FreeTypeFont:
         f = ImageFont.load_default()
         _FONT_CACHE[key] = f
         return f
-
 def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
     b = draw.textbbox((0, 0), text, font=font)
     return b[2] - b[0], b[3] - b[1]
-
-# -------------------- Texto / wrapping --------------------
 def _wrap_words(draw: ImageDraw.ImageDraw, words: List[str], font: ImageFont.FreeTypeFont, maxw: int) -> List[List[str]]:
     lines: List[List[str]] = []
     cur: List[str] = []
@@ -275,7 +282,6 @@ def _wrap_words(draw: ImageDraw.ImageDraw, words: List[str], font: ImageFont.Fre
             cur = [w]
     if cur: lines.append(cur)
     return lines
-
 def _best_font_and_wrap(draw, text, font_name, maxw, min_size, max_size, max_lines=3):
     words = text.split()
     lo, hi = min_size, max_size
@@ -292,7 +298,6 @@ def _best_font_and_wrap(draw, text, font_name, maxw, min_size, max_size, max_lin
         else:
             hi = mid - 2
     return best_font, [" ".join(l) for l in best_lines]
-
 def _draw_text_with_stroke(draw, xy, text, font, fill, stroke_fill, stroke_w):
     x, y = xy
     if stroke_w > 0:
@@ -300,37 +305,17 @@ def _draw_text_with_stroke(draw, xy, text, font, fill, stroke_fill, stroke_w):
                        (-stroke_w,-stroke_w),(-stroke_w,stroke_w),(stroke_w,-stroke_w),(stroke_w,stroke_w)]:
             draw.text((x+dx, y+dy), text, font=font, fill=stroke_fill)
     draw.text((x, y), text, font=font, fill=fill)
-
-def _draw_line_colored(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    line_text: str,
-    font: ImageFont.FreeTypeFont,
-    highlight_set: set,
-    fill="white",
-    hl_fill=(243, 179, 74),
-    style: Optional[str] = None,
-    stroke_w: Optional[int] = None,
-):
-    """Desenha token a token; highlight só nas palavras marcadas (modo LTR)."""
-    if style is None:
-        style = IMAGE_TEXT_OUTLINE_STYLE
-    if stroke_w is None:
-        stroke_w = max(1, IMAGE_STROKE_WIDTH)
-
+def _draw_line_colored(draw: ImageDraw.ImageDraw, x: int, y: int, line_text: str, font: ImageFont.FreeTypeFont, highlight_set: set, fill="white", hl_fill=(243, 179, 74), style: Optional[str] = None, stroke_w: Optional[int] = None):
+    if style is None: style = IMAGE_TEXT_OUTLINE_STYLE
+    if stroke_w is None: stroke_w = max(1, IMAGE_STROKE_WIDTH)
     tokens = line_text.split(" ")
     cur_x = x
-
     for i, raw in enumerate(tokens):
         key = re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", raw).lower()
         color = hl_fill if key in highlight_set else fill
-
         if style == "stroke":
             if stroke_w > 0:
-                for dx, dy in [(-stroke_w,0),(stroke_w,0),(0,-stroke_w),(0,stroke_w),
-                               (-stroke_w,-stroke_w),(-stroke_w,stroke_w),
-                               (stroke_w,-stroke_w),(stroke_w,stroke_w)]:
+                for dx, dy in [(-stroke_w,0),(stroke_w,0),(0,-stroke_w),(0,stroke_w), (-stroke_w,-stroke_w),(-stroke_w,stroke_w), (stroke_w,-stroke_w),(stroke_w,stroke_w)]:
                     draw.text((cur_x+dx, y+dy), raw, font=font, fill=(0,0,0,200))
             draw.text((cur_x, y), raw, font=font, fill=color)
         elif style == "shadow":
@@ -340,38 +325,15 @@ def _draw_line_colored(
             draw.text((cur_x, y), raw, font=font, fill=color)
         else:
             draw.text((cur_x, y), raw, font=font, fill=color)
-
         w = draw.textbbox((0,0), raw + (" " if i < len(tokens)-1 else ""), font=font)[2]
         cur_x += w
-
-def _draw_line_simple(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    line_text: str,
-    font: ImageFont.FreeTypeFont,
-    *,
-    rtl: bool = False,
-    fill="white",
-    style: Optional[str] = None,
-    stroke_w: int = 0,
-    right_margin: Optional[int] = None,
-    canvas_w: Optional[int] = None,
-):
-    """
-    Desenha a linha inteira (sem highlight token a token).
-    Se rtl=True, posiciona x = W - right_margin - text_width.
-    """
-    if style is None:
-        style = IMAGE_TEXT_OUTLINE_STYLE
-    if stroke_w is None:
-        stroke_w = 0
-
+def _draw_line_simple(draw: ImageDraw.ImageDraw, x: int, y: int, line_text: str, font: ImageFont.FreeTypeFont, *, rtl: bool = False, fill="white", style: Optional[str] = None, stroke_w: int = 0, right_margin: Optional[int] = None, canvas_w: Optional[int] = None):
+    if style is None: style = IMAGE_TEXT_OUTLINE_STYLE
+    if stroke_w is None: stroke_w = 0
     bb = draw.textbbox((0,0), line_text, font=font)
     tw = bb[2]-bb[0]
     if rtl and right_margin is not None and canvas_w is not None:
         x = max(0, int(canvas_w - right_margin - tw))
-
     if style == "stroke" and stroke_w > 0:
         _draw_text_with_stroke(draw, (x, y), line_text, font, fill, "black", stroke_w)
     elif style == "shadow":
@@ -380,15 +342,11 @@ def _draw_line_simple(
         draw.text((x, y), line_text, font=font, fill=fill)
     else:
         draw.text((x, y), line_text, font=font, fill=fill)
-
-# -------------------- Efeitos de fundo --------------------
 def _darken_and_vignette(img: Image.Image, base_dark_alpha: int, vig: float, softness: float, center_protect: float) -> Image.Image:
     w, h = img.size
     out = img.convert("RGBA")
-
     if base_dark_alpha > 0:
         out = Image.alpha_composite(out, Image.new("RGBA", (w, h), (0, 0, 0, int(base_dark_alpha))))
-
     if vig > 0:
         mask = Image.new("L", (w, h), 255)
         d = ImageDraw.Draw(mask)
@@ -399,17 +357,13 @@ def _darken_and_vignette(img: Image.Image, base_dark_alpha: int, vig: float, sof
         left = (w - inner_w) // 2
         top  = (h - inner_h) // 2
         d.ellipse((left, top, left + inner_w, top + inner_h), fill=0)
-
         blur = max(6, int(min(w, h) * (0.06 + 0.16 * _clamp(softness, 0.0, 1.0))))
         mask = mask.filter(ImageFilter.GaussianBlur(radius=blur))
-
         scaled_alpha = mask.point(lambda v: int(v * _clamp(vig, 0.0, 1.0)))
         overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         overlay.putalpha(scaled_alpha)
         out = Image.alpha_composite(out, overlay)
-
     return out.convert("RGB")
-
 def _ensure_1080x1920(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("RGB")
     tw, th = 1080, 1920
@@ -420,14 +374,11 @@ def _ensure_1080x1920(img: Image.Image) -> Image.Image:
     left = (nx - tw)//2
     top  = (ny - th)//2
     return new.crop((left, top, left+tw, top+th))
-
-# -------------------- Download / geração --------------------
 def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None, max_retries: int = 3):
     os.makedirs(os.path.dirname(arquivo_saida) or ".", exist_ok=True)
     used = load_used_images()
     region = _pick_proxy_region(None, idioma)
     session = _get_session(region)
-
     for attempt in range(1, max_retries + 1):
         try:
             if IMAGE_MODE != "pexels":
@@ -438,7 +389,6 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[
             page = random.randint(1, 10)
             params = {"query": prompt, "orientation": "portrait", "size": "large", "per_page": 30, "page": page}
             logger.debug("📸 Pexels: query='%s' page=%s (region=%s)", prompt, page, region or "DEFAULT")
-
             r = session.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
@@ -450,7 +400,6 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[
             src = choice.get("src") or {}
             url = src.get("large2x") or src.get("large") or src.get("portrait")
             logger.debug("📸 Pexels: escolhida id=%s", choice.get("id"))
-
             raw_resp = session.get(url, timeout=20)
             raw_resp.raise_for_status()
             raw = raw_resp.content
@@ -465,13 +414,7 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[
         except Exception as e:
             logger.warning("⚠️ Falha na geração (tentativa %d/%d): %s", attempt, max_retries, e)
     logger.error("❌ Não conseguiu gerar nova imagem após %d tentativas.", max_retries)
-
-# -------------------- Helpers de layout do texto --------------------
-_PUNCH_WORDS = {
-    "você","voce","vida","fé","fe","deus","foco","força","forca","coragem",
-    "propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"
-}
-
+_PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca","coragem", "propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
 def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
     segs = re.findall(r"\*\*(.+?)\*\*", s, flags=re.S)
     clean = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
@@ -482,7 +425,6 @@ def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
             if tok:
                 words.append(tok)
     return clean, words
-
 def _pick_highlights(line: str) -> List[str]:
     words = [re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", w).lower() for w in line.split()]
     for w in words:
@@ -492,7 +434,6 @@ def _pick_highlights(line: str) -> List[str]:
         if len(w) >= 3:
             return [w]
     return words[-1:] if words else []
-
 def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
     s = clean.strip()
@@ -509,7 +450,6 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
             punch = " ".join(ws[cut:])
         else:
             intro, punch = "", s
-
     if explicit_words:
         hl = explicit_words
     else:
@@ -520,48 +460,23 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
             hl = toks[-IMAGE_EMPHASIS_LAST_WORDS:] if toks else _pick_highlights(punch)
         else:
             hl = _pick_highlights(punch)
-
     return intro, punch, hl
-
-# -------------------- escolha de fonte por idioma --------------------
 def _font_for_lang(base_font: str, idioma: Optional[str], bold: bool = False) -> str:
     if _idioma_norm(idioma) == "ar":
         return ARABIC_FONT_IMAGE_BOLD if bold else ARABIC_FONT_IMAGE_REG
     return base_font
-
-# -------------------- Renders --------------------
 def _prepare_bg(img: Image.Image, base_dark: float, template: str) -> Image.Image:
     base = _ensure_1080x1920(img)
     if not IMAGE_DARK_ENABLE:
         logger.debug("🎛️ prepare_bg (NO-DARK) | template=%s", template)
         return base
-    return _darken_and_vignette(
-        base,
-        base_dark_alpha=int(255 * _clamp(base_dark, 0.0, 1.0)),
-        vig=IMAGE_VIGNETTE_STRENGTH,
-        softness=IMAGE_VIGNETTE_SOFTNESS,
-        center_protect=IMAGE_DARK_CENTER_PROTECT
-    )
-
-def _render_singleline_center(
-    img: Image.Image,
-    text: str,
-    *,
-    font_name: str,
-    width_ratio: float = 0.86,
-    y_ratio: float = 0.18,
-    min_size: int = 54,
-    max_size: int = 128,
-    stroke_ratio: float = 0.045,
-    idioma: Optional[str] = None
-) -> Image.Image:
+    return _darken_and_vignette(base, base_dark_alpha=int(255 * _clamp(base_dark, 0.0, 1.0)), vig=IMAGE_VIGNETTE_STRENGTH, softness=IMAGE_VIGNETTE_SOFTNESS, center_protect=IMAGE_DARK_CENTER_PROTECT)
+def _render_singleline_center(img: Image.Image, text: str, *, font_name: str, width_ratio: float = 0.86, y_ratio: float = 0.18, min_size: int = 54, max_size: int = 128, stroke_ratio: float = 0.045, idioma: Optional[str] = None) -> Image.Image:
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-
     W, H = img.size
     draw = ImageDraw.Draw(img)
     do_upper = (IMAGE_TEXT_UPPER and _idioma_norm(idioma) != "ar")
     text = text.upper() if do_upper else text
-
     font_name = _font_for_lang(font_name, idioma, bold=False)
     max_w = int(W * _clamp(width_ratio, 0.4, 0.95))
     lo, hi = min_size, max_size
@@ -575,10 +490,8 @@ def _render_singleline_center(
             hi = mid - 2
     font = _load_font(font_name, best)
     tw, _ = _text_size(draw, text, font)
-
     x = (W - tw) // 2
     y = int(H * _clamp(y_ratio, 0.05, 0.35))
-
     if IMAGE_TEXT_OUTLINE_STYLE == "stroke":
         stroke_w = max(1, int(best * stroke_ratio))
         _draw_text_with_stroke(draw, (x, y), text, font, "white", "black", stroke_w)
@@ -588,114 +501,67 @@ def _render_singleline_center(
         draw.text((x, y), text, font=font, fill="white")
     else:
         draw.text((x, y), text, font=font, fill="white")
-
     return img
-
 def _render_modern_block(img: Image.Image, frase: str, *, idioma: Optional[str] = None) -> Image.Image:
     img = _prepare_bg(img, IMAGE_DARK_MODERN, "modern_block").convert("RGBA")
     W, H = img.size
     draw = ImageDraw.Draw(img)
-
     intro, punch, hl_words = _split_for_emphasis(frase)
     is_ar = (_idioma_norm(idioma) == "ar")
     if IMAGE_TEXT_UPPER and not is_ar:
         intro = intro.upper()
         punch = punch.upper()
-
     base_scale = (W / 1080.0) * IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MODERN
     left_margin  = int(W * 0.08)
     right_margin = int(W * 0.08)
     maxw  = int(W - left_margin - right_margin)
     y     = int(H * 0.14)
-
-    # Intro (menor)
     if intro:
-        f_small, lines1 = _best_font_and_wrap(
-            draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False),
-            maxw, int(38*base_scale), int(70*base_scale), max_lines=2
-        )
+        f_small, lines1 = _best_font_and_wrap(draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False), maxw, int(38*base_scale), int(70*base_scale), max_lines=2)
         for ln in lines1:
             if is_ar:
-                _draw_line_simple(draw, 0, y, ln, f_small, rtl=True, fill="white",
-                                  style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(1, int(f_small.size*0.05)) if IMAGE_HL_STROKE else 0,
-                                  right_margin=right_margin, canvas_w=W)
+                _draw_line_simple(draw, 0, y, ln, f_small, rtl=True, fill="white", style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(1, int(f_small.size*0.05)) if IMAGE_HL_STROKE else 0, right_margin=right_margin, canvas_w=W)
             else:
-                _draw_line_colored(draw, left_margin, y, ln, f_small, set(),
-                                   fill="white", hl_fill=IMAGE_HL_COLOR, style=None)
+                _draw_line_colored(draw, left_margin, y, ln, f_small, set(), fill="white", hl_fill=IMAGE_HL_COLOR, style=None)
             y += int(f_small.size * 1.16)
         y += int(H * 0.018)
-
-    # Principal (bold)
-    f_main, lines2 = _best_font_and_wrap(
-        draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, bold=True),
-        maxw, int(68*base_scale), int(104*base_scale), max_lines=4
-    )
+    f_main, lines2 = _best_font_and_wrap(draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, bold=True), maxw, int(68*base_scale), int(104*base_scale), max_lines=4)
     for ln in lines2:
         if is_ar:
-            _draw_line_simple(draw, 0, y, ln, f_main, rtl=True, fill="white",
-                              style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(2, int(f_main.size*0.055)) if IMAGE_HL_STROKE else 0,
-                              right_margin=right_margin, canvas_w=W)
+            _draw_line_simple(draw, 0, y, ln, f_main, rtl=True, fill="white", style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(2, int(f_main.size*0.055)) if IMAGE_HL_STROKE else 0, right_margin=right_margin, canvas_w=W)
         else:
-            _draw_line_colored(
-                draw, left_margin, y, ln, f_main, set(hl_words),
-                fill="white", hl_fill=IMAGE_HL_COLOR, style=None,
-                stroke_w=max(2, int(f_main.size * 0.055)) if IMAGE_HL_STROKE else 0
-            )
+            _draw_line_colored(draw, left_margin, y, ln, f_main, set(hl_words), fill="white", hl_fill=IMAGE_HL_COLOR, style=None, stroke_w=max(2, int(f_main.size * 0.055)) if IMAGE_HL_STROKE else 0)
         y += int(f_main.size * 1.10)
-
     return img.convert("RGB")
-
 def _render_classic_serif(img: Image.Image, frase: str, *, idioma: Optional[str] = None) -> Image.Image:
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
     hl_set = set(explicit_words)
-
     img = _prepare_bg(img, IMAGE_DARK_CLASSIC, "classic_serif").convert("RGBA")
     W, H = img.size
     draw = ImageDraw.Draw(img)
-
     is_ar = (_idioma_norm(idioma) == "ar")
     text = clean.upper() if (IMAGE_TEXT_UPPER and not is_ar) else clean
     left_margin  = int(W * 0.12)
     right_margin = int(W * 0.10)
     maxw = int(W - left_margin - right_margin)
-
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
-    f_serif, lines = _best_font_and_wrap(
-        draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, bold=True),
-        maxw, int(54*scls), int(80*scls), max_lines=4
-    )
-
+    f_serif, lines = _best_font_and_wrap(draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, bold=True), maxw, int(54*scls), int(80*scls), max_lines=4)
     y = int(H*0.20)
     for ln in lines:
         if is_ar:
-            _draw_line_simple(
-                draw, 0, y, ln, f_serif, rtl=True, fill="white",
-                style=IMAGE_TEXT_OUTLINE_STYLE,
-                stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0,
-                right_margin=right_margin, canvas_w=W
-            )
+            _draw_line_simple(draw, 0, y, ln, f_serif, rtl=True, fill="white", style=IMAGE_TEXT_OUTLINE_STYLE, stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0, right_margin=right_margin, canvas_w=W)
         else:
-            _draw_line_colored(
-                draw, left_margin, y, ln, f_serif,
-                highlight_set=(hl_set if (hl_set or not IMAGE_EMPHASIS_ONLY_MARKUP) else set()),
-                fill="white",
-                hl_fill=IMAGE_HL_COLOR,
-                style=None,
-                stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0
-            )
+            _draw_line_colored(draw, left_margin, y, ln, f_serif, highlight_set=(hl_set if (hl_set or not IMAGE_EMPHASIS_ONLY_MARKUP) else set()), fill="white", hl_fill=IMAGE_HL_COLOR, style=None, stroke_w=max(1, int(f_serif.size * 0.05)) if IMAGE_HL_STROKE else 0)
         y += int(f_serif.size * 1.18)
     return img.convert("RGB")
-
 def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str] = None) -> Image.Image:
     img = _prepare_bg(img, IMAGE_DARK_MINIMAL, "minimal_center").convert("RGBA")
     W, H = img.size
     draw = ImageDraw.Draw(img)
-
     is_ar = (_idioma_norm(idioma) == "ar")
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MINIMAL
     big_name   = _font_for_lang("BebasNeue-Regular.ttf", idioma, bold=True)
     small_name = _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False)
-
     clean, _ = _parse_highlights_from_markdown(frase)
     two = quebrar_em_duas_linhas(clean)
     if IMAGE_TEXT_UPPER and not is_ar:
@@ -703,21 +569,16 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
     parts = two.split("\n")
     l1 = parts[0].strip()
     l2 = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
-
     small = _load_font(small_name, max(36, int(W*0.039*scls)))
     big   = _load_font(big_name,   max(90, int(W*0.102*scls)))
-
     right_margin = int(W*0.08)
     left_margin  = int(W*0.08)
-
-    # Linha pequena (l1)
     b1 = draw.textbbox((0,0), l1, font=small); tw1 = b1[2]-b1[0]; th1 = b1[3]-b1[1]
     if is_ar:
         x1 = max(0, W - right_margin - tw1)
     else:
         x1 = (W - tw1)//2
     y = int(H*0.20)
-
     if IMAGE_TEXT_OUTLINE_STYLE == "stroke":
         _draw_text_with_stroke(draw, (x1, y), l1, small, "white", "black", max(1, int(small.size*0.05)))
     elif IMAGE_TEXT_OUTLINE_STYLE == "shadow":
@@ -726,10 +587,7 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
         draw.text((x1, y), l1, font=small, fill="white")
     else:
         draw.text((x1, y), l1, font=small, fill="white")
-
     y += th1 + int(H*0.02)
-
-    # Quebra da big (l2) respeitando margem/RTL
     maxw = int(W - left_margin - right_margin)
     words = l2.split(); cur=""; lines=[]
     for w in words:
@@ -740,14 +598,12 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
             if cur: lines.append(cur)
             cur=w
     if cur: lines.append(cur)
-
     for ln in lines:
         bb=draw.textbbox((0,0), ln, font=big); tw=bb[2]-bb[0]
         if is_ar:
             x = max(0, W - right_margin - tw)
         else:
             x = (W - tw)//2
-
         if IMAGE_TEXT_OUTLINE_STYLE == "stroke":
             _draw_text_with_stroke(draw, (x, y), ln, big, "white", "black", max(2, int(big.size*0.05)))
         elif IMAGE_TEXT_OUTLINE_STYLE == "shadow":
@@ -758,56 +614,42 @@ def _render_minimal_center(img: Image.Image, frase: str, *, idioma: Optional[str
             draw.text((x, y), ln, font=big, fill="white")
         y += (bb[3]-bb[1]) + int(big.size*0.06)
     return img.convert("RGB")
-
-# -------------------- API pública --------------------
-def escrever_frase_na_imagem(imagem_path: str, frase: str, saida_path: str, *,
-                             idioma: str = "pt-br", template: str = "auto") -> None:
+def escrever_frase_na_imagem(imagem_path: str, frase: str, saida_path: str, *, idioma: str = "pt-br", template: str = "auto") -> None:
     if not os.path.exists(imagem_path):
         raise FileNotFoundError(imagem_path)
     img = Image.open(imagem_path)
-
     if template == "auto":
         template = random.choice(["classic_serif", "modern_block", "minimal_center"])
-
     if template == "classic_serif":
         out = _render_classic_serif(img, frase, idioma=idioma)
     elif template == "minimal_center":
         out = _render_minimal_center(img, frase, idioma=idioma)
     else:
         out = _render_modern_block(img, frase, idioma=idioma)
-
     os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
     out.save(saida_path, quality=92)
-
     try:
         w, h = out.size
         size_kb = os.path.getsize(saida_path) // 1024
     except Exception:
         w = h = size_kb = -1
-
     logger.info("✅ Imagem final salva (%s) | %dx%d | %d KB", template, w, h, size_kb)
-
 def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[str] = None, *, idioma: Optional[str] = None) -> List[str]:
     if not PEXELS_API_KEY:
         logger.error("❌ PEXELS_API_KEY não configurado.")
         return [p for p in [primeira_imagem] if p and os.path.isfile(p)]
-
     region = _pick_proxy_region(None, idioma)
     session = _get_session(region)
-
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "portrait", "size": "large", "per_page": 30, "page": 1}
     logger.debug("🖼️ Slides Pexels: query='%s' count=%d (region=%s)", query, count, region or "DEFAULT")
-
     r = session.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     photos = r.json().get("photos") or []
     logger.debug("🖼️ Slides Pexels: resultados=%d", len(photos))
-
     slides: List[str] = []
     if primeira_imagem and os.path.isfile(primeira_imagem):
         slides.append(primeira_imagem)
-
     random.shuffle(photos)
     for photo in photos:
         if len(slides) >= count:
@@ -832,9 +674,9 @@ def montar_slides_pexels(query: str, count: int = 4, primeira_imagem: Optional[s
             slides.append(out)
         except Exception as e:
             logger.warning("⚠️ Falha ao baixar slide id=%s: %s", photo.get("id"), e)
-
     if not slides and primeira_imagem and os.path.isfile(primeira_imagem):
         slides = [primeira_imagem]
-
     logger.info("🖼️ %d slide(s) prontos.", len(slides[:count]))
     return slides[:count]
+
+# --- FIM DO CONTEÚDO EXISTENTE ---
