@@ -6,7 +6,7 @@ import random
 import json
 import hashlib
 import time
-from typing import List, Set, Tuple, Optional
+from typing import List, Set, Tuple, Optional, Dict
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,12 +37,15 @@ logger = logging.getLogger(__name__)
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "45"))
 
 # -----------------------------------------------------------------------------#
-# Cache
+# Cache & Resources (Lógica de Fallback Externalizada Adicionada)
 # -----------------------------------------------------------------------------#
 CACHE_DIR = "cache"
+RESOURCES_DIR = "resources"
 os.makedirs(CACHE_DIR, exist_ok=True)
 PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_phrases.json")
 LONG_PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_long_phrases.json")
+FALLBACK_PHRASES_FILE = os.path.join(RESOURCES_DIR, "fallback_phrases.json")
+_FALLBACK_PHRASES_CACHE: Optional[Dict] = None
 
 
 def load_used_phrases(cache_file: str) -> Set[str]:
@@ -98,6 +101,25 @@ def _load_prompt_template(template_name: str) -> str:
             raise ValueError(f"O arquivo YAML '{config_path}' não contém a chave 'template' ou ela está vazia.")
         return template.strip()
 
+# --- NOVA FUNÇÃO HELPER PARA FALLBACKS ---
+def _get_fallback_phrase(theme: str, lang: str) -> str:
+    """Carrega o JSON de fallbacks e escolhe uma frase aleatória."""
+    global _FALLBACK_PHRASES_CACHE
+    if _FALLBACK_PHRASES_CACHE is None:
+        try:
+            with open(FALLBACK_PHRASES_FILE, "r", encoding="utf-8") as f:
+                _FALLBACK_PHRASES_CACHE = json.load(f)
+        except Exception as e:
+            logger.error(f"Erro fatal ao carregar arquivo de fallback '{FALLBACK_PHRASES_FILE}': {e}")
+            _FALLBACK_PHRASES_CACHE = {}
+    
+    phrases = _FALLBACK_PHRASES_CACHE.get(theme, {}).get(lang, [])
+    if phrases:
+        return random.choice(phrases)
+    
+    logger.error(f"Nenhuma frase de fallback encontrada para tema='{theme}' e idioma='{lang}'.")
+    return "Acredite no poder dos seus sonhos."
+# --- FIM DA NOVA FUNÇÃO ---
 
 def _lang_tag(idioma: Optional[str]) -> str:
     s = (idioma or "en").strip().lower()
@@ -140,14 +162,8 @@ def _ask_json_list(prompt: str, temperature: float = 1.0, tries: int = 3) -> Lis
             raw = (getattr(resp, "text", "") or "").strip()
             data = json.loads(raw)
             if isinstance(data, list):
-                out = []
-                for it in data:
-                    if isinstance(it, str):
-                        c = _clean_line(it)
-                        if c:
-                            out.append(c)
-                if out:
-                    return out
+                out = [c for it in data if isinstance(it, str) and (c := _clean_line(it))]
+                if out: return out
         except Exception as e:
             logger.warning("Falha ao pedir lista JSON ao Gemini (tentativa %d/%d): %s", attempt + 1, tries, e)
         time.sleep(0.8 * (attempt + 1))
@@ -159,30 +175,16 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
 
     spans = list(re.finditer(r'\*\*([^*]+)\*\*', base))
     if len(spans) == 1:
-        inner = spans[0].group(1).strip()
-        words = [w for w in re.findall(r"[\w’'-]+", inner) if w]
-        if len(words) > 2:
-            inner = " ".join(words[-2:])
-        base_no = re.sub(r'\*\*([^*]+)\*\*', r'\1', base)
-        idx = base_no.lower().rfind(inner.lower())
-        if idx >= 0:
-            return base_no[:idx] + "**" + base_no[idx:idx+len(inner)] + "**" + base_no[idx+len(inner):]
+        return base
 
     base = _strip_emph(base)
-
     tokens = re.findall(r"\w+|\W+", base, flags=re.UNICODE)
-    picks: List[int] = []
-    for i in range(len(tokens)-1, -1, -1):
-        if re.match(r"\w+", tokens[i], flags=re.UNICODE):
-            word = tokens[i].strip(" _").lower()
-            if len(word) >= 3 and word not in sw:
-                picks.append(i)
-                if len(picks) >= prefer_last_n:
-                    break
+    picks = [i for i, token in enumerate(tokens) if re.match(r"\w+", token) and len(token) >= 3 and token.lower() not in sw]
     if not picks:
         return base
-    picks = sorted(picks)
-    i0, i1 = picks[0], picks[-1]
+    
+    target_indices = picks[-prefer_last_n:]
+    i0, i1 = target_indices[0], target_indices[-1]
     tokens[i0] = "**" + tokens[i0]
     tokens[i1] = tokens[i1] + "**"
     return "".join(tokens)
@@ -267,16 +269,12 @@ def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3, plata
 # -----------------------------------------------------------------------------#
 # Geradores de Prompt de Imagem
 # -----------------------------------------------------------------------------#
-def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "en") -> List[str]: # A assinatura mantém 'idioma' por consistência, mas não será usado.
+def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "en") -> List[str]:
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ GEMINI_API_KEY não configurada.")
         return [f"{tema}, variação {i+1}" for i in range(quantidade)]
 
-    # --- ALTERAÇÃO PRINCIPAL AQUI ---
-    # Ignora o idioma de entrada e força a geração dos prompts de imagem em português
-    # para maximizar a criatividade na ideação.
     target_lang_name = LANG_NAME_MAP["pt"]
-    # --- FIM DA ALTERAÇÃO ---
 
     template = _load_prompt_template("image_prompts")
     prompt_text = template.format(
@@ -322,40 +320,38 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
         return _clean_line(chosen)
 
     logger.warning("Nenhuma frase curta inédita foi gerada, usando fallback.")
-    return "Você tem o **poder** de criar a vida que deseja." if lang == "pt" else "You have the **power** to create the life you desire."
+    return _get_fallback_phrase("motivacional_curta", lang)
 
 def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
-    """Gera uma frase longa para narração, garantindo que seja inédita."""
     lang = _lang_tag(idioma)
     target_lang_name = LANG_NAME_MAP.get(lang, "inglês")
-
     template = _load_prompt_template("long_motivational")
     prompt_text = template.format(target_lang_name=target_lang_name)
     
-    fallback = (
-        "Lembre-se que cada passo que você dá, por menor que seja, é um movimento poderoso na direção da vida extraordinária que você não só merece, mas é capaz de construir."
-        if lang == "pt" else
-        "Remember that every step you take, no matter how small, is a powerful movement towards the extraordinary life you not only deserve, but are capable of building."
-    )
-    if lang == "ar":
-        fallback = "تذكر أن كل خطوة تخطوها، مهما كانت صغيرة، هي حركة قوية نحو الحياة الاستثنائية التي لا تستحقها فحسب، بل أنت قادر على بنائها."
-
+    MAX_ATTEMPTS = 3
     used_long_phrases = load_used_phrases(LONG_PHRASES_CACHE_FILE)
-    phrases = _ask_json_list(prompt_text, temperature=1.2, tries=4)
     
-    valid_phrases = [
-        p for p in phrases if 25 <= _count_words_no_markup(p) <= 40 and _md5(p) not in used_long_phrases
-    ]
-    
-    if valid_phrases:
-        chosen = random.choice(valid_phrases)
-        used_long_phrases.add(_md5(chosen))
-        save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
-        logger.info("Frase longa inédita selecionada para narração.")
-        return _clean_line(chosen)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        logger.info(f"Tentando gerar frase longa inédita (tentativa {attempt}/{MAX_ATTEMPTS})...")
+        phrases = _ask_json_list(prompt_text, temperature=1.2, tries=2)
+        
+        valid_phrases = [
+            p for p in phrases if 25 <= _count_words_no_markup(p) <= 40 and _md5(p) not in used_long_phrases
+        ]
+        
+        if valid_phrases:
+            chosen = random.choice(valid_phrases)
+            used_long_phrases.add(_md5(chosen))
+            save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
+            logger.info("✅ Frase longa inédita selecionada para narração.")
+            return _clean_line(chosen)
+        
+        if attempt < MAX_ATTEMPTS:
+            logger.info(f"Tentativa {attempt} não gerou frases novas. Tentando novamente...")
+            time.sleep(1)
 
-    logger.warning("Nenhuma frase longa inédita foi gerada, usando fallback.")
-    return fallback
+    logger.warning(f"Nenhuma frase longa inédita foi gerada após {MAX_ATTEMPTS} tentativas, usando fallback.")
+    return _get_fallback_phrase("motivacional_longa", lang)
 
 # -----------------------------------------------------------------------------#
 # Tarot
@@ -367,46 +363,44 @@ def gerar_prompt_tarot(idioma: str = "en") -> str:
 def gerar_frase_tarot_curta(idioma: str = "en") -> str:
     lang = _lang_tag(idioma)
     target_lang_name = LANG_NAME_MAP.get(lang, "inglês")
-    
     template = _load_prompt_template("short_tarot")
     prompt_text = template.format(target_lang_name=target_lang_name)
-    
     phrases = _ask_json_list(prompt_text, temperature=1.2)
+    
     if phrases:
+        # Para frases curtas, o cache é menos crítico, podemos pegar uma aleatória
         return _ensure_single_emphasis(random.choice(phrases), lang)
     
     logger.warning("Nenhuma frase curta de tarot foi gerada, usando fallback.")
-    return "As cartas revelam um novo **caminho** para você." if lang == "pt" else "The cards reveal a new **path** for you."
+    return _get_fallback_phrase("tarot_curta", lang)
 
 def gerar_frase_tarot_longa(idioma: str = "en") -> str:
-    """Gera uma frase longa de tarot para narração, garantindo que seja inédita."""
     lang = _lang_tag(idioma)
     target_lang_name = LANG_NAME_MAP.get(lang, "inglês")
-
     template = _load_prompt_template("long_tarot")
     prompt_text = template.format(target_lang_name=target_lang_name)
     
-    fallback = (
-        "As energias cósmicas se alinham para iluminar sua jornada, revelando verdades ocultas nas sombras do tempo e oferecendo a clareza que sua alma anseia para evoluir."
-        if lang == "pt" else
-        "The cosmic energies align to illuminate your journey, revealing hidden truths in the shadows of time and offering the clarity your soul craves to evolve."
-    )
-    if lang == "ar":
-        fallback = "الطاقات الكونية تتراصف لتنير رحلتك، كاشفة عن حقائق خفية في ظلال الزمن ومانحة الوضوح الذي تتوق إليه روحك للتطور."
-
+    MAX_ATTEMPTS = 3
     used_long_phrases = load_used_phrases(LONG_PHRASES_CACHE_FILE)
-    phrases = _ask_json_list(prompt_text, temperature=1.2, tries=4)
-    
-    valid_phrases = [
-        p for p in phrases if 25 <= _count_words_no_markup(p) <= 40 and _md5(p) not in used_long_phrases
-    ]
-    
-    if valid_phrases:
-        chosen = random.choice(valid_phrases)
-        used_long_phrases.add(_md5(chosen))
-        save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
-        logger.info("Frase longa de tarot inédita selecionada para narração.")
-        return _clean_line(chosen)
 
-    logger.warning("Nenhuma frase longa de tarot inédita foi gerada, usando fallback.")
-    return fallback
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        logger.info(f"Tentando gerar frase longa de tarot inédita (tentativa {attempt}/{MAX_ATTEMPTS})...")
+        phrases = _ask_json_list(prompt_text, temperature=1.2, tries=2)
+        
+        valid_phrases = [
+            p for p in phrases if 25 <= _count_words_no_markup(p) <= 40 and _md5(p) not in used_long_phrases
+        ]
+        
+        if valid_phrases:
+            chosen = random.choice(valid_phrases)
+            used_long_phrases.add(_md5(chosen))
+            save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
+            logger.info("✅ Frase longa de tarot inédita selecionada para narração.")
+            return _clean_line(chosen)
+            
+        if attempt < MAX_ATTEMPTS:
+            logger.info(f"Tentativa {attempt} não gerou frases novas. Tentando novamente...")
+            time.sleep(1)
+
+    logger.warning(f"Nenhuma frase longa de tarot inédita foi gerada após {MAX_ATTEMPTS} tentativas, usando fallback.")
+    return _get_fallback_phrase("tarot_longa", lang)
