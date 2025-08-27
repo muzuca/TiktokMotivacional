@@ -1,22 +1,23 @@
 # utils/veo3_flow.py
 # Automação do Google Labs Flow (Veo3) via Selenium + cookies Netscape.
-# Destaques:
+# Recursos:
 # - Cookies Netscape injetados por domínio (evita login).
-# - Abre "Novo projeto" com rotina de scroll de destrava (evita misclick).
+# - Abre "Novo projeto" com rotina de scroll anti-layout.
 # - Força "Respostas por comando"=1 (apenas uma vez).
-# - LIMPEZA: remove todos os vídeos já existentes no projeto antes de cada cena.
-# - Prompt multiline via JS (sem ENTER quebrar texto).
-# - Probes periódicos (hover/pausa) até ver "Baixar".
-# - Clique robusto no menu Radix: Baixar → "Tamanho original (720p)".
-# - Download com retries e grace de chegada do arquivo.
-# - Detecta "travou em 99%" e faz refresh automático.
-# - Exclui o cartão após cada download.
-# - Novo: generate_many_via_flow(prompts[]) mantém UMA sessão para N cenas.
-# - NEW: _delete_current_video() e limpeza FINAL garantida antes de fechar o navegador.
-
+# - LIMPEZA: remove vídeos/cartões existentes antes de cada geração.
+# - Prompt multiline via JS (sem ENTER indesejado).
+# - Anti-stall 99% (refresh automático com limites).
+# - Busca robusta do menu "Baixar" → 720p (Original), download com retries.
+# - Checagem de ÁUDIO via ffprobe; se estiver mudo, re‑gera a cena na hora.
+# - Exclui cartão após baixar; limpeza final garantida.
+# - APIs: generate_single_via_flow / generate_many_via_flow (uma sessão para N cenas).
+#
+# Observação: Depende de Selenium + ChromeDriver compatível e ffprobe no PATH (para checar áudio).
+#             Se ffprobe não estiver disponível, a checagem de áudio é ignorada.
+#
 from __future__ import annotations
-import os, time, glob, shutil, logging
-from typing import List, Dict, Tuple
+import os, time, glob, shutil, logging, subprocess
+from typing import List, Dict, Tuple, Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -60,6 +61,7 @@ def _group_cookie_domains(cookies: List[Dict]) -> List[str]:
         d = (ck.get("domain") or "").strip().lstrip(".")
         if d:
             hosts.add(d)
+    # Domínios de 2 níveis por último (ordem ajuda a evitar redirecionamentos chatos)
     return sorted(hosts, key=lambda h: (h.count("."), len(h)))
 
 def _add_cookies_multi_domain(driver: webdriver.Chrome, cookies: List[Dict]) -> None:
@@ -90,15 +92,18 @@ def _add_cookies_multi_domain(driver: webdriver.Chrome, cookies: List[Dict]) -> 
 def _chrome(download_dir: str, headless: bool = True) -> webdriver.Chrome:
     os.makedirs(download_dir, exist_ok=True)
     opts = Options()
+    # Janela
     if headless:
         opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=1366,900")
+    # Robustez
     opts.add_argument("--log-level=3")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1366,900")
+    # Downloads
     opts.add_experimental_option("prefs", {
         "download.default_directory": os.path.abspath(download_dir),
         "download.prompt_for_download": False,
@@ -242,7 +247,7 @@ def _open_flow_home(driver: webdriver.Chrome, entry_url: str):
 
 def _unlock_home_scroll(driver: webdriver.Chrome):
     """Mitiga layout primeiro paint: espera e faz scroll down/up para liberar o botão 'Novo projeto'."""
-    time.sleep(1.2)
+    time.sleep(1.0)
     try:
         driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.7));")
         time.sleep(0.25)
@@ -254,7 +259,7 @@ def _unlock_home_scroll(driver: webdriver.Chrome):
 def _click_novo_projeto(driver: webdriver.Chrome):
     """
     Clica especificamente em botões/elementos de texto 'Novo projeto'.
-    Evita clicar em <a href="/project/..."> de cartões já existentes.
+    Evita clicar em <a href='/project/...'> de cartões.
     """
     _unlock_home_scroll(driver)
     try:
@@ -266,7 +271,7 @@ def _click_novo_projeto(driver: webdriver.Chrome):
         _safe_click(driver, btn); return
     except Exception:
         pass
-    # alternativa: buscar qualquer botão com label 'Novo projeto'
+    # alternativa por JS
     try:
         el = driver.execute_script(r"""
 const matches = (el, txts) => {
@@ -304,6 +309,64 @@ def _force_respostas_por_comando_1(driver: webdriver.Chrome):
     _safe_click(driver, opt_1)
     try: driver.find_element(By.TAG_NAME, "body").click()
     except Exception: pass
+
+# --- INÍCIO DA FUNÇÃO ATUALIZADA (VERSÃO 3) ---
+def _force_model_veo3_fast(driver: webdriver.Chrome):
+    """
+    Seleciona o modelo 'Veo 3 - Fast' no menu de modelos para garantir a geração de áudio.
+    Esta versão é mais robusta, focando nos contêineres dos itens de menu.
+    """
+    logger.info("🔧 Tentando forçar o modelo para 'Veo 3 - Fast'...")
+    
+    # Bloco 1: Clicar no menu principal de seleção de modelo
+    model_menu_button = None
+    try:
+        logger.info("   - Passo 1: Procurando o botão do menu de modelo...")
+        model_menu_button = _first_visible(driver, [
+            (By.XPATH, "//button[@role='combobox' and .//span[text()='Modelo']]"),
+        ], timeout=20)
+        
+        # Verifica se o modelo já está selecionado para evitar cliques desnecessários
+        if "Veo 3 - Fast" in model_menu_button.text:
+            logger.info("✅ Modelo 'Veo 3 - Fast' já está selecionado. Nenhuma ação necessária.")
+            return
+
+        _safe_click(driver, model_menu_button)
+        logger.info("   - Passo 1 SUCESSO: Menu de modelo clicado.")
+        time.sleep(1.5) # Pausa crucial para a animação do menu
+
+    except Exception as e:
+        logger.error("❌ FALHA no Passo 1: Não foi possível encontrar ou clicar no menu de seleção de modelo.")
+        logger.error("   - Detalhes do erro: %s", e)
+        _dump_debug(driver, "model_menu_button_fail")
+        return
+
+    # Bloco 2: Clicar na opção desejada dentro do menu aberto
+    try:
+        logger.info("   - Passo 2: Procurando a opção 'Veo 3 - Fast' no menu...")
+        # Este seletor encontra o contêiner da opção que TEM um filho com o texto exato.
+        veo3_fast_option_container = _first_visible(driver, [
+            (By.XPATH, "//div[@role='option'][.//div[text()='Veo 3 - Fast']]"),
+        ], timeout=10)
+
+        _safe_click(driver, veo3_fast_option_container)
+        
+        # Bloco 3: Verificação pós-clique
+        logger.info("   - Passo 3: Verificando se a seleção foi aplicada...")
+        WebDriverWait(driver, 10).until(
+            EC.text_to_be_present_in_element(
+                (By.XPATH, "//button[@role='combobox' and .//span[text()='Modelo']]"),
+                "Veo 3 - Fast"
+            )
+        )
+        logger.info("✅ SUCESSO: Modelo 'Veo 3 - Fast' selecionado e confirmado.")
+        time.sleep(0.5)
+
+    except Exception as e:
+        logger.error("❌ FALHA nos Passos 2/3: Não foi possível selecionar ou confirmar a opção 'Veo 3 - Fast'.")
+        logger.error("   - Detalhes do erro: %s", e)
+        _dump_debug(driver, "model_option_fail")
+# --- FIM DA FUNÇÃO ATUALIZADA ---
 
 # ----------- Injeção segura do prompt -----------
 def _set_text_multiline_js(driver: webdriver.Chrome, element, text: str) -> None:
@@ -399,7 +462,7 @@ def _click_download_720p_once(driver: webdriver.Chrome) -> bool:
         return False
 
     candidates_xp = [
-        ".//div[@role='menuitem'][.//i[normalize-space()='capture']]",  # ícone do 720p
+        ".//div[@role='menuitem'][.//i[normalize-space()='capture']]",
         ".//div[@role='menuitem'][contains(normalize-space(.), 'Tamanho original (720p)')]",
         ".//div[@role='menuitem'][contains(normalize-space(.), 'Original') and contains(normalize-space(.), '720p')]",
         ".//div[@role='menuitem'][contains(normalize-space(.), '720p')]",
@@ -480,7 +543,7 @@ def _clear_existing_videos(driver: webdriver.Chrome, max_loops: int = 8) -> int:
         logger.info("🧹 Limpeza: nenhum vídeo anterior encontrado.")
     return removed
 
-# ----------- Apagar o vídeo ATUAL pelo mesmo menu do download (mais resiliente) -----------
+# ----------- Apagar o vídeo ATUAL pelo mesmo menu do download -----------
 def _delete_current_video(driver: webdriver.Chrome, tries: int = 3, timeout: int = 20) -> bool:
     """
     Abre o menu do vídeo atual (via botão 'Baixar' ou 'more_vert') e clica em 'Excluir'.
@@ -498,11 +561,6 @@ def _delete_current_video(driver: webdriver.Chrome, tries: int = 3, timeout: int
                 driver.execute_script("arguments[0].click();", el); return True
             except Exception:
                 return False
-
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
 
     for attempt in range(tries):
         if not _videos_visible():
@@ -553,7 +611,8 @@ def _delete_current_video(driver: webdriver.Chrome, tries: int = 3, timeout: int
         time.sleep(1.0)
 
     # Se falhou em excluir, considera ok se já não houver vídeo
-    return not _videos_visible()
+    vids = driver.find_elements(By.TAG_NAME, "video")
+    return not any(v.is_displayed() for v in vids)
 
 # ----------- Download 720p (probes + retries + refresh em 99%) -----------
 def _wait_download_720p(driver: webdriver.Chrome, download_dir: str, before: List[str]) -> str:
@@ -653,6 +712,7 @@ def _wait_download_720p(driver: webdriver.Chrome, download_dir: str, before: Lis
     _dump_debug(driver, "download_timeout")
     raise TimeoutException("Timeout geral tentando efetuar o download 720p.")
 
+# ----------- Delete via menu do cartão atual (atalho) -----------
 def _delete_card(driver: webdriver.Chrome):
     def _find_delete_item():
         xp = ("//div[@role='menuitem' and .//i[normalize-space()='delete'] "
@@ -677,6 +737,38 @@ def _delete_card(driver: webdriver.Chrome):
     except Exception as e:
         logger.debug("Não foi possível excluir no Flow (seguindo): %s", e)
 
+# ====================== Áudio: ffprobe ======================
+def _ffprobe_path() -> Optional[str]:
+    p = shutil.which("ffprobe")
+    if not p:
+        logger.warning("ffprobe não encontrado no PATH — pulando checagem de áudio (FLOW_CHECK_AUDIO=0 para ocultar este aviso).")
+    return p
+
+def _has_audio_ffprobe(video_path: str) -> Optional[bool]:
+    """Retorna True/False se conseguiu checar; None se ffprobe indisponível/erro."""
+    ffprobe = _ffprobe_path()
+    if not ffprobe or not os.path.isfile(video_path):
+        return None
+    try:
+        # Lista os índices de streams de áudio; se vazio => sem áudio
+        cmd = [ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", video_path]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10)
+        has_audio = bool(out.decode("utf-8", "ignore").strip())
+        return has_audio
+    except Exception as e:
+        logger.debug("ffprobe falhou ao checar áudio (%s): %s", video_path, e)
+        return None
+
+def _should_check_audio() -> bool:
+    v = (os.getenv("FLOW_CHECK_AUDIO", "1").strip() or "1")
+    return v not in {"0", "false", "no", "off"}
+
+def _noaudio_retries() -> int:
+    try:
+        return max(0, int(float(os.getenv("FLOW_NOAUDIO_RETRIES", "2"))))
+    except Exception:
+        return 2
+
 # ====================== APIs públicas ======================
 def generate_single_via_flow(
     prompt_text: str,
@@ -688,10 +780,10 @@ def generate_single_via_flow(
 ) -> str:
     """
     Mantido para retrocompatibilidade: abre sessão, gera 1 cena e fecha.
+    Agora com: re‑geração automática se o .mp4 vier sem trilha de áudio.
     """
     download_dir = os.path.abspath(os.path.dirname(out_path) or ".")
     os.makedirs(download_dir, exist_ok=True)
-    before = glob.glob(os.path.join(download_dir, "*.mp4"))
 
     driver = _chrome(download_dir=download_dir, headless=headless)
     try:
@@ -703,21 +795,68 @@ def generate_single_via_flow(
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
             _force_respostas_por_comando_1(driver)
+            _force_model_veo3_fast(driver) # --- CHAMADA DA FUNÇÃO ATUALIZADA ---
         else:
             driver.get(project_url)
 
-        _clear_existing_videos(driver)
+        # Loop com retries de "sem áudio"
+        max_regen = _noaudio_retries()
+        for attempt in range(1, max_regen + 2):
+            _clear_existing_videos(driver)
 
-        logger.info("Enviando prompt…")
-        _submit_prompt(driver, prompt_text)
-        logger.info("Prompt enviado; aguardando opção de download…")
+            before = glob.glob(os.path.join(download_dir, "*.mp4"))
 
-        mp4_tmp = _wait_download_720p(driver, download_dir, before)
-        logger.info("Vídeo baixado: %s", mp4_tmp)
+            logger.info("Enviando prompt…")
+            _submit_prompt(driver, prompt_text)
+            logger.info("Prompt enviado; aguardando opção de download…")
 
-        _delete_card(driver)  # tentativa primária de exclusão
+            mp4_tmp = _wait_download_720p(driver, download_dir, before)
+            logger.info("Vídeo baixado: %s", mp4_tmp)
 
-        # LIMPEZA FINAL extra (garantir que nada restou)
+            # Checagem de áudio
+            ok = True
+            if _should_check_audio():
+                has_aud = _has_audio_ffprobe(mp4_tmp)
+                if has_aud is False:
+                    ok = False
+                    logger.warning("⚠️ Arquivo sem trilha de áudio. Vou excluir e re‑gerar (tentativa %d).", attempt)
+                elif has_aud is None:
+                    logger.debug("Não foi possível confirmar áudio via ffprobe — seguindo com este arquivo.")
+                else:
+                    logger.info("✅ Áudio presente no arquivo gerado.")
+
+            if ok:
+                # Exclui cartão e move
+                _delete_card(driver)
+                if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
+                    if os.path.exists(out_path):
+                        try: os.remove(out_path)
+                        except Exception: pass
+                    shutil.move(mp4_tmp, out_path)
+                break
+            else:
+                # Limpa ui + apaga arquivo baixado e tenta de novo
+                try:
+                    _delete_card(driver)
+                except Exception:
+                    pass
+                try:
+                    os.remove(mp4_tmp)
+                except Exception:
+                    pass
+                if attempt >= (max_regen + 1):
+                    logger.error("❌ Sem áudio após %d tentativa(s). Seguiremos com o último arquivo mesmo assim.", attempt)
+                    if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
+                        if os.path.exists(out_path):
+                            try: os.remove(out_path)
+                            except Exception: pass
+                        shutil.move(mp4_tmp, out_path)
+                    break
+                else:
+                    time.sleep(1.0)
+                    continue
+
+        # LIMPEZA FINAL: garantir que não ficou vídeo no projeto
         try:
             if _delete_current_video(driver):
                 logger.info("🧹 Limpeza final: vídeo removido do projeto.")
@@ -726,11 +865,6 @@ def generate_single_via_flow(
         except Exception as e:
             logger.debug("Limpeza final falhou: %s", e)
 
-        if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
-            if os.path.exists(out_path):
-                try: os.remove(out_path)
-                except Exception: pass
-            shutil.move(mp4_tmp, out_path)
         return out_path
 
     except Exception:
@@ -751,11 +885,12 @@ def generate_many_via_flow(
     timeout_sec: int = 480,
 ) -> List[str]:
     """
-    NOVO: Gera N cenas em uma ÚNICA sessão e no MESMO projeto.
+    Gera N cenas em uma ÚNICA sessão e no MESMO projeto.
     Para cada cena:
       - limpa cartões existentes,
       - envia prompt,
       - baixa 720p (com retries, hover, anti-99%),
+      - **valida se o arquivo tem ÁUDIO; se não tiver, re‑gera a cena automaticamente**,
       - exclui o cartão baixado,
       - move o arquivo para o out_path correspondente.
     Fecha o navegador somente ao final (com limpeza final garantida).
@@ -763,7 +898,6 @@ def generate_many_via_flow(
     if len(prompts) != len(out_paths):
         raise ValueError("prompts e out_paths precisam ter o mesmo tamanho.")
 
-    # todos os downloads cairão na pasta do primeiro out_path (mesma pasta já usada no seu pipeline)
     download_dir = os.path.abspath(os.path.dirname(out_paths[0]) or ".")
     os.makedirs(download_dir, exist_ok=True)
 
@@ -778,39 +912,86 @@ def generate_many_via_flow(
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
             _force_respostas_por_comando_1(driver)
+            _force_model_veo3_fast(driver) # --- CHAMADA DA FUNÇÃO ATUALIZADA ---
         else:
             driver.get(project_url)
 
         results: List[str] = []
+        max_regen = _noaudio_retries()
+
         for idx, (prompt_text, out_path) in enumerate(zip(prompts, out_paths), start=1):
             logger.info("──────── Cena %d/%d ────────", idx, len(prompts))
 
-            # limpar cartões existentes ANTES de enviar o prompt da cena
-            _clear_existing_videos(driver)
+            success = False
+            for attempt in range(1, max_regen + 2):
 
-            # coletar baseline de arquivos para detectar o novo .mp4
-            before = glob.glob(os.path.join(download_dir, "*.mp4"))
+                # limpar cartões existentes ANTES de enviar o prompt da cena
+                _clear_existing_videos(driver)
 
-            # enviar prompt
-            logger.info("Enviando prompt…")
-            _submit_prompt(driver, prompt_text)
-            logger.info("Prompt enviado; aguardando opção de download…")
+                # baseline de arquivos para detectar o novo .mp4
+                before = glob.glob(os.path.join(download_dir, "*.mp4"))
 
-            # aguarda e tenta os cliques de download 720p (com anti-99%)
-            mp4_tmp = _wait_download_720p(driver, download_dir, before)
-            logger.info("Vídeo baixado: %s", mp4_tmp)
+                # enviar prompt
+                logger.info("Enviando prompt…")
+                _submit_prompt(driver, prompt_text)
+                logger.info("Prompt enviado; aguardando opção de download…")
 
-            # excluir o cartão do vídeo que acabou de baixar (mantém projeto limpo)
-            _delete_card(driver)
+                # aguarda e tenta os cliques de download 720p (com anti-99%)
+                mp4_tmp = _wait_download_720p(driver, download_dir, before)
+                logger.info("Vídeo baixado: %s", mp4_tmp)
 
-            # mover para o destino final desta cena
-            if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
-                if os.path.exists(out_path):
-                    try: os.remove(out_path)
-                    except Exception: pass
-                shutil.move(mp4_tmp, out_path)
+                # Checagem de áudio
+                ok = True
+                if _should_check_audio():
+                    has_aud = _has_audio_ffprobe(mp4_tmp)
+                    if has_aud is False:
+                        ok = False
+                        logger.warning("⚠️ Cena %d: arquivo sem trilha de áudio. Re‑gerando (tentativa %d)…", idx, attempt)
+                    elif has_aud is None:
+                        logger.debug("Cena %d: não foi possível confirmar áudio via ffprobe — seguindo com este arquivo.", idx)
+                    else:
+                        logger.info("Cena %d: ✅ Áudio presente.", idx)
 
-            results.append(out_path)
+                if ok:
+                    # excluir o cartão do vídeo baixado
+                    _delete_card(driver)
+
+                    # mover para o destino final desta cena
+                    if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
+                        if os.path.exists(out_path):
+                            try: os.remove(out_path)
+                            except Exception: pass
+                        shutil.move(mp4_tmp, out_path)
+
+                    results.append(out_path)
+                    success = True
+                    break  # próxima cena
+                else:
+                    # excluir cartão + deletar arquivo, e tentar novamente
+                    try:
+                        _delete_card(driver)
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(mp4_tmp)
+                    except Exception:
+                        pass
+                    if attempt >= (max_regen + 1):
+                        logger.error("Cena %d: ❌ Sem áudio após %d tentativa(s). Usarei o último arquivo mesmo assim.", idx, attempt)
+                        if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
+                            if os.path.exists(out_path):
+                                try: os.remove(out_path)
+                                except Exception: pass
+                            shutil.move(mp4_tmp, out_path)
+                        results.append(out_path)
+                        success = True
+                        break
+                    else:
+                        time.sleep(1.0)
+                        continue
+
+            if not success:
+                raise RuntimeError(f"Falha ao gerar a cena {idx} (sem áudio repetidamente).")
 
         # LIMPEZA FINAL: garantir que não ficou vídeo no projeto
         try:

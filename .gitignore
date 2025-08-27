@@ -20,3 +20,4 @@ dist/
 build/
 chrome_cache/
 chrome_profiles/
+.chrome-profile-flow/
