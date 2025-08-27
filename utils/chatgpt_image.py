@@ -45,7 +45,6 @@ def gerar_imagem_chatgpt(prompt: str, cookies_path: str, arquivo_saida: str) -> 
 
     opts = uc.ChromeOptions()
     opts.add_argument("--log-level=3")
-    # A linha --window-size foi removida daqui, pois não é confiável.
     opts.add_experimental_option("prefs", {
         "download.default_directory": temp_download_dir
     })
@@ -55,11 +54,8 @@ def gerar_imagem_chatgpt(prompt: str, cookies_path: str, arquivo_saida: str) -> 
         logger.info(f"Iniciando automação com cookies (Headless: {headless})...")
         driver = uc.Chrome(options=opts, headless=headless)
         
-        # --- CORREÇÃO DEFINITIVA PARA O TAMANHO DA JANELA ---
-        # Este comando é executado após o navegador iniciar, sendo mais confiável.
         logger.info("Redimensionando a janela para 800x600...")
         driver.set_window_size(800, 600)
-        # --- FIM DA CORREÇÃO ---
 
         driver.set_page_load_timeout(60)
         
@@ -85,7 +81,7 @@ def gerar_imagem_chatgpt(prompt: str, cookies_path: str, arquivo_saida: str) -> 
                 try:
                     driver.add_cookie(cookie)
                 except Exception:
-                    pass # Ignora cookies que não podem ser adicionados
+                    pass
         
         logger.info("Cookies injetados. Atualizando a página para aplicar a sessão...")
         driver.get("https://chatgpt.com/")
@@ -98,10 +94,12 @@ def gerar_imagem_chatgpt(prompt: str, cookies_path: str, arquivo_saida: str) -> 
         )
         logger.info("Campo de texto visível encontrado.")
         
+        # --- ALTERAÇÃO AQUI: PROMPT-BASE EM PORTUGUÊS ---
         full_prompt = (
-            f"Generate a single photorealistic image with an aspect ratio of 9:16, based on the following theme: '{prompt}'. "
-            "Do not add any text or logos to the image. Focus on a cinematic and high-quality visual."
+            f"Crie uma única imagem fotorrealista com proporção 9:16, baseada no seguinte tema: '{prompt}'. "
+            "Não adicione texto ou logos na imagem. Foque em um visual cinematográfico e de alta qualidade."
         )
+        # --- FIM DA ALTERAÇÃO ---
         
         driver.execute_script(
             "arguments[0].innerHTML = arguments[1];", 

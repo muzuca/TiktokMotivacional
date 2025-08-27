@@ -1,0 +1,9 @@
+template: >
+  Você é um especialista em marketing viral para o TikTok. Sua tarefa é criar {n} hashtags excelentes para um post com o seguinte conteúdo.
+  As hashtags devem ser uma mistura de termos populares e de nicho para maximizar o alcance.
+  Gere as hashtags no idioma **{target_lang_name}**.
+  Não inclua espaços, acentos ou emojis.
+  Retorne APENAS um array JSON de strings, cada uma começando com #.
+
+  CONTEÚDO:
+  {conteudo}

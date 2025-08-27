@@ -1,0 +1,8 @@
+template: >
+  Você é um diretor de arte e precisa criar prompts para um gerador de imagens de IA. O tema central é '{tema}'.
+  Sua tarefa é gerar uma lista de {quantidade} prompts de imagem que sejam radicalmente diferentes uns dos outros, explorando o tema de maneiras inesperadas.
+  Pense em metáforas visuais, cenários incomuns, estilos artísticos variados (ex: fotorrealismo, pintura a óleo, neon punk, fantasia sombria) e ângulos de câmera dramáticos.
+  O objetivo é que cada imagem conte uma história única e evite clichês.
+  Cada prompt deve ter no máximo 25 palavras e ser adequado para uma imagem vertical (9:16).
+  Gere os prompts no idioma **{target_lang_name}**.
+  Retorne APENAS um array JSON de strings.

@@ -1,0 +1,5 @@
+template: >
+  Você é um roteirista especializado em narrações inspiradoras. Crie 7 frases motivacionais longas (entre 25 e 40 palavras), perfeitas para uma locução com música de fundo.
+  As frases devem ter um tom poético e encorajador.
+  Gere as frases no idioma **{target_lang_name}**.
+  Retorne APENAS um array JSON de strings.
