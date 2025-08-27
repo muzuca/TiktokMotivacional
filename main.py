@@ -177,6 +177,49 @@ def _cleanup_browsers(policy=None):
     if killed:
         logger.info("🧹 Cleanup browsers (%s): %d processo(s) finalizado(s).", policy, killed)
 
+# --------------------- retry de postagem ---------------------
+def _postar_com_retry(video_final: str, idioma: str, desc_tiktok: str) -> bool:
+    """
+    Envolve postar_no_tiktok_e_renomear com tentativas extras caso falhe.
+    Controlado por:
+      - ONEOFF_RETRY_MINUTES (default 10)
+      - ONEOFF_RETRY_MAX (default 1)  -> total de tentativas = 1 (imediata) + ONEOFF_RETRY_MAX
+    """
+    delay_min   = _int_env("ONEOFF_RETRY_MINUTES", 10)
+    max_retries = _int_env("ONEOFF_RETRY_MAX", 1)
+
+    tentativa = 0
+    while True:
+        tentativa += 1
+        ok = False
+        try:
+            ok = postar_no_tiktok_e_renomear(
+                descricao_personalizada=desc_tiktok,
+                video_final=video_final,
+                idioma=idioma
+            )
+        except Exception as e:
+            logger.exception("❌ Exceção ao postar no TikTok (tentativa %d): %s", tentativa, e)
+            ok = False
+
+        if ok:
+            logger.info("✅ Post confirmado no TikTok (tentativa %d).", tentativa)
+            return True
+
+        # Falhou
+        if tentativa > max_retries + 1:  # 1 imediata + N retries
+            logger.error("❌ Falha em todas as tentativas de postagem (%d).", tentativa - 1)
+            return False
+
+        # Preparar retry
+        logger.warning("⚠️ Post falhou (tentativa %d). Tentarei de novo em %d min...", tentativa, delay_min)
+        # Fecha chromedrivers/navegadores da execução anterior p/ evitar sessão zumbi
+        try:
+            _cleanup_browsers(policy="children")
+        except Exception:
+            pass
+        time.sleep(max(1, int(delay_min) * 60))
+
 def _run_rotina_once(args_tuple):
     try:
         _cleanup_browsers()
@@ -546,13 +589,12 @@ def rotina(modo_conteudo, idioma, tts_engine, legendas, video_style, motion, sli
             slides_paths=slides_para_video
         )
 
-    postar_no_tiktok_e_renomear(
-        descricao_personalizada=desc_tiktok,
-        video_final=video_final,
-        idioma=idioma
-    )
-    
-    logger.info("✅ Processo concluído com sucesso!")
+    # ---------- Postagem com retry ----------
+    ok_post = _postar_com_retry(video_final=video_final, idioma=idioma, desc_tiktok=desc_tiktok)
+    if ok_post:
+        logger.info("✅ Processo concluído com sucesso!")
+    else:
+        logger.error("❌ Processo finalizado sem confirmar postagem (após retries). Veja logs!")
 
 def postar_em_intervalo(cada_horas, modo_conteudo, idioma, tts_engine, legendas, video_style, motion, slides_count, image_engine):
     logger.info(f"⏱️ Modo automático base: {cada_horas:.2f} h (Ctrl+C para parar).")

@@ -4,6 +4,7 @@
 # - Normaliza cada cena para 9:16 (1080x1920) via scale+pad (SEM zoom)
 # - Junta cenas (concat) + BGM opcional (com Audio Ducking); aplica PÓS-ZOOM opcional no final
 # - Menus com "b/voltar": testar, gerar+postar, reutilizar, **exportar (sem postar)** e auto-config do modo automático
+
 from __future__ import annotations
 import os, re, json, time, shutil, random, logging, subprocess
 from typing import List, Dict, Optional, Tuple
@@ -65,6 +66,13 @@ FLOW_PROJECT_URL  = os.getenv("FLOW_PROJECT_URL", "").strip()
 FLOW_COOKIES_FILE = os.getenv("FLOW_COOKIES_FILE", "cookies_veo3.txt").strip()
 VEO3_HEADLESS     = os.getenv("VEO3_CHROME_HEADLESS", "1").strip() != "0"
 
+# Retry automático em caso de falha (modo automático)
+def _auto_retry_minutes() -> int:
+    try:
+        return int(float(os.getenv("AUTO_RETRY_MINUTES", "10")))
+    except Exception:
+        return 10
+
 # Tokens de "voltar"
 _BACK_TOKENS = {"b", "voltar", "back"}
 
@@ -89,6 +97,39 @@ def _ffprobe_or_die() -> str:
     if not p:
         raise RuntimeError("ffprobe não encontrado no PATH.")
     return p
+
+# ---------- ffprobe helpers ----------
+def _probe_json(path: str) -> dict:
+    try:
+        out = subprocess.check_output([
+            _ffprobe_or_die(),
+            "-v", "error", "-show_streams", "-show_format", "-of", "json", path
+        ], stderr=subprocess.STDOUT)
+        return json.loads(out.decode("utf-8", "replace"))
+    except Exception as e:
+        logger.debug("ffprobe falhou em %s: %s", path, e)
+        return {}
+
+def _has_audio_stream(path: str) -> bool:
+    info = _probe_json(path)
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "audio":
+            return True
+    return False
+
+def _video_duration(path: str) -> float:
+    info = _probe_json(path)
+    # tenta em streams e depois em format.duration
+    for s in info.get("streams", []):
+        if s.get("codec_type") == "video":
+            try:
+                return float(s.get("duration")) if s.get("duration") else float(info.get("format", {}).get("duration", 0.0))
+            except Exception:
+                pass
+    try:
+        return float(info.get("format", {}).get("duration", 0.0))
+    except Exception:
+        return 0.0
 
 def _extract_frame_ffmpeg(video_path: str, out_jpg: str, t: float = 1.0) -> str:
     try:
@@ -284,15 +325,15 @@ def _ask_gemini_scene_prompts(
     return _parse_prompts_from_gemini_json(resp.text or "", n)
 
 # ------------------------ FFmpeg helpers ------------------------
-def _filter_for_input_nozoom(i: int) -> str:
-    return (f"[{i}:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
-            f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,fps={FPS_OUT},format=yuv420p,setsar=1/1[v{i}];"
-            f"[{i}:a]aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR}[a{i}];")
-
 def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", bgm_db: float = BG_MIX_DB) -> str:
     if not mp4s:
         raise ValueError("Lista de vídeos vazia.")
     ffmpeg = _ffmpeg_or_die()
+
+    # Detecta áudio e duração de cada entrada
+    has_aud = [ _has_audio_stream(p) for p in mp4s ]
+    durations = [ max(0.0, _video_duration(p)) for p in mp4s ]
+
     cmd = [ffmpeg, "-y", "-loglevel", "error", "-stats"]
     for p in mp4s:
         cmd += ["-i", p]
@@ -303,16 +344,34 @@ def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", b
         bgm_idx = len(mp4s)
 
     parts = []
+    # Vídeo + áudio (ou silêncio) por entrada
     for i in range(len(mp4s)):
-        parts.append(_filter_for_input_nozoom(i))
+        # vídeo sempre normalizado
+        parts.append(
+            f"[{i}:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
+            f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,fps={FPS_OUT},format=yuv420p,setsar=1/1[v{i}];"
+        )
+        if has_aud[i]:
+            parts.append(
+                f"[{i}:a]aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR}[a{i}];"
+            )
+        else:
+            dur = durations[i] if durations[i] > 0 else 8.0
+            parts.append(
+                f"anullsrc=r={AUDIO_SR}:cl=stereo,atrim=0:{dur:.3f},asetpts=N/SR/TB[a{i}];"
+            )
 
+    # concat
     va = "".join([f"[v{i}][a{i}]" for i in range(len(mp4s))])
     parts.append(f"{va}concat=n={len(mp4s)}:v=1:a=1[vcat][acat];")
 
+    # BGM opcional com ducking
     if bgm_idx >= 0:
-        parts.append(f"[{bgm_idx}:a]aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
-                     f"aloop=loop=-1:size=2e9,aresample={AUDIO_SR}[bg_looped];")
-        parts.append(f"[bg_looped][acat]sidechaincompress=threshold=0.06:ratio=8:attack=100:release=500:detection=rms[bg_ducked];")
+        parts.append(
+            f"[{bgm_idx}:a]aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
+            f"aloop=loop=-1:size=2e9,aresample={AUDIO_SR}[bg_looped];"
+        )
+        parts.append("[bg_looped][acat]sidechaincompress=threshold=0.06:ratio=8:attack=100:release=500:detection=rms[bg_ducked];")
         vol = 10 ** (bgm_db / 20.0)
         parts.append(f"[acat][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:weights='1 {vol}'[aout]")
         vmap, amap = "[vcat]", "[aout]"
@@ -339,8 +398,10 @@ def _post_zoom_ffmpeg(src_path: str, dst_path: str, zoom: float) -> str:
     if zoom <= 1.0001:
         shutil.copy2(src_path, dst_path)
         return dst_path
-    filter_v = (f"[0:v]scale=iw*{zoom}:ih*{zoom},crop={OUT_W}:{OUT_H}:(iw-{OUT_W})/2:(ih-{OUT_H})/2,"
-                f"fps={FPS_OUT},format=yuv420p,setsar=1/1[v]")
+    filter_v = (
+        f"[0:v]scale=iw*{zoom}:ih*{zoom},crop={OUT_W}:{OUT_H}:(iw-{OUT_W})/2:(ih-{OUT_H})/2,"
+        f"fps={FPS_OUT},format=yuv420p,setsar=1/1[v]"
+    )
     cmd = [
         _ffmpeg_or_die(), "-y", "-loglevel", "error", "-stats", "-i", src_path,
         "-filter_complex", filter_v, "-map", "[v]", "-map", "0:a?",
@@ -379,8 +440,8 @@ def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
             pass
     return out[:k]
 
-def _postar_video(final_video: str, idioma: str):
-    """Gera descrição (no IDIOMA certo) e envia para o TikTok."""
+def _postar_video(final_video: str, idioma: str) -> bool:
+    """Gera descrição (no IDIOMA certo) e envia para o TikTok. Retorna True se a postagem foi confirmada."""
     try:
         frase    = gerar_frase_motivacional(idioma=idioma)
         hashtags = gerar_hashtags_virais(frase, idioma=idioma, n=HASHTAGS_TOP_N)
@@ -405,7 +466,11 @@ def _postar_video(final_video: str, idioma: str):
     except Exception as e:
         logger.exception("❌ Falha ao postar no TikTok: %s", e)
 
-    print("✅ Postado com sucesso." if ok else "⚠️ Upload não confirmado. Verifique os logs.")
+    if ok:
+        print("✅ Postado com sucesso.")
+    else:
+        print("⚠️ Upload não confirmado. Verifique os logs.")
+    return bool(ok)
 
 # ------------------------ Utilidades de arquivo ------------------------
 _VID_RE = re.compile(r"^veo3_(?:test_)?(?P<slug>.+?)(?:_c(?P<idx>\d+)|_final.*)?\.mp4$", re.IGNORECASE)
@@ -732,7 +797,8 @@ def _veo3_generate_batch(prompts: List[str], out_paths: List[str], idioma: str, 
 # ------------------------ Automático (com pré-config) ------------------------
 def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
     """Loop automático com pré-configuração (tema/nº cenas/variação).
-       Opções 'aleatório a cada ciclo' estão disponíveis."""
+       Opções 'aleatório a cada ciclo' estão disponíveis.
+       Retry automático se falhar (AUTO_RETRY_MINUTES, 0 = desliga)."""
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
 
     # Pré-config interativa
@@ -741,9 +807,7 @@ def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
     if tema_fix is None:
         print("Cancelado.")
         return
-    usar_tema_aleatorio = False
-    if tema_fix.strip().lower() in {"random", "aleatorio", "aleatório"}:
-        usar_tema_aleatorio = True
+    usar_tema_aleatorio = tema_fix.strip().lower() in {"random", "aleatorio", "aleatório"}
 
     n_cenas = _selecionar_qtd_cenas()
     if n_cenas is None:
@@ -765,6 +829,7 @@ def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
             tema = random.choice(base_temas) if usar_tema_aleatorio else tema_fix
             print(f"\n🟢 Veo3 automático — {inicio:%d/%m %H:%M} | persona={persona} | tema={tema}")
 
+            success = False
             try:
                 viral_context = _ask_gemini_viral_analysis(tema, persona, idioma)
                 variacao = (random.choice(["keep_all", "change_bg", "change_wardrobe", "change_both"])
@@ -798,12 +863,20 @@ def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
                     except Exception as e:
                         logger.warning("Falha no pós-zoom auto (%.2f): %s", POST_ZOOM, e)
 
-                _postar_video(final_video, idioma)
+                success = _postar_video(final_video, idioma)
 
             except Exception as e:
                 logger.exception("Falha no ciclo Veo3: %s", e)
 
-            proxima = inicio + timedelta(seconds=intervalo)
+            # Próximo agendamento
+            retry_min = _auto_retry_minutes()
+            if not success and retry_min > 0:
+                proxima = datetime.now() + timedelta(minutes=retry_min)
+                logger.warning("⚠️ Falha na execução; nova tentativa em %d min (às %s).",
+                               retry_min, proxima.strftime('%H:%M'))
+            else:
+                proxima = inicio + timedelta(seconds=intervalo)
+
             while True:
                 rem = (proxima - datetime.now()).total_seconds()
                 if rem <= 0:
