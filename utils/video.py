@@ -235,13 +235,18 @@ def _render_modern_block(img, frase, *, idioma=None):
     is_ar = (_idioma_norm(idioma) == "ar")
     if IMAGE_TEXT_UPPER and not is_ar: intro, punch = intro.upper(), punch.upper()
     base_scale = (W / 1080.0) * IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MODERN
-    left_margin, right_margin, maxw, y = int(W*0.08), int(W*0.08), int(W*0.84), int(H*0.14)
+    left_margin, right_margin, maxw = int(W*0.08), int(W*0.08), int(W*0.84)
+    
+    # ### AJUSTE DE ALTURA ###
+    y = int(H * 0.20) # Começa a desenhar mais para cima, como no estilo clássico desejado
+
     if intro:
         f_small, lines1 = _best_font_and_wrap(draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False), maxw, int(38*base_scale), int(70*base_scale), max_lines=2)
         for ln in lines1:
             _draw_line_colored(draw, left_margin, y, ln, f_small, set())
             y += int(f_small.size * 1.16)
         y += int(H * 0.018)
+    
     f_main, lines2 = _best_font_and_wrap(draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, bold=True), maxw, int(68*base_scale), int(104*base_scale), max_lines=4)
     for ln in lines2:
         _draw_line_colored(draw, left_margin, y, ln, f_main, set(hl_words), hl_fill=_hex_to_rgba(IMAGE_HL_COLOR))
@@ -257,8 +262,11 @@ def _render_classic_serif(img, frase, *, idioma=None):
     left_margin, right_margin, maxw = int(W*0.12), int(W*0.10), int(W*0.78)
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
     f_serif, lines = _best_font_and_wrap(draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, bold=True), maxw, int(54*scls), int(80*scls), max_lines=4)
-    total_h = sum(f_serif.getbbox(l)[3] for l in lines) + int(f_serif.size*0.18)*(len(lines)-1)
-    y = (H - total_h)//2
+    
+    # ### AJUSTE DE ALTURA ###
+    # Em vez de centralizar na imagem toda, definimos um ponto de partida mais alto
+    y = int(H * 0.20) 
+
     for ln in lines:
         _draw_line_colored(draw, left_margin, y, ln, f_serif, highlight_set=hl_set, hl_fill=_hex_to_rgba(IMAGE_HL_COLOR))
         y += int(f_serif.size * 1.18)
