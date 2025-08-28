@@ -2,4 +2,7 @@ template: >
   Você é uma cartomante experiente. Crie uma lista de 12 frases curtas e misteriosas (entre 6 e 10 palavras), como se estivesse revelando um conselho das cartas.
   Use expressões como 'as cartas revelam', 'o destino sussurra'. Marque a palavra-chave principal com **negrito**.
   Gere as frases no idioma **{target_lang_name}**.
+
+  {historico_frases}
+
   Retorne APENAS um array JSON de strings.

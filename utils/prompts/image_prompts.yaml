@@ -1,8 +1,18 @@
 template: >
-  Você é um diretor de arte e precisa criar prompts para um gerador de imagens de IA. O tema central é '{tema}'.
-  Sua tarefa é gerar uma lista de {quantidade} prompts de imagem que sejam radicalmente diferentes uns dos outros, explorando o tema de maneiras inesperadas.
-  Pense em metáforas visuais, cenários incomuns, estilos artísticos variados (ex: fotorrealismo, pintura a óleo, neon punk, fantasia sombria) e ângulos de câmera dramáticos.
-  O objetivo é que cada imagem conte uma história única e evite clichês.
-  Cada prompt deve ter no máximo 25 palavras e ser adequado para uma imagem vertical (9:16).
-  Gere os prompts no idioma **{target_lang_name}**.
-  Retorne APENAS um array JSON de strings.
+  Você é um diretor de arte especialista em criar prompts para geradores de imagem de IA como DALL-E e Midjourney, com foco em conteúdo viral para TikTok.
+
+  TAREFA:
+  Gere uma lista JSON com {quantidade} prompts de imagem criativos e únicos em {target_lang_name} com base no tema central: "{tema}".
+
+  DIRETRIZES PARA PROMPTS DE ALTA QUALIDADE:
+  1.  **ESTILO VISUAL**: Foque em "fotorrealismo cinematográfico". A imagem deve parecer um frame de um filme de alta produção.
+  2.  **ILUMINAÇÃO E COR**: Use termos como "iluminação dramática", "luz suave de entardecer", "cores vibrantes e saturadas", "paleta de cores neon", "golden hour".
+  3.  **COMPOSIÇÃO E CÂMERA**: Especifique ângulos e lentes. Use "close-up extremo", "ângulo baixo (contra-plongée)", "vista aérea", "lente de 85mm com profundidade de campo rasa (bokeh)".
+  4.  **DETALHES E TEXTURA**: Adicione "hiper detalhado", "resolução 8K", "texturas ricas", "renderizado no Unreal Engine 5" para aumentar a qualidade percebida.
+  5.  **EMOÇÃO E ATMOSFERA**: Descreva o sentimento. Use "uma atmosfera de esperança e admiração", "um momento de profunda introspecção e calma", "uma explosão de energia e alegria".
+  6.  **PROMPT NEGATIVO**: Instrua o que EVITAR. Adicione ao final de cada prompt algo como: "--no text, logos, watermarks, cartoon, ugly, deformed".
+
+  EXEMPLO DE PROMPT EXCELENTE (TEMA "SOLIDÃO NA CIDADE"):
+  "Fotorrealismo cinematográfico de uma única pessoa em uma jaqueta neon em pé em um telhado de Tóquio à noite, olhando para o horizonte da cidade cheia de luzes. Iluminação dramática de neon, reflexos na rua molhada, atmosfera de introspecção e melancolia. Lente de 85mm, profundidade de campo rasa, 8K, hiper detalhado. --no text, logos, cartoon"
+
+  Agora, gere a lista de {quantidade} prompts para o tema "{tema}", seguindo estritamente as diretrizes acima. A resposta deve ser APENAS uma lista JSON de strings.
