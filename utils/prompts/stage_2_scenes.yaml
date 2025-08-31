@@ -25,7 +25,6 @@ template: |
   **STRICT RULES:**
   - **Follow the DIRECTORIAL GUIDANCE and use the CINEMATOGRAPHY LIBRARY.**
   - Respond JSON only. All fields in English except `Dialogue`.
-  - Style: vertical 9:16, 1080x1920. Length: 8s. Model: veo-3.
   {strict_rules_extra}
   **Scene roles (in order):**
   {roles_text}

@@ -16,7 +16,7 @@
 #             Se ffprobe não estiver disponível, a checagem de áudio é ignorada.
 #
 from __future__ import annotations
-import os, time, glob, shutil, logging, subprocess
+import os, time, glob, shutil, logging, subprocess, re
 from typing import List, Dict, Tuple, Optional
 
 from selenium import webdriver
@@ -26,8 +26,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver import ActionChains
 from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.keys import Keys
 
 logger = logging.getLogger(__name__)
+
+# --- NOVA CONSTANTE DE CUSTO ---
+CREDIT_COST_PER_SCENE = 20
 
 # ====================== Cookies (Netscape) ======================
 def _read_netscape_cookies(path: str) -> List[Dict]:
@@ -292,45 +296,56 @@ return null;
     raise TimeoutException("Não consegui clicar em 'Novo projeto'.")
 
 def _force_respostas_por_comando_1(driver: webdriver.Chrome):
-    ajustes_btn = _first_visible(driver, [
-        (By.XPATH, "//button[.//i[contains(., 'tune')]]"),
-        (By.XPATH, "//button[contains(@aria-label, 'config') or contains(@aria-label, 'ajustes') or contains(@aria-label, 'settings')]"),
-    ], timeout=20)
-    _safe_click(driver, ajustes_btn)
-    select_btn = _first_visible(driver, [
-        (By.XPATH, "//*[contains(normalize-space(.), 'Respostas por comando')]/following::button[1]"),
-        (By.XPATH, "//div[contains(., 'Respostas por comando')]//button"),
-    ], timeout=10)
-    _safe_click(driver, select_btn)
-    opt_1 = _first_visible(driver, [
-        (By.XPATH, "//div[@role='option' or @role='menuitem'][normalize-space()='1']"),
-        (By.XPATH, "//*[normalize-space()='1']"),
-    ], timeout=10)
-    _safe_click(driver, opt_1)
-    try: driver.find_element(By.TAG_NAME, "body").click()
-    except Exception: pass
+    """Clica nos menus para forçar 'Respostas por comando' para 1 e adiciona espera no final."""
+    try:
+        logger.info("🔧 Forçando 'Respostas por comando' para 1...")
+        ajustes_btn = _first_visible(driver, [
+            (By.XPATH, "//button[.//i[contains(., 'tune')]]"),
+            (By.XPATH, "//button[contains(@aria-label, 'config') or contains(@aria-label, 'ajustes') or contains(@aria-label, 'settings')]"),
+        ], timeout=20)
+        _safe_click(driver, ajustes_btn)
+        logger.info("   - Passo 1: Clicou no botão de Ajustes (tune).")
 
-# --- INÍCIO DA FUNÇÃO ATUALIZADA (VERSÃO 3) ---
+        select_btn = _first_visible(driver, [
+            (By.XPATH, "//*[contains(normalize-space(.), 'Respostas por comando')]/ancestor::button"),
+            (By.XPATH, "//button[contains(., 'Respostas por comando')]"),
+        ], timeout=10)
+        _safe_click(driver, select_btn)
+        logger.info("   - Passo 2: Clicou no dropdown 'Respostas por comando'.")
+
+        opt_1 = _first_visible(driver, [
+            (By.XPATH, "//div[@role='option' or @role='menuitem'][normalize-space()='1']"),
+        ], timeout=10)
+        _safe_click(driver, opt_1)
+        logger.info("   - Passo 3: Selecionou a opção '1'.")
+
+        # --- ESPERA ESTRATÉGICA PARA EVITAR 'STALE ELEMENT' ---
+        WebDriverWait(driver, 10).until(
+            EC.invisibility_of_element_located((By.XPATH, "//div[@role='option' or @role='menuitem']"))
+        )
+        time.sleep(0.5) # Pausa extra de segurança para a re-renderização da página
+        logger.info("   - Passo 4: Configuração de 'Respostas por comando' concluída e UI estabilizada.")
+
+    except Exception as e:
+        logger.error("❌ Falha ao tentar forçar 'Respostas por comando' para 1.")
+        logger.error("   - Detalhes do erro: %s", e)
+        _dump_debug(driver, "respostas_comando_fail")
+
 def _force_model_veo3_fast(driver: webdriver.Chrome):
     """
-    Seleciona o modelo 'Veo 3 - Fast' no menu de modelos para garantir a geração de áudio.
-    Esta versão é mais robusta, focando nos contêineres dos itens de menu.
+    SEMPRE clica e seleciona o modelo 'Veo 3 - Fast' no menu para garantir consistência,
+    usando seletores mais robustos.
     """
-    logger.info("🔧 Tentando forçar o modelo para 'Veo 3 - Fast'...")
+    logger.info("🔧 Forçando a seleção do modelo para 'Veo 3 - Fast'...")
     
     # Bloco 1: Clicar no menu principal de seleção de modelo
-    model_menu_button = None
     try:
-        logger.info("   - Passo 1: Procurando o botão do menu de modelo...")
+        logger.info("   - Passo 1: Procurando e clicando no botão do menu de modelo...")
         model_menu_button = _first_visible(driver, [
-            (By.XPATH, "//button[@role='combobox' and .//span[text()='Modelo']]"),
+            (By.XPATH, "//button[.//span[normalize-space()='Modelo']]"),
+            (By.XPATH, "//span[normalize-space()='Modelo']/ancestor::button[1]"),
         ], timeout=20)
         
-        # Verifica se o modelo já está selecionado para evitar cliques desnecessários
-        if "Veo 3 - Fast" in model_menu_button.text:
-            logger.info("✅ Modelo 'Veo 3 - Fast' já está selecionado. Nenhuma ação necessária.")
-            return
-
         _safe_click(driver, model_menu_button)
         logger.info("   - Passo 1 SUCESSO: Menu de modelo clicado.")
         time.sleep(1.5) # Pausa crucial para a animação do menu
@@ -344,18 +359,18 @@ def _force_model_veo3_fast(driver: webdriver.Chrome):
     # Bloco 2: Clicar na opção desejada dentro do menu aberto
     try:
         logger.info("   - Passo 2: Procurando a opção 'Veo 3 - Fast' no menu...")
-        # Este seletor encontra o contêiner da opção que TEM um filho com o texto exato.
         veo3_fast_option_container = _first_visible(driver, [
-            (By.XPATH, "//div[@role='option'][.//div[text()='Veo 3 - Fast']]"),
+            (By.XPATH, "//div[@role='option'][.//span[normalize-space()='Veo 3 - Fast']]"),
+            (By.XPATH, "//div[@role='option'][contains(., 'Veo 3 - Fast')]"),
         ], timeout=10)
 
         _safe_click(driver, veo3_fast_option_container)
         
-        # Bloco 3: Verificação pós-clique
+        # Bloco 3: Verificação pós-clique para confirmar
         logger.info("   - Passo 3: Verificando se a seleção foi aplicada...")
         WebDriverWait(driver, 10).until(
             EC.text_to_be_present_in_element(
-                (By.XPATH, "//button[@role='combobox' and .//span[text()='Modelo']]"),
+                (By.XPATH, "//button[contains(., 'Modelo')]"),
                 "Veo 3 - Fast"
             )
         )
@@ -366,7 +381,6 @@ def _force_model_veo3_fast(driver: webdriver.Chrome):
         logger.error("❌ FALHA nos Passos 2/3: Não foi possível selecionar ou confirmar a opção 'Veo 3 - Fast'.")
         logger.error("   - Detalhes do erro: %s", e)
         _dump_debug(driver, "model_option_fail")
-# --- FIM DA FUNÇÃO ATUALIZADA ---
 
 # ----------- Injeção segura do prompt -----------
 def _set_text_multiline_js(driver: webdriver.Chrome, element, text: str) -> None:
@@ -769,6 +783,48 @@ def _noaudio_retries() -> int:
     except Exception:
         return 2
 
+# --- FUNÇÃO DE CHECAR CRÉDITOS ATUALIZADA ---
+def _check_and_log_credits(driver: webdriver.Chrome, stage: str) -> Optional[int]:
+    """Clica no perfil, lê os créditos de IA, registra no log e retorna o valor."""
+    try:
+        logger.info("💰 Verificando créditos de IA (%s)...", stage)
+
+        # 1. Clicar no ícone de perfil/conta no canto superior direito
+        profile_icon = _first_visible(driver, [
+            (By.XPATH, "//button[.//img[contains(@alt, 'perfil do usuário')]]"),
+            (By.XPATH, "//button[.//div[normalize-space()='PRO']]"),
+        ], timeout=15)
+        _safe_click(driver, profile_icon)
+        
+        # 2. Aguardar o menu e encontrar o elemento dos créditos
+        credit_element = _first_visible(driver, [
+            (By.XPATH, "//a[contains(., 'Créditos de IA') or contains(., 'AI Credits')]")
+        ], timeout=10)
+        
+        # 3. Extrair e logar o número de créditos
+        text = credit_element.text
+        credits = None
+        match = re.search(r'(\d+)', text)
+        if match:
+            credits = int(match.group(1))
+            logger.info("💰 Créditos de IA (%s): %d", stage, credits)
+        else:
+            logger.warning("Não foi possível extrair o número de créditos do texto: '%s'", text)
+            
+        # 4. Fechar o menu para não interferir com outras ações
+        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        time.sleep(0.5)
+        return credits
+
+    except Exception as e:
+        logger.warning("Não foi possível verificar os créditos de IA: %s", e)
+        try:
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        except Exception:
+            pass
+        return None
+
+
 # ====================== APIs públicas ======================
 def generate_single_via_flow(
     prompt_text: str,
@@ -780,7 +836,6 @@ def generate_single_via_flow(
 ) -> str:
     """
     Mantido para retrocompatibilidade: abre sessão, gera 1 cena e fecha.
-    Agora com: re‑geração automática se o .mp4 vier sem trilha de áudio.
     """
     download_dir = os.path.abspath(os.path.dirname(out_path) or ".")
     os.makedirs(download_dir, exist_ok=True)
@@ -794,16 +849,28 @@ def generate_single_via_flow(
             logger.info("Abrindo Flow e criando 'Novo projeto'…")
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
-            _force_respostas_por_comando_1(driver)
-            _force_model_veo3_fast(driver) # --- CHAMADA DA FUNÇÃO ATUALIZADA ---
         else:
             driver.get(project_url)
 
-        # Loop com retries de "sem áudio"
+        # --- LÓGICA DE VERIFICAÇÃO DE CRÉDITOS ---
+        creditos_iniciais = _check_and_log_credits(driver, "início")
+        if creditos_iniciais is not None:
+            if creditos_iniciais < CREDIT_COST_PER_SCENE:
+                logger.error(
+                    f"❌ CRÉDITOS INSUFICIENTES! Disponíveis: {creditos_iniciais}, "
+                    f"Necessários: {CREDIT_COST_PER_SCENE}. Processo abortado."
+                )
+                raise RuntimeError("Créditos insuficientes para gerar 1 cena.")
+        else:
+            logger.warning("Não foi possível verificar o saldo de créditos. O processo continuará.")
+        
+        _force_respostas_por_comando_1(driver)
+        _force_model_veo3_fast(driver)
+
+        # (Restante da lógica da função...)
         max_regen = _noaudio_retries()
         for attempt in range(1, max_regen + 2):
             _clear_existing_videos(driver)
-
             before = glob.glob(os.path.join(download_dir, "*.mp4"))
 
             logger.info("Enviando prompt…")
@@ -813,7 +880,6 @@ def generate_single_via_flow(
             mp4_tmp = _wait_download_720p(driver, download_dir, before)
             logger.info("Vídeo baixado: %s", mp4_tmp)
 
-            # Checagem de áudio
             ok = True
             if _should_check_audio():
                 has_aud = _has_audio_ffprobe(mp4_tmp)
@@ -826,42 +892,27 @@ def generate_single_via_flow(
                     logger.info("✅ Áudio presente no arquivo gerado.")
 
             if ok:
-                # Exclui cartão e move
                 _delete_card(driver)
                 if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
-                    if os.path.exists(out_path):
-                        try: os.remove(out_path)
-                        except Exception: pass
+                    if os.path.exists(out_path): os.remove(out_path)
                     shutil.move(mp4_tmp, out_path)
                 break
             else:
-                # Limpa ui + apaga arquivo baixado e tenta de novo
-                try:
-                    _delete_card(driver)
-                except Exception:
-                    pass
-                try:
-                    os.remove(mp4_tmp)
-                except Exception:
-                    pass
+                try: _delete_card(driver)
+                except Exception: pass
+                try: os.remove(mp4_tmp)
+                except Exception: pass
                 if attempt >= (max_regen + 1):
-                    logger.error("❌ Sem áudio após %d tentativa(s). Seguiremos com o último arquivo mesmo assim.", attempt)
+                    logger.error("❌ Sem áudio após %d tentativa(s). Seguiremos com o último arquivo.", attempt)
                     if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
-                        if os.path.exists(out_path):
-                            try: os.remove(out_path)
-                            except Exception: pass
+                        if os.path.exists(out_path): os.remove(out_path)
                         shutil.move(mp4_tmp, out_path)
                     break
-                else:
-                    time.sleep(1.0)
-                    continue
-
-        # LIMPEZA FINAL: garantir que não ficou vídeo no projeto
+        
+        _check_and_log_credits(driver, "fim")
         try:
-            if _delete_current_video(driver):
-                logger.info("🧹 Limpeza final: vídeo removido do projeto.")
-            else:
-                logger.warning("⚠️ Limpeza final: não consegui excluir o vídeo ativo.")
+            if _delete_current_video(driver): logger.info("🧹 Limpeza final: vídeo removido do projeto.")
+            else: logger.warning("⚠️ Limpeza final: não consegui excluir o vídeo ativo.")
         except Exception as e:
             logger.debug("Limpeza final falhou: %s", e)
 
@@ -886,14 +937,6 @@ def generate_many_via_flow(
 ) -> List[str]:
     """
     Gera N cenas em uma ÚNICA sessão e no MESMO projeto.
-    Para cada cena:
-      - limpa cartões existentes,
-      - envia prompt,
-      - baixa 720p (com retries, hover, anti-99%),
-      - **valida se o arquivo tem ÁUDIO; se não tiver, re‑gera a cena automaticamente**,
-      - exclui o cartão baixado,
-      - move o arquivo para o out_path correspondente.
-    Fecha o navegador somente ao final (com limpeza final garantida).
     """
     if len(prompts) != len(out_paths):
         raise ValueError("prompts e out_paths precisam ter o mesmo tamanho.")
@@ -906,15 +949,30 @@ def generate_many_via_flow(
         cookies = _read_netscape_cookies(cookies_file)
         _add_cookies_multi_domain(driver, cookies)
 
-        # entry: home → novo projeto → respostas por comando = 1
         if "/tools/flow" in project_url and "/project/" not in project_url:
             logger.info("Abrindo Flow e criando 'Novo projeto'…")
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
-            _force_respostas_por_comando_1(driver)
-            _force_model_veo3_fast(driver) # --- CHAMADA DA FUNÇÃO ATUALIZADA ---
         else:
             driver.get(project_url)
+        
+        # --- LÓGICA DE VERIFICAÇÃO DE CRÉDITOS ---
+        creditos_iniciais = _check_and_log_credits(driver, "início")
+        if creditos_iniciais is not None:
+            num_cenas = len(prompts)
+            custo_total = num_cenas * CREDIT_COST_PER_SCENE
+            logger.info(f"Custo estimado para {num_cenas} cena(s): {custo_total} créditos.")
+            if creditos_iniciais < custo_total:
+                logger.error(
+                    f"❌ CRÉDITOS INSUFICIENTES! Disponíveis: {creditos_iniciais}, "
+                    f"Necessários: {custo_total}. Processo abortado."
+                )
+                raise RuntimeError(f"Créditos insuficientes para gerar {num_cenas} cenas.")
+        else:
+            logger.warning("Não foi possível verificar o saldo de créditos. O processo continuará por sua conta e risco.")
+
+        _force_respostas_por_comando_1(driver)
+        _force_model_veo3_fast(driver)
 
         results: List[str] = []
         max_regen = _noaudio_retries()
@@ -924,23 +982,16 @@ def generate_many_via_flow(
 
             success = False
             for attempt in range(1, max_regen + 2):
-
-                # limpar cartões existentes ANTES de enviar o prompt da cena
                 _clear_existing_videos(driver)
-
-                # baseline de arquivos para detectar o novo .mp4
                 before = glob.glob(os.path.join(download_dir, "*.mp4"))
 
-                # enviar prompt
                 logger.info("Enviando prompt…")
                 _submit_prompt(driver, prompt_text)
                 logger.info("Prompt enviado; aguardando opção de download…")
 
-                # aguarda e tenta os cliques de download 720p (com anti-99%)
                 mp4_tmp = _wait_download_720p(driver, download_dir, before)
                 logger.info("Vídeo baixado: %s", mp4_tmp)
 
-                # Checagem de áudio
                 ok = True
                 if _should_check_audio():
                     has_aud = _has_audio_ffprobe(mp4_tmp)
@@ -948,54 +999,38 @@ def generate_many_via_flow(
                         ok = False
                         logger.warning("⚠️ Cena %d: arquivo sem trilha de áudio. Re‑gerando (tentativa %d)…", idx, attempt)
                     elif has_aud is None:
-                        logger.debug("Cena %d: não foi possível confirmar áudio via ffprobe — seguindo com este arquivo.", idx)
+                        logger.debug("Cena %d: não foi possível confirmar áudio via ffprobe — seguindo.", idx)
                     else:
                         logger.info("Cena %d: ✅ Áudio presente.", idx)
 
                 if ok:
-                    # excluir o cartão do vídeo baixado
                     _delete_card(driver)
-
-                    # mover para o destino final desta cena
                     if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
-                        if os.path.exists(out_path):
-                            try: os.remove(out_path)
-                            except Exception: pass
+                        if os.path.exists(out_path): os.remove(out_path)
                         shutil.move(mp4_tmp, out_path)
-
                     results.append(out_path)
                     success = True
-                    break  # próxima cena
+                    break
                 else:
-                    # excluir cartão + deletar arquivo, e tentar novamente
-                    try:
-                        _delete_card(driver)
-                    except Exception:
-                        pass
-                    try:
-                        os.remove(mp4_tmp)
-                    except Exception:
-                        pass
+                    try: _delete_card(driver)
+                    except Exception: pass
+                    try: os.remove(mp4_tmp)
+                    except Exception: pass
                     if attempt >= (max_regen + 1):
-                        logger.error("Cena %d: ❌ Sem áudio após %d tentativa(s). Usarei o último arquivo mesmo assim.", idx, attempt)
+                        logger.error("Cena %d: ❌ Sem áudio após %d tentativas. Usando o último arquivo.", idx, attempt)
                         if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
-                            if os.path.exists(out_path):
-                                try: os.remove(out_path)
-                                except Exception: pass
+                            if os.path.exists(out_path): os.remove(out_path)
                             shutil.move(mp4_tmp, out_path)
                         results.append(out_path)
                         success = True
                         break
-                    else:
-                        time.sleep(1.0)
-                        continue
 
             if not success:
                 raise RuntimeError(f"Falha ao gerar a cena {idx} (sem áudio repetidamente).")
 
-        # LIMPEZA FINAL: garantir que não ficou vídeo no projeto
         try:
             _clear_existing_videos(driver)
+            _check_and_log_credits(driver, "fim")
             if _delete_current_video(driver):
                 logger.info("🧹 Limpeza final: projeto ficou sem vídeos antes de fechar.")
             else:

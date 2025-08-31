@@ -53,7 +53,7 @@ VEO3_MODEL  = os.getenv("VEO3_MODEL", "veo-3.0-generate-preview").strip()
 TEXT_MODEL  = os.getenv("VEO3_TEXT_MODEL", "gemini-2.0-flash-001").strip()
 
 D_MIN = int(os.getenv("VEO3_DIALOGUE_MIN_WORDS", "18"))
-D_MAX = int(os.getenv("VEO3_DIALOGUE_MAX_WORDS", "25"))
+D_MAX = int(os.getenv("VEO3_DIALOGUE_MAX_WORDS", "22"))
 HASHTAGS_TOP_N = 3
 
 NEGATIVE_PROMPT = (
@@ -311,6 +311,34 @@ def _parse_prompts_from_gemini_json(raw_text: str, n: int) -> List[str]:
         logger.warning("Gemini retornou um número de prompts diferente do esperado (%d/%d).", len(prompts), n)
     return prompts
 
+def _regenerate_short_dialogue(client: "genai.Client", original_dialogue: str, max_words: int) -> Optional[str]:
+    """Pede ao Gemini para reescrever um diálogo para ser mais curto."""
+    try:
+        logger.info(f"🔄 Diálogo muito longo. Pedindo ao Gemini para reescrever com no máximo {max_words} palavras...")
+        word_count = len(original_dialogue.split())
+        
+        prompt = (
+            f"A frase a seguir tem {word_count} palavras, o que é muito longo. "
+            f"Por favor, reescreva-a para transmitir exatamente a mesma ideia e tom, "
+            f"mas usando um máximo absoluto de {max_words} palavras. "
+            f"Responda APENAS com a frase reescrita, terminando com um ponto final.\n\n"
+            f"Frase original: \"{original_dialogue}\""
+        )
+        
+        resp = client.models.generate_content(model=TEXT_MODEL, contents=prompt)
+        new_dialogue = (resp.text or "").strip()
+
+        if new_dialogue and len(new_dialogue.split()) <= max_words:
+            logger.info(f"✅ Diálogo reescrito com sucesso: \"{new_dialogue}\"")
+            return new_dialogue
+        else:
+            logger.warning("A reescrita do Gemini falhou ou ainda é muito longa. O fallback será usado.")
+            return None
+    except Exception as e:
+        logger.error(f"Erro ao tentar regenerar diálogo: {e}")
+        return None
+
+# --- FUNÇÃO CORRIGIDA E MAIS ROBUSTA ---
 def _ask_gemini_scene_prompts(
     persona: str, idioma: str, tema: str, n: int, variation_mode: str, viral_context: Dict[str, str]
 ) -> List[str]:
@@ -322,7 +350,46 @@ def _ask_gemini_scene_prompts(
     print("\n===================================================================\n")
     cfg = types.GenerateContentConfig(response_mime_type="application/json")
     resp = client.models.generate_content(model=TEXT_MODEL, contents=cmd, config=cfg)
-    return _parse_prompts_from_gemini_json(resp.text or "", n)
+    
+    prompts = _parse_prompts_from_gemini_json(resp.text or "", n)
+    
+    # Define o padrão regex para encontrar o bloco de diálogo de forma segura
+    dialogue_pattern = re.compile(
+        r'(Dialogue:.*?spoken in .*?\n)(.*?)(?=\n\n|\nBackground sounds:)', 
+        re.DOTALL
+    )
+
+    # Função interna para processar cada match do regex
+    def replacer(match: re.Match) -> str:
+        header = match.group(1)
+        original_dialogue = match.group(2).strip()
+        word_count = len(original_dialogue.split())
+
+        if word_count <= D_MAX:
+            return match.group(0) # Retorna o bloco original sem alterações
+
+        logger.warning(
+            f"Diálogo gerado pelo Gemini excedeu o limite de {D_MAX} palavras (tinha {word_count}). "
+            "Tentando regenerar uma versão mais curta..."
+        )
+        
+        # Plano A: Tenta regenerar
+        new_dialogue = _regenerate_short_dialogue(client, original_dialogue, D_MAX)
+
+        # Plano B: Se a regeneração falhar, usa o fallback de truncamento
+        if not new_dialogue:
+            logger.warning("Fallback: O diálogo será cortado no limite de palavras.")
+            words = original_dialogue.split()[:D_MAX]
+            new_dialogue = ' '.join(words)
+            if not new_dialogue.endswith('.'):
+                new_dialogue = re.sub(r'[,;:]\s*$', '', new_dialogue).strip() + '.'
+        
+        return f"{header}{new_dialogue}"
+
+    # Itera sobre cada prompt e aplica a substituição segura
+    validated_prompts = [dialogue_pattern.sub(replacer, p_text) for p_text in prompts]
+    return validated_prompts
+
 
 # ------------------------ FFmpeg helpers ------------------------
 def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", bgm_db: float = BG_MIX_DB) -> str:
@@ -367,13 +434,18 @@ def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", b
 
     # BGM opcional com ducking
     if bgm_idx >= 0:
+        # 1. Prepara a música de fundo com loop
         parts.append(
             f"[{bgm_idx}:a]aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
             f"aloop=loop=-1:size=2e9,aresample={AUDIO_SR}[bg_looped];"
         )
-        parts.append("[bg_looped][acat]sidechaincompress=threshold=0.06:ratio=8:attack=100:release=500:detection=rms[bg_ducked];")
+        # 2. Duplica o áudio da narração para usar em dois lugares diferentes
+        parts.append("[acat]asplit[main_for_mix][voice_for_sc];")
+        # 3. Usa uma cópia da narração para controlar o sidechain (ducking)
+        parts.append("[bg_looped][voice_for_sc]sidechaincompress=threshold=0.06:ratio=8:attack=100:release=500:detection=rms[bg_ducked];")
+        # 4. Usa a outra cópia da narração para a mixagem final com a música
         vol = 10 ** (bgm_db / 20.0)
-        parts.append(f"[acat][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:weights='1 {vol}'[aout]")
+        parts.append(f"[main_for_mix][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:weights='1 {vol}'[aout]")
         vmap, amap = "[vcat]", "[aout]"
     else:
         vmap, amap = "[vcat]", "[acat]"
@@ -696,7 +768,7 @@ def executar_interativo(persona: str, idioma: str) -> None:
             _menu_reutilizar_videos(idioma)
             return
 
-        slug = re.sub(r"[^a-z0-9]+", "-", f"{persona}-{tema.lower()}").strip("-")
+        slug = re.sub(r"[^a-z0-pessoal]", "-", f"{persona}-{tema.lower()}").strip("-")
 
         try:
             viral_context = _ask_gemini_viral_analysis(tema, persona, idioma)
