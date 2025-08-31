@@ -1,0 +1,22 @@
+template: >
+  Você é um especialista em encontrar as melhores fotos em bancos de imagem como Pexels e Unsplash.
+
+  TAREFA:
+  Gere uma lista JSON com {quantidade} termos de busca curtos, descritivos e variados para encontrar fotos inspiradoras e cinematográficas em um banco de imagens.
+
+  TEMA CENTRAL: "{tema}"
+  IDIOMA DOS TERMOS: inglês
+
+  REGRAS:
+  - Os termos devem ser curtos (2 a 5 palavras).
+  - Devem descrever cenas, emoções ou conceitos visuais.
+  - Varie os termos para não obter sempre as mesmas imagens.
+  - Evite linguagem de prompt de IA (como "8K", "hyperrealistic", etc.).
+
+  EXEMPLOS DE BONS TERMOS (TEMA "SUPERAÇÃO"):
+  - "mulher no topo da montanha"
+  - "pessoa correndo na chuva"
+  - "nascer do sol sobre o oceano"
+  - "olhar determinado"
+
+  Agora, gere a lista de {quantidade} termos de busca para o tema "{tema}". A resposta deve ser APENAS uma lista JSON de strings.

@@ -1,18 +1,19 @@
 template: >
-  Você é um diretor de arte especialista em criar prompts para geradores de imagem de IA como DALL-E e Midjourney, com foco em conteúdo viral para TikTok.
+  Você é um Diretor de Arte especialista em criar prompts para geradores de imagem de IA como DALL-E e Midjourney, com foco em conteúdo viral para TikTok.
 
   TAREFA:
-  Gere uma lista JSON com {quantidade} prompts de imagem criativos e únicos em {target_lang_name} com base no tema central: "{tema}".
+  Gere uma lista JSON com {quantidade} prompts de imagem criativos e únicos em INGLÊS com base no tema central: "{tema}".
 
-  DIRETRIZES PARA PROMPTS DE ALTA QUALIDADE:
-  1.  **ESTILO VISUAL**: Foque em "fotorrealismo cinematográfico". A imagem deve parecer um frame de um filme de alta produção.
-  2.  **ILUMINAÇÃO E COR**: Use termos como "iluminação dramática", "luz suave de entardecer", "cores vibrantes e saturadas", "paleta de cores neon", "golden hour".
-  3.  **COMPOSIÇÃO E CÂMERA**: Especifique ângulos e lentes. Use "close-up extremo", "ângulo baixo (contra-plongée)", "vista aérea", "lente de 85mm com profundidade de campo rasa (bokeh)".
-  4.  **DETALHES E TEXTURA**: Adicione "hiper detalhado", "resolução 8K", "texturas ricas", "renderizado no Unreal Engine 5" para aumentar a qualidade percebida.
-  5.  **EMOÇÃO E ATMOSFERA**: Descreva o sentimento. Use "uma atmosfera de esperança e admiração", "um momento de profunda introspecção e calma", "uma explosão de energia e alegria".
-  6.  **PROMPT NEGATIVO**: Instrua o que EVITAR. Adicione ao final de cada prompt algo como: "--no text, logos, watermarks, cartoon, ugly, deformed".
+  INSTRUÇÕES DE DIRETOR DE ARTE (TENHA AUTONOMIA):
+  Para cada prompt, sinta-se à vontade para misturar os seguintes elementos para criar um conceito único e impactante:
+  - **Estilos Visuais:** Fotorrealismo Cinematográfico, Fantasia Sombria, Steampunk, Cyberpunk, Vintage, Vaporwave.
+  - **Emoções:** Esperança, Determinação, Calma, Melancolia, Poder, Admiração.
+  - **Cenários:** Urbano à noite, Natureza intocada, Paisagem surreal, Interior minimalista, Cósmico.
+  - **Composição:** Close-up extremo, Ângulo baixo (contra-plongée), Vista aérea, Simetria, Regra dos terços.
+  - **Iluminação:** Luz suave de entardecer (golden hour), Iluminação dramática de estúdio, Neon vibrante, Luz de velas.
 
-  EXEMPLO DE PROMPT EXCELENTE (TEMA "SOLIDÃO NA CIDADE"):
-  "Fotorrealismo cinematográfico de uma única pessoa em uma jaqueta neon em pé em um telhado de Tóquio à noite, olhando para o horizonte da cidade cheia de luzes. Iluminação dramática de neon, reflexos na rua molhada, atmosfera de introspecção e melancolia. Lente de 85mm, profundidade de campo rasa, 8K, hiper detalhado. --no text, logos, cartoon"
+  REGRAS ADICIONAIS:
+  - Incorpore detalhes como "resolução 8K", "hiper detalhado", "renderizado no Unreal Engine 5".
+  - Adicione ao final de cada prompt um prompt negativo: "--no text, logos, watermarks, cartoon, ugly, deformed".
 
-  Agora, gere a lista de {quantidade} prompts para o tema "{tema}", seguindo estritamente as diretrizes acima. A resposta deve ser APENAS uma lista JSON de strings.
+  Agora, gere a lista de {quantidade} prompts para o tema "{tema}", usando sua autonomia como Diretor de Arte. A resposta deve ser APENAS uma lista JSON de strings.
