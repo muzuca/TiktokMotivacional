@@ -317,7 +317,7 @@ def _selecionar_idioma():
         if op == "3": return "ar-eg"
         print("Opção inválida!")
 
-def _submenu_conteudo_por_idioma(idioma):1
+def _submenu_conteudo_por_idioma(idioma):
     while True:
         if idioma == "ar-eg":
             print("\nSelecione o conteúdo (Árabe):")
