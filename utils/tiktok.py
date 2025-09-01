@@ -164,7 +164,7 @@ def postar_no_tiktok_e_renomear(
             comment=True,
             stitch=True,
             duet=True,
-            headless=False,         # troque para True se quiser rodar invisível
+            headless=True,         # troque para True se quiser rodar invisível
             schedule=schedule,
             idioma=idioma_norm      # ex.: 'ar' -> ar-EG na lib
         )

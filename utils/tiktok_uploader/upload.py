@@ -1,12 +1,20 @@
 # utils/tiktok_uploader/upload.py
 """
-Módulo `tiktok_uploader` para fazer upload de vídeos no TikTok
+Módulo `tiktok_uploader` para fazer upload de vídeos no TikTok.
 
-Funções Principais
------------------
-upload_video : Faz o upload de um único vídeo no TikTok
-upload_videos : Faz o upload de vários vídeos no TikTok
+Atualizações desta versão:
+- Captura **robusta** do perfil autenticado logo após abrir o upload, com **retry automático** que
+  volta à rota `/tiktokstudio/upload` caso a página tenha redirecionado para o hub `/tiktokstudio`.
+- Suporte a **timezone/locale forçados via CDP** (ex.: `Africa/Cairo` + `ar-EG`) para agendamentos corretos por região.
+- Navegação resiliente para rede lenta/proxy: warm-up em `/explore`, múltiplas variantes da URL de upload,
+  espera por hidratação do SPA e antiredirecionamento para o hub.
+- Headless mais estável: flags de SwiftShader/WebGL para evitar os erros de GPU citados no log.
+- UI de upload mais robusta: tenta iframe e DOM principal; em falha reabre a rota e tenta novamente.
+
+Copie e cole este arquivo no lugar do seu `upload.py`.
 """
+
+from __future__ import annotations
 
 import logging
 import os
@@ -35,6 +43,7 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.remote.webdriver import WebDriver  # type: ignore
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.common.action_chains import ActionChains
 
 # ===== App modules =====
 from .auth import AuthBackend
@@ -110,7 +119,7 @@ except ImportError:
             'request_storage': 'none',
             'verify_ssl': False,
             'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"],
-            'port': 0, 'addr': '127.0.0.1', 'auto_config': True  # 👈 evita colisão
+            'port': 0, 'addr': '127.0.0.1', 'auto_config': True
         }
         if not use_proxy:
             return opts
@@ -138,7 +147,16 @@ except ImportError:
     def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto",
                     headless: bool = False, *, want_proxy: Optional[bool] = None,
                     region: Optional[str] = None, lang_tag: Optional[str] = None, **kwargs):
-        load_dotenv()
+        from seleniumwire import webdriver as wire_webdriver  # type: ignore
+        from selenium.webdriver.chrome.service import Service as ChromeService
+        from webdriver_manager.chrome import ChromeDriverManager
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+        from selenium.webdriver.firefox.service import Service as FirefoxService
+        from webdriver_manager.firefox import GeckoDriverManager
+        from selenium.webdriver.edge.options import Options as EdgeOptions
+        from selenium.webdriver.edge.service import Service as EdgeService
+        from webdriver_manager.microsoft import EdgeChromiumDriverManager
+
         if want_proxy is None:
             want_proxy = _want_proxy_default(idioma)
         if region is None:
@@ -153,7 +171,6 @@ except ImportError:
             if options is None:
                 options = ChromeOptions()
             options.add_argument(f"--lang={lang_tag}")
-            options.add_argument("--disable-gpu")
             options.add_argument("--disable-logging")
             options.add_argument("--log-level=3")
             options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
@@ -162,13 +179,19 @@ except ImportError:
             options.add_argument("--disable-popup-blocking")
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--remote-debugging-pipe")  # 👈 sem porta
+            options.add_argument("--remote-debugging-pipe")
+            # Headless: habilitar SwiftShader/GL para evitar erros do log
             if headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--ignore-certificate-errors")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--use-gl=swiftshader")
+                options.add_argument("--enable-unsafe-swiftshader")
+                options.add_argument("--ignore-gpu-blocklist")
+
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
             driver = wire_webdriver.Chrome(
-                service=ChromeService(ChromeDriverManager().install(), port=0),  # 👈 aleatória
+                service=ChromeService(ChromeDriverManager().install(), port=0),
                 options=options,
                 seleniumwire_options=sw_opts
             )
@@ -265,31 +288,34 @@ NAV_MAX_RETRIES   = _int_env("UPLOAD_NAV_RETRIES", 3)
 IFRAME_MAX_RETRY  = _int_env("UPLOAD_IFRAME_RETRIES", 2)
 NAV_RETRY_BACKOFF = _float_env("UPLOAD_RETRY_BACKOFF_SEC", 3.0)
 
-# ——— Novos tempos de “grace” e assentamento de overlays antes do Post ———
+# ——— Grace e overlays antes do Post ———
 POST_MIN_GRACE_SEC           = _int_env("POST_MIN_GRACE_SEC", 30)
 POST_AFTER_ENABLED_EXTRA_SEC = _int_env("POST_AFTER_ENABLED_EXTRA_SEC", 2)
 OVERLAYS_SETTLE_SEC          = _int_env("OVERLAYS_SETTLE_SEC", 3)
 
-# ——— Confirmação na tela de Publicações ———
+# ——— Confirmar Publicações ———
 PUBLICATIONS_WAIT_SEC        = _int_env("PUBLICATIONS_WAIT_SEC", 120)
 VERIFY_POST_IN_PUBLICATIONS  = _bool_env("VERIFY_POST_IN_PUBLICATIONS", True)
 DEFAULT_BEGIN_WORDS          = _int_env("PUBLICATIONS_DESC_BEGIN_WORDS", 2)
 
-# ——— JITTER / DESALINHAMENTO ENTRE INSTÂNCIAS ———
-JITTER_START_MIN_SEC         = _int_env("JITTER_START_MIN_SEC", 0)   # ex.: 20
-JITTER_START_MAX_SEC         = _int_env("JITTER_START_MAX_SEC", 0)   # ex.: 90
+# ——— JITTER ———
+JITTER_START_MIN_SEC         = _int_env("JITTER_START_MIN_SEC", 0)
+JITTER_START_MAX_SEC         = _int_env("JITTER_START_MAX_SEC", 0)
 
-# Helpers para “intervalo humano” (para loops externos de X em X horas)
-JITTER_MIN_MINUTES           = _int_env("JITTER_MIN_MINUTES", -15)   # -15 min
-JITTER_MAX_MINUTES           = _int_env("JITTER_MAX_MINUTES",  18)   # +18 min
+# ——— Rede lenta/Proxy ———
+SLOW_NET_EXTRA_WAIT_SEC      = _int_env("SLOW_NET_EXTRA_WAIT_SEC", 60)
+UPLOAD_PAGE_SETTLE_SEC       = _int_env("UPLOAD_PAGE_SETTLE_SEC", 15)
+HEADER_MAX_WAIT_SEC          = _int_env("HEADER_MAX_WAIT_SEC", 90)
+WARMUP_EXPLORE_WAIT_SEC      = _int_env("WARMUP_EXPLORE_WAIT_SEC", 45)
+PROFILE_RETRIES              = _int_env("PROFILE_RETRIES", 3)
+
+# Helpers de intervalo humano
+JITTER_MIN_MINUTES           = _int_env("JITTER_MIN_MINUTES", -15)
+JITTER_MAX_MINUTES           = _int_env("JITTER_MAX_MINUTES",  18)
 
 def human_interval_seconds(base_hours: float,
                            jitter_min_minutes: Optional[int] = None,
                            jitter_max_minutes: Optional[int] = None) -> int:
-    """
-    Retorna segundos para um próximo ciclo “humano”: base_hours ± jitter.
-    Ex.: base_hours=4 => entre 3h42 e 4h18 com padrão acima.
-    """
     jmin = JITTER_MIN_MINUTES if jitter_min_minutes is None else jitter_min_minutes
     jmax = JITTER_MAX_MINUTES if jitter_max_minutes is None else jitter_max_minutes
     offs_minutes = random.randint(jmin, jmax)
@@ -297,10 +323,6 @@ def human_interval_seconds(base_hours: float,
     return max(60, base_sec + offs_minutes * 60)
 
 def sleep_jitter_before_post() -> int:
-    """
-    Se configurado, dorme aleatoriamente antes de iniciar o upload (desalinha instâncias).
-    Retorna quantos segundos dormiu.
-    """
     lo, hi = sorted((max(0, JITTER_START_MIN_SEC), max(0, JITTER_START_MAX_SEC)))
     if hi <= 0:
         return 0
@@ -338,15 +360,7 @@ def _is_seleniumwire_driver(driver) -> bool:
     except Exception:
         return False
 
-def _accept_header_from_tag(tag: Optional[str]) -> str:
-    tag = (tag or "").strip() or "en-US"
-    if tag.lower().startswith("pt"):
-        return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tag.lower().startswith("ar"):
-        return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
-    return "en-US,en;q=0.9"
-
-# ============= Seletor/rotinas: confirmação na tela de Publicações =============
+# =================== Publicações (confirmação pós-post) ===================
 PUB_ROW_CONTAINER_XPATH = "//div[@data-tt='components_PostInfoCell_Container']"
 PUB_ROW_LINK_REL_XPATH  = ".//a[@data-tt='components_PostInfoCell_a']"
 
@@ -355,18 +369,6 @@ PUBLICACOES_SEARCH_XPATHES = [
     "//div[contains(@class,'Search') or contains(@data-tt,'SearchBar')]//input",
     "(//div[.//text()[contains(.,'Views') or contains(.,'Visualiza') or contains(.,'Commentaires') or contains(.,'Kommentare') or contains(.,'تعليقات')]]//input)[1]",
 ]
-
-def _xpath_literal(s: str) -> str:
-    if "'" not in s:
-        return f"'{s}'"
-    if '"' not in s:
-        return f'"{s}"'
-    parts = []
-    for p in s.split("'"):
-        parts.append(f"'{p}'")
-        parts.append('"\'"')
-    parts = parts[:-1]
-    return "concat(" + ",".join(parts) + ")"
 
 def _find_publications_search_input(driver) -> Optional[Any]:
     for xp in PUBLICACOES_SEARCH_XPATHES:
@@ -395,22 +397,6 @@ def _wait_publications_page(driver: WebDriver, timeout: int = 90) -> None:
             return False
     WebDriverWait(driver, timeout).until(_ready)
 
-def _maybe_filter_publications_by_query(driver: WebDriver, query: str) -> None:
-    try:
-        search = _find_publications_search_input(driver)
-        if not search:
-            return
-        search.click()
-        try:
-            search.clear()
-        except Exception:
-            pass
-        search.send_keys(query)
-        search.send_keys(Keys.RETURN)
-        time.sleep(0.8)
-    except Exception:
-        pass
-
 def _snippet_from_beginning(description: str, begin_words: int = DEFAULT_BEGIN_WORDS, max_chars: int = 60) -> str:
     if not description:
         return ""
@@ -429,6 +415,22 @@ def _snippet_from_beginning(description: str, begin_words: int = DEFAULT_BEGIN_W
     if len(snippet) > max_chars:
         snippet = snippet[:max_chars].rstrip()
     return snippet
+
+def _maybe_filter_publications_by_query(driver: WebDriver, query: str) -> None:
+    try:
+        search = _find_publications_search_input(driver)
+        if not search:
+            return
+        search.click()
+        try:
+            search.clear()
+        except Exception:
+            pass
+        search.send_keys(query)
+        search.send_keys(Keys.RETURN)
+        time.sleep(0.8)
+    except Exception:
+        pass
 
 def _confirm_post_in_publications(
     driver: WebDriver,
@@ -484,7 +486,229 @@ def _confirm_post_in_publications(
     logger.warning("Não consegui confirmar o post na lista (início=%r) em %ds.", snippet, timeout)
     return False
 
-# --------------------------------- API ----------------------------------------
+# ========================= Captura robusta de perfil ==========================
+PROFILE_AVATAR_BTN_XPATHES = [
+    "//button[@data-tt='Header_NewHeader_Clickable']",
+    "//div[@data-tt='Header_NewHeader_FlexRow_4']//button[@data-tt='Header_NewHeader_Clickable']",
+    "//img[contains(@data-tt,'components_Avatar_AvatarImg')]/ancestor::button[1]",
+    "//button[@aria-haspopup='dialog' and contains(@class,'e1rf0ws82')]",
+    "//button[contains(@class,'e1rf0ws82')]",
+]
+
+PROFILE_MENU_LINK_XPATHES = [
+    "//a[@data-tt='Header_NewHeader_TUXMenuItem' and contains(@href,'tiktok.com/@')]",
+    "//a[contains(@class,'TUXMenuItem') and contains(@href,'tiktok.com/@')]",
+    "//a[contains(@href,'/@@') or contains(@href,'tiktok.com/@')]",
+]
+
+def _await_document_ready(driver: WebDriver, timeout: int = 60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            state = driver.execute_script("return document.readyState")
+            if state == "complete":
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+def _wait_header_ready(driver: WebDriver, timeout: int = 45) -> bool:
+    driver.switch_to.default_content()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for xp in PROFILE_AVATAR_BTN_XPATHES:
+            try:
+                el = WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, xp)))
+                if el.is_displayed():
+                    return True
+            except Exception:
+                pass
+        for xp in PROFILE_MENU_LINK_XPATHES:
+            try:
+                if driver.find_elements(By.XPATH, xp):
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.3)
+    return False
+
+def _open_profile_menu(driver: WebDriver, timeout: int = 20) -> None:
+    driver.switch_to.default_content()
+    if not _wait_header_ready(driver, timeout=max(3, timeout-2)):
+        return
+    for xp in PROFILE_AVATAR_BTN_XPATHES:
+        try:
+            btn = driver.find_element(By.XPATH, xp)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'end'});", btn)
+            try:
+                ActionChains(driver).move_to_element(btn).pause(0.05).click(btn).perform()
+            except Exception:
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].dispatchEvent(new MouseEvent('click',{bubbles:true}))", btn)
+            time.sleep(0.4)
+            for mxp in PROFILE_MENU_LINK_XPATHES:
+                if driver.find_elements(By.XPATH, mxp):
+                    return
+        except Exception:
+            pass
+
+def _extract_profile_from_menu(driver: WebDriver, timeout: int = 8) -> Optional[Tuple[str, str]]:
+    driver.switch_to.default_content()
+    for xp in PROFILE_MENU_LINK_XPATHES:
+        try:
+            a = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, xp)))
+            href = (a.get_attribute("href") or "").strip()
+            if not href:
+                continue
+            user = ""
+            try:
+                parsed = urlparse(href)
+                if parsed.path and parsed.path.startswith("/@"):
+                    user = parsed.path[2:].split("/")[0]
+            except Exception:
+                user = ""
+            return (user, href)
+        except Exception:
+            pass
+    return None
+
+def _profile_from_page_state(driver: WebDriver) -> Optional[Tuple[str, str]]:
+    try:
+        js = """
+        try {
+            if (window.SIGI_STATE && window.SIGI_STATE.UserModule) {
+                const u = window.SIGI_STATE.UserModule.user || {};
+                const id = u.uniqueId || u.secUid || "";
+                if (id) return [id, 'https://www.tiktok.com/@'+id];
+            }
+            const g = window.__UNIVERSAL_DATA__ && window.__UNIVERSAL_DATA__.__INITIAL_STATE__;
+            if (g && g.user) {
+                const id = g.user.uniqueId || "";
+                if (id) return [id, 'https://www.tiktok.com/@'+id];
+            }
+        } catch (e) {}
+        return null;
+        """
+        res = driver.execute_script(js)
+        if res and isinstance(res, (list, tuple)) and len(res) == 2:
+            return (str(res[0]), str(res[1]))
+    except Exception:
+        pass
+    return None
+
+def _close_any_menu(driver: WebDriver) -> None:
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        try:
+            driver.execute_script("document.body && document.body.click && document.body.click();")
+        except Exception:
+            pass
+
+def _log_current_profile(driver: WebDriver, timeout: int = 20, *, want_proxy: bool = False) -> Optional[Tuple[str,str]]:
+    """Tenta abrir o menu do avatar e extrair (username, href). Retorna None se não conseguir."""
+    try:
+        _await_document_ready(driver, timeout=max(10, timeout))
+        if want_proxy:
+            time.sleep(min(15, SLOW_NET_EXTRA_WAIT_SEC))
+        _open_profile_menu(driver, timeout=max(8, timeout // 2))
+        info = _extract_profile_from_menu(driver, timeout=max(6, timeout // 2)) or _profile_from_page_state(driver)
+        if info:
+            username, href = info
+            handle = f"@{username}" if username else "(desconhecido)"
+            logger.info("👤 Perfil autenticado (header): %s — %s", handle, href)
+            return info
+        else:
+            logger.warning("Não consegui capturar o perfil atual no header (menu não disponível/sem href).")
+            return None
+    except Exception as e:
+        logger.warning("Falha ao capturar o perfil atual: %s", e)
+        return None
+    finally:
+        _close_any_menu(driver)
+
+# -------------------------------- Navegação Upload -----------------------------
+
+def _candidate_upload_urls(lang_tag: Optional[str]) -> List[str]:
+    base = "https://www.tiktok.com/tiktokstudio/upload"
+    lt = (lang_tag or "en-US")
+    return [
+        f"{base}?from=webapp&lang={lt}",
+        f"{base}?from=creator_center&lang={lt}",
+        f"{base}?lang={lt}",
+    ]
+
+def _warmup_explore(driver: WebDriver, *, slow_network: bool) -> None:
+    if not slow_network:
+        return
+    try:
+        driver.get("https://www.tiktok.com/explore")
+        logger.info("Warmup: /explore")
+        WebDriverWait(driver, EXPLICIT_WAIT + SLOW_NET_EXTRA_WAIT_SEC).until(
+            EC.presence_of_element_located((By.ID, "root"))
+        )
+        time.sleep(min(WARMUP_EXPLORE_WAIT_SEC, 90))
+    except Exception:
+        pass
+
+def _apply_lang_to_url(url: str, lang_tag: Optional[str]) -> str:
+    if not lang_tag:
+        return url
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["lang"] = [lang_tag]
+        new_q = urlencode(qs, doseq=True)
+        return urlunparse(parsed._replace(query=new_q))
+    except Exception:
+        return url
+
+def _is_upload_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.path.rstrip('/') == "/tiktokstudio/upload"
+    except Exception:
+        return False
+
+def _on_wrong_hub(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.path.rstrip('/') == "/tiktokstudio"
+    except Exception:
+        return False
+
+def _nav_with_retries(driver: WebDriver, *, lang_tag: Optional[str] = None, slow_network: bool = False) -> None:
+    _warmup_explore(driver, slow_network=slow_network)
+
+    candidates = _candidate_upload_urls(lang_tag)
+    attempts = NAV_MAX_RETRIES + (1 if slow_network else 0)
+    settle_extra = SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0
+
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        for target in candidates:
+            try:
+                driver.get(target)
+                logger.info("Navegou para: %s", driver.current_url)
+                WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.ID, "root")))
+                time.sleep(min(UPLOAD_PAGE_SETTLE_SEC + settle_extra, 90))
+                if _on_wrong_hub(driver.current_url):
+                    logger.info("Redirecionado ao hub /tiktokstudio. Forçando novamente a rota de upload…")
+                    continue
+                driver.switch_to.default_content()
+                return
+            except Exception as e:
+                last_error = e
+        logger.warning("Timeout/falha abrindo upload (tentativa %d/%d). Retentando em %.1fs…", attempt, attempts, NAV_RETRY_BACKOFF)
+        time.sleep(NAV_RETRY_BACKOFF)
+
+    raise TimeoutException(f"Não consegui abrir a página de upload após tentativas. Último erro: {last_error}")
+
+# --------------------------- API de Upload ---------------------------
+
 def upload_video(
     filename: str,
     description: Optional[str] = None,
@@ -498,11 +722,10 @@ def upload_video(
     proxy: Optional[ProxyDict] = None,
     product_id: Optional[str] = None,
     idioma: str = "auto",
-    begin_words: Optional[int] = None,   # <<<< novo
+    begin_words: Optional[int] = None,
     *args,
     **kwargs,
 ) -> List[VideoDict]:
-    """Faz o upload de um único vídeo no TikTok."""
     auth = AuthBackend(
         username=username,
         password=password,
@@ -525,7 +748,7 @@ def upload_video(
         auth,
         proxy,
         idioma=idioma,
-        begin_words=begin_words,   # <<<< novo
+        begin_words=begin_words,
         *args,
         **kwargs,
     )
@@ -541,17 +764,15 @@ def upload_videos(
     num_retries: int = 1,
     skip_split_window: bool = False,
     idioma: str = "auto",
-    begin_words: Optional[int] = None,   # <<<< novo
+    begin_words: Optional[int] = None,
     *args,
     **kwargs,
 ) -> List[VideoDict]:
-    """Faz o upload de vários vídeos no TikTok."""
     videos = _convert_videos_dict(videos)  # type: ignore
 
     if videos and len(videos) > 1:
         logger.info("Fazendo upload de %d vídeos", len(videos))
 
-    # 👇 desalinha instâncias antes de começar a postar
     sleep_jitter_before_post()
 
     want_proxy = _use_proxy_from_idioma(idioma)
@@ -577,7 +798,13 @@ def upload_videos(
         we_created_driver = True
         logger.info("Criando uma instância de navegador %s %s", browser, "(headless)" if headless else "")
         chrome_options = ChromeOptions()
-        chrome_options.add_argument("--disable-gpu")
+        if headless:
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--ignore-certificate-errors")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--use-gl=swiftshader")
+            chrome_options.add_argument("--enable-unsafe-swiftshader")
+            chrome_options.add_argument("--ignore-gpu-blocklist")
         chrome_options.add_argument("--disable-logging")
         chrome_options.add_argument("--log-level=3")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
@@ -586,10 +813,7 @@ def upload_videos(
         chrome_options.add_argument("--disable-popup-blocking")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--remote-debugging-pipe")  # 👈 sem porta
-        if headless:
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--ignore-certificate-errors")
+        chrome_options.add_argument("--remote-debugging-pipe")
 
         driver = get_browser(
             browser,
@@ -609,9 +833,12 @@ def upload_videos(
     # Autenticação (cookies/session)
     driver = auth.authenticate_agent(driver)
 
+    # Egito/árabe: forçar timezone e locale no navegador (vale para agendamento)
+    if _idioma_norm(idioma) == "ar":
+        _force_timezone(driver, os.getenv("TZ_EG", "Africa/Cairo"), locale="ar-EG")
+
     failed: List[VideoDict] = []
 
-    # define begin_words efetivo
     eff_begin_words = begin_words if (begin_words is not None and begin_words > 0) else DEFAULT_BEGIN_WORDS
 
     for video in videos:
@@ -648,12 +875,13 @@ def upload_videos(
                 driver, path, description, schedule, skip_split_window,
                 product_id, num_retries, headless=headless,
                 idioma=idioma, lang_tag=lang_tag,
-                begin_words=eff_begin_words,  # <<<< novo
+                begin_words=eff_begin_words,
+                want_proxy=want_proxy,
             )
 
         except WebDriverException as e:
             logger.error("Falha ao fazer upload de %s devido a erro no WebDriver", path)
-            logger.error("Detalhes: %s", str(e))
+            logger.error("Detalhes: Message: UI de upload não apareceu (iframe/input)." if "UI de upload não apareceu" in str(e) else f"Detalhes: {str(e)}")
             failed.append(video)
         except Exception as e:
             logger.error("Falha ao fazer upload de %s", path)
@@ -665,13 +893,14 @@ def upload_videos(
 
     if we_created_driver:
         try:
-            driver.quit()   # 👈 encerra só a nossa instância (sem kill por nome)
+            driver.quit()
         except Exception:
             pass
 
     return failed
 
 # --------------------------- fluxo de upload UI ---------------------------
+
 def complete_upload_form(
     driver: WebDriver,
     path: str,
@@ -684,13 +913,28 @@ def complete_upload_form(
     *,
     idioma: Optional[str] = None,
     lang_tag: Optional[str] = None,
-    begin_words: int = DEFAULT_BEGIN_WORDS,  # <<<< novo
+    begin_words: int = DEFAULT_BEGIN_WORDS,
+    want_proxy: bool = False,
     **kwargs
 ) -> None:
-    """Realiza o upload de um vídeo — tolerante a latência, com “grace” e anticlique precoce."""
-    _nav_with_retries(driver, lang_tag=lang_tag)
+    slow = bool(want_proxy or _use_proxy_from_idioma(idioma))
+
+    _nav_with_retries(driver, lang_tag=lang_tag, slow_network=slow)
     _maybe_close_cookie_banner(driver)
-    _ensure_upload_ui(driver)
+
+    # >>> Captura de perfil com retry e auto-volta à rota de upload <<<
+    for i in range(1, max(1, PROFILE_RETRIES) + 1):
+        info = _log_current_profile(driver, timeout=HEADER_MAX_WAIT_SEC if slow else 12, want_proxy=slow)
+        if info:
+            break
+        if not _is_upload_url(driver.current_url):
+            logger.info("Não está na rota de upload (atual=%s). Tentando voltar para /tiktokstudio/upload…", driver.current_url)
+            _nav_with_retries(driver, lang_tag=lang_tag, slow_network=slow)
+        else:
+            logger.info("Perfil não exibido; reabrindo o menu e tentando novamente (%d/%d)…", i, PROFILE_RETRIES)
+        time.sleep(2)
+
+    _ensure_upload_ui(driver, slow_network=slow)
 
     send_ts = _set_video(driver, path=path, num_retries=max(1, num_retries))
 
@@ -707,7 +951,7 @@ def complete_upload_form(
     elapsed = time.time() - send_ts
     remaining = max(0, POST_MIN_GRACE_SEC - int(elapsed))
     if remaining > 0:
-        logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio do arquivo)...", remaining)
+        logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio do arquivo)…", remaining)
         time.sleep(remaining)
 
     if POST_AFTER_ENABLED_EXTRA_SEC > 0:
@@ -741,67 +985,60 @@ def complete_upload_form(
     except Exception:
         pass
 
-def _apply_lang_to_url(url: str, lang_tag: Optional[str]) -> str:
-    if not lang_tag:
-        return url
-    try:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query, keep_blank_values=True)
-        qs["lang"] = [lang_tag]
-        new_q = urlencode(qs, doseq=True)
-        return urlunparse(parsed._replace(query=new_q))
-    except Exception:
-        return url
+# =============== Upload UI/iframe detection (robusto) ==================
 
-def _nav_with_retries(driver: WebDriver, *, lang_tag: Optional[str] = None) -> None:
-    target = _apply_lang_to_url(config["paths"]["upload"], lang_tag)
-    for attempt in range(1, NAV_MAX_RETRIES + 1):
-        try:
-            if driver.current_url != target:
-                driver.get(target)
-                logger.info(f"Navegou para: {driver.current_url}")
-            WebDriverWait(driver, EXPLICIT_WAIT).until(EC.presence_of_element_located((By.ID, "root")))
-            driver.switch_to.default_content()
-            return
-        except TimeoutException:
-            logger.warning("Timeout abrindo upload (tentativa %d/%d). Retentando em %.1fs...",
-                           attempt, NAV_MAX_RETRIES, NAV_RETRY_BACKOFF)
-            time.sleep(NAV_RETRY_BACKOFF)
-        except WebDriverException as e:
-            logger.warning("Falha de navegação (tentativa %d/%d): %s", attempt, NAV_MAX_RETRIES, e)
-            time.sleep(NAV_RETRY_BACKOFF)
-    raise TimeoutException("Não consegui abrir a página de upload após múltiplas tentativas.")
+def _ensure_upload_ui(driver: WebDriver, *, slow_network: bool = False) -> None:
+    """Garante que o input de upload esteja disponível.
+    Tenta primeiro dentro do iframe conhecido; se não achar, procura no `defaultContent`.
+    Se ainda falhar, reabre a página (variantes de URL) e tenta novamente.
+    """
+    selectors = config["selectors"]["upload"]
 
-def _ensure_upload_ui(driver: WebDriver) -> None:
-    for attempt in range(1, IFRAME_MAX_RETRY + 1):
+    def _find_input_in_default() -> Optional[Any]:
         try:
-            driver.switch_to.default_content()
+            return driver.find_element(By.XPATH, selectors["upload_video"])  # do config
+        except Exception:
             try:
-                iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(
-                    EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
+                return driver.find_element(By.XPATH, "//input[@type='file' and contains(@accept,'video')]")
+            except Exception:
+                return None
+
+    for attempt in range(1, IFRAME_MAX_RETRY + 2):  # +1 tentativa extra
+        try:
+            driver.switch_to.default_content()
+            # 1) tentar pelo iframe do Studio
+            try:
+                iframe = WebDriverWait(driver, IMPLICIT_WAIT + (SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0)).until(
+                    EC.presence_of_element_located((By.XPATH, selectors["iframe"]))
                 )
                 driver.switch_to.frame(iframe)
+                WebDriverWait(driver, EXPLICIT_WAIT + (SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0)).until(
+                    EC.presence_of_element_located((By.XPATH, selectors["upload_video"]))
+                )
                 logger.info("Entrou no iframe de upload")
+                return
             except TimeoutException:
                 driver.switch_to.default_content()
 
-            WebDriverWait(driver, EXPLICIT_WAIT).until(
-                EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["upload_video"]))
-            )
-            return
-        except TimeoutException:
-            logger.warning("Upload UI não disponível (tentativa %d/%d).", attempt, IFRAME_MAX_RETRY)
-            time.sleep(NAV_RETRY_BACKOFF)
+            # 2) tentar achar direto no DOM principal
+            inp = _find_input_in_default()
+            if inp is not None:
+                logger.info("Upload UI detectada no documento principal (sem iframe)")
+                return
+
+        except Exception:
+            pass
+
+        logger.warning("Upload UI não disponível (tentativa %d/%d).", attempt, IFRAME_MAX_RETRY + 1)
+        time.sleep(NAV_RETRY_BACKOFF)
+        try:
+            _nav_with_retries(driver, slow_network=slow_network)
+        except Exception:
+            pass
+
     raise TimeoutException("UI de upload não apareceu (iframe/input).")
 
-def _change_to_upload_iframe(driver: WebDriver) -> None:
-    try:
-        driver.switch_to.default_content()
-        iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
-        iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(iframe_selector)
-        driver.switch_to.frame(iframe)
-    except TimeoutException:
-        driver.switch_to.default_content()
+# ================== utilidades de descrição/hashtags/etc ==================
 
 def _maybe_close_cookie_banner(driver: WebDriver) -> None:
     try:
@@ -812,8 +1049,7 @@ def _maybe_close_cookie_banner(driver: WebDriver) -> None:
 def _wait_post_enabled(driver: WebDriver, timeout: int = 30) -> None:
     try:
         WebDriverWait(driver, timeout).until(
-            lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and
-                      el.get_attribute("data-disabled") == "false"
+            lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and el.get_attribute("data-disabled") == "false"
         )
     except Exception:
         pass
@@ -858,8 +1094,7 @@ def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
             try:
                 btn = driver.find_element(
                     By.XPATH,
-                    f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
-                    f"//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]"
+                    f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]"
                 )
             except Exception:
                 btn = None
@@ -874,8 +1109,7 @@ def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
         try:
             any_primary = driver.find_element(
                 By.XPATH,
-                "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]"
-                "//button[contains(@class,'TUXButton--primary')]"
+                "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]//button[contains(@class,'TUXButton--primary')]"
             )
             driver.execute_script("arguments[0].click();", any_primary)
             time.sleep(0.8)
@@ -1025,6 +1259,15 @@ def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs
         time.sleep(min(10, NAV_RETRY_BACKOFF * attempt))
 
     raise FailedToUpload(last_exc or Exception("Falha ao anexar vídeo."))
+
+def _change_to_upload_iframe(driver: WebDriver) -> None:
+    try:
+        driver.switch_to.default_content()
+        iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
+        iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(iframe_selector)
+        driver.switch_to.frame(iframe)
+    except TimeoutException:
+        driver.switch_to.default_content()
 
 def _remove_cookies_window(driver) -> None:
     try:
@@ -1183,7 +1426,7 @@ def _post_video(driver: WebDriver) -> None:
 
     try:
         if _click_publish_now_if_modal(driver, wait_secs=30):
-            logger.info("Prosseguindo após confirmar 'Publicar agora'.")
+            logger.info("✅ Modal de verificação tratado — clicado 'Publicar agora'.")
     except Exception:
         pass
 
@@ -1284,6 +1527,22 @@ def _refresh_with_alert(driver: WebDriver) -> None:
     except Exception as e:
         logger.debug("Sem alert ao atualizar: %s", e)
 
+# =============================== CDP Helpers ================================
+
+def _force_timezone(driver: WebDriver, tz: str, locale: Optional[str] = None) -> None:
+    """Força timezone/locale do navegador via CDP (para agendamentos corretos)."""
+    try:
+        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": tz})
+        if locale:
+            try:
+                driver.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": locale})
+            except Exception:
+                pass
+        z = driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone")
+        logger.info("🕒 Timezone ativo no navegador: %s", z)
+    except Exception as e:
+        logger.warning("Falha ao forçar timezone: %s", e)
+
 # -------------------------------- exceções ------------------------------------
 class DescriptionTooLong(Exception):
     """Descrição excede o máximo suportado pelo uploader web do TikTok"""
@@ -1296,7 +1555,7 @@ class FailedToUpload(Exception):
         super().__init__(message or self.__doc__)
 
 # -------------------------- link de produto (opcional) ------------------------
+
 def _add_product_link(driver: WebDriver, product_id: str) -> None:
     logger.info(f"Tentando adicionar link de produto para ID: {product_id}")
-    # ... (o corpo permanece igual ao seu original; mantive aqui para não alongar demais)
-    # Se quiser, eu reescrevo o seletor/flow deste modal também.
+    # Mantido conforme o seu fluxo original; posso reescrever se necessário.
