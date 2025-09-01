@@ -1,4 +1,4 @@
-# utils/frase.py
+# utils/frase.py (Copie e cole este conteúdo)
 import os
 import re
 import unicodedata
@@ -44,6 +44,7 @@ RESOURCES_DIR = "resources"
 os.makedirs(CACHE_DIR, exist_ok=True)
 PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_phrases.json")
 LONG_PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_long_phrases.json")
+PEXELS_PROMPTS_CACHE_FILE = os.path.join(CACHE_DIR, "used_pexels_prompts.json") # <--- NOVO CACHE
 FALLBACK_PHRASES_FILE = os.path.join(RESOURCES_DIR, "fallback_phrases.json")
 _FALLBACK_PHRASES_CACHE: Optional[Dict] = None
 
@@ -75,7 +76,7 @@ def save_used_phrases(used_phrases: List[str], cache_file: str) -> None:
 # -----------------------------------------------------------------------------#
 _PT_SW = {"a","o","os","as","um","uma","de","da","do","das","dos","em","no","na","nos","nas","e","ou","pra","para","por","que","se","com","sem","ao","à","às","aos","é","ser","ter"}
 _EN_SW = {"a","an","the","and","or","of","in","on","to","for","with","that","is","it","you","your"}
-LANG_NAME_MAP = {"pt": "português do Brasil", "en": "inglês", "ar": "árabe"}
+LANG_NAME_MAP = {"pt": "português do Brasil", "en": "inglês", "ar": "árabe egípcio"}
 
 def _load_prompt_template(template_name: str) -> str:
     """Carrega um template de prompt de um arquivo YAML."""
@@ -85,7 +86,10 @@ def _load_prompt_template(template_name: str) -> str:
     config_path = Path(__file__).parent / "prompts" / f"{template_name}.yaml"
     
     if not config_path.exists():
-        raise FileNotFoundError(f"Arquivo de template de prompt '{config_path}' não encontrado.")
+        config_path = Path("prompts") / f"{template_name}.yaml"
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Arquivo de template de prompt '{config_path.name}' não encontrado em {config_path.resolve()} ou na pasta /prompts")
     
     with open(config_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
@@ -130,7 +134,8 @@ def _strip_emph(s: str) -> str:
 def _count_words_no_markup(s: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", _strip_emph(s), flags=re.UNICODE))
 
-def _ask_json_list(prompt: str, temperature: float = 1.0, tries: int = 3) -> List[str]:
+def _ask_gemini(prompt: str, response_type: type = list, temperature: float = 1.0, tries: int = 3):
+    """Função genérica para fazer perguntas ao Gemini e esperar um tipo de JSON (list ou dict)."""
     print("\n" + "="*20 + " PROMPT ENVIADO AO GEMINI " + "="*20)
     print(prompt)
     print("="*66 + "\n")
@@ -148,14 +153,24 @@ def _ask_json_list(prompt: str, temperature: float = 1.0, tries: int = 3) -> Lis
             print(raw)
             print("-"*68 + "\n")
 
-            data = json.loads(raw)
-            if isinstance(data, list):
-                out = [c for it in data if isinstance(it, str) and (c := _clean_line(it))]
-                if out: return out
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                if raw.startswith('[') and raw.endswith(']'):
+                    list_data = json.loads(raw)
+                    if isinstance(list_data, list) and len(list_data) > 0 and isinstance(list_data[0], str):
+                        data = json.loads(list_data[0])
+                else:
+                    raise
+
+            if isinstance(data, response_type):
+                if response_type == list:
+                    return [c for it in data if isinstance(it, str) and (c := _clean_line(it))]
+                return data
         except Exception as e:
-            logger.warning("Falha ao pedir/processar lista JSON ao Gemini (tentativa %d/%d): %s", attempt + 1, tries, e)
+            logger.warning("Falha ao pedir/processar JSON ao Gemini (tentativa %d/%d): %s", attempt + 1, tries, e)
         time.sleep(0.8 * (attempt + 1))
-    return []
+    return response_type()
 
 def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str:
     base = _clean_line(text)
@@ -181,7 +196,7 @@ def quebrar_em_duas_linhas(frase: str) -> str:
     ponto_de_quebra = (len(palavras) + 1) // 2
     return f'{" ".join(palavras[:ponto_de_quebra])}\n{" ".join(palavras[ponto_de_quebra:])}'
 
-# ### INÍCIO DA ADIÇÃO: Funções movidas para cá para serem centralizadas ###
+# ### Funções de ênfase (centralizadas) ###
 _PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca","coragem", "propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
 
 def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
@@ -201,7 +216,6 @@ def _pick_highlights(line: str) -> List[str]:
     return words[-1:] if words else []
 
 def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
-    # Dependências de ambiente que esta função usa (copiadas de imagem.py)
     IMAGE_EMPHASIS_ONLY_MARKUP = os.getenv("IMAGE_EMPHASIS_ONLY_MARKUP", "True").lower() in ("true", "1", "yes")
     IMAGE_FORCE_EMPHASIS = os.getenv("IMAGE_FORCE_EMPHASIS", "False").lower() in ("true", "1", "yes")
     IMAGE_EMPHASIS_LAST_WORDS = int(os.getenv("IMAGE_EMPHASIS_LAST_WORDS", "1"))
@@ -229,17 +243,43 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
         else:
             hl = _pick_highlights(punch)
     return intro, punch, hl
-# ### FIM DA ADIÇÃO ###
 
+# ### LÓGICA DE GERAÇÃO DE CONTEÚDO DINÂMICO ###
+def _gerar_contexto_dinamico(content_mode: str, lang: str) -> str:
+    """ETAPA 1: Gera uma persona, tema e metáfora únicos para o vídeo do dia."""
+    logger.info("Gerando contexto dinâmico para a narração...")
+    try:
+        content_type = "Tarot ou Oráculo" if content_mode == "tarot" else "Motivacional"
+        prompt_text = _load_prompt_template("context_generator").format(
+            content_type=content_type,
+            target_lang_name=LANG_NAME_MAP.get(lang, "inglês")
+        )
+        
+        context_data = _ask_gemini(prompt_text, response_type=dict, temperature=1.3)
+        
+        if context_data and all(k in context_data for k in ["persona_do_dia", "tema_especifico", "metafora_visual"]):
+            context_str = (
+                f"PERSONA: {context_data['persona_do_dia']}\n"
+                f"TEMA: {context_data['tema_especifico']}\n"
+                f"METÁFORA: {context_data['metafora_visual']}"
+            )
+            logger.info("✅ Contexto dinâmico gerado com sucesso.")
+            return context_str
+        
+        logger.warning("A resposta do gerador de contexto não continha as chaves esperadas.")
+    except Exception as e:
+        logger.error("Falha ao gerar contexto dinâmico: %s", e)
+
+    return "PERSONA: Um narrador sábio e gentil.\nTEMA: A importância da perseverança.\nMETÁFORA: Uma pequena luz na escuridão."
 
 # -----------------------------------------------------------------------------#
 # Funções Principais (Hashtags, Prompts, Frases)
 # -----------------------------------------------------------------------------#
-def _get_history_for_prompt(cache_file: str, limit: int = 30) -> str:
+def _get_history_for_prompt(cache_file: str, limit: int = 15) -> str:
     used_phrases = load_used_phrases(cache_file)
     if not used_phrases: return ""
     formatted_list = "\n".join([f'- "{phrase}"' for phrase in used_phrases[-limit:]])
-    return f"---\nHISTÓRICO DE FRASES RECENTES (EVITE CRIAR ALGO SIMILAR A ISTO):\n{formatted_list}\n---"
+    return f"\n{formatted_list}\n"
 
 def _dedupe_hashtags(tags: List[str]) -> List[str]:
     seen, out = set(), []
@@ -271,26 +311,70 @@ def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3, plata
     except FileNotFoundError as e:
         logger.warning(f"Falha ao gerar hashtags (seguirei sem): {e}")
         return []
-    raw_list = _ask_json_list(prompt, temperature=0.9, tries=3)
+    raw_list = _ask_gemini(prompt, response_type=list, temperature=0.9, tries=3)
     tags = _dedupe_hashtags([_sanitize_hashtag(t, lang) for t in raw_list if t])
     if len(tags) < n:
         fallbacks = {"pt": ["#motivacao", "#inspiracao", "#mindset", "#disciplina", "#foco"], "ar": ["#تحفيز", "#الهام", "#انجاز", "#انضباط", "#تركيز"], "en": ["#motivation", "#inspiration", "#mindset", "#discipline", "#focus"]}
         tags.extend(f for f in fallbacks.get(lang, []) if f.lower() not in {t.lower() for t in tags} and len(tags) < n)
     return tags[:n]
 
-def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "en") -> List[str]:
+def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "en", pexels_mode: bool = False) -> List[str]:
+    """Gera prompts de imagem para Pexels (simples) ou IA (complexo)."""
     if not os.getenv("GEMINI_API_KEY"):
         logger.error("❌ GEMINI_API_KEY não configurada.")
         return [f"{tema}, variação {i+1}" for i in range(quantidade)]
-    target_lang_name = LANG_NAME_MAP.get(_lang_tag(idioma), "inglês")
-    template = _load_prompt_template("image_prompts")
-    prompt_text = template.format(tema=tema, quantidade=quantidade, target_lang_name=target_lang_name)
-    descricoes = _ask_json_list(prompt_text, temperature=1.3, tries=3)
-    if descricoes and len(descricoes) >= quantidade:
-        logger.info(f"✅ {len(descricoes)} prompts de imagem criativos gerados para o tema '{tema}'.")
-        return descricoes[:quantidade]
+    
+    image_mode_from_env = os.getenv("IMAGE_MODE", "pexels").lower()
+    if image_mode_from_env == "pexels":
+        if not pexels_mode:
+            logger.debug("Forçando pexels_mode=True com base no .env (IMAGE_MODE=pexels)")
+        pexels_mode = True
+    
+    template_name = "image_prompts_pexels" if pexels_mode else "image_prompts"
+    
+    try:
+        # <--- MUDANÇA AQUI: Lógica de cache e histórico para prompts do Pexels --->
+        cache_file = PEXELS_PROMPTS_CACHE_FILE if pexels_mode else ""
+        historico_prompts = ""
+        used_prompts = []
+        if pexels_mode and cache_file:
+            used_prompts = load_used_phrases(cache_file)
+            historico_prompts = "\n".join([f"- {p}" for p in used_prompts[-20:]]) # Envia os últimos 20 para o prompt
+
+        template = _load_prompt_template(template_name)
+        format_args = {
+            "quantidade": quantidade,
+            "tema": tema,
+            "target_lang_name": LANG_NAME_MAP.get(_lang_tag(idioma), "inglês"),
+            "historico_prompts": historico_prompts
+        }
+        prompt_text = template.format(**format_args)
+        descricoes = _ask_gemini(prompt_text, response_type=list, temperature=1.3, tries=3)
+        
+        # Filtra e salva os novos prompts
+        if descricoes:
+            used_prompts_set = {p.strip().lower() for p in used_prompts}
+            novos_prompts = [p for p in descricoes if p.strip().lower() not in used_prompts_set]
+
+            if len(novos_prompts) < quantidade:
+                logger.warning(f"Gerou apenas {len(novos_prompts)} prompts inéditos para Pexels. Usando-os e preenchendo com fallbacks se necessário.")
+
+            final_prompts = novos_prompts[:quantidade]
+            if len(final_prompts) < quantidade:
+                 final_prompts.extend([f"{tema} cinematic variation {i+1}" for i in range(quantidade - len(final_prompts))])
+
+            if pexels_mode and cache_file and final_prompts:
+                save_used_phrases(used_prompts + final_prompts, cache_file)
+            
+            logger.info(f"✅ {len(final_prompts)} prompts de imagem ({'Pexels' if pexels_mode else 'IA'}) gerados para '{tema}'.")
+            return final_prompts
+
+    except Exception as e:
+        logger.warning("Falha ao gerar prompts de imagem: %s", e)
+
     logger.warning("Não foi possível gerar prompts criativos. Usando fallback.")
-    return [f"{tema}, cinematic, high detail, variation {i+1}" for i in range(quantidade)]
+    fallback_suffix = "cinematic" if pexels_mode else "cinematic, high detail, 8k --no text"
+    return [f"{tema}, {fallback_suffix}, variation {i+1}" for i in range(quantidade)]
 
 def gerar_frase_motivacional(idioma: str = "en") -> str:
     lang = _lang_tag(idioma)
@@ -298,7 +382,7 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
     used_phrases = load_used_phrases(PHRASES_CACHE_FILE)
     used_phrases_set = {p.strip() for p in used_phrases}
     for _ in range(3):
-        phrases = _ask_json_list(prompt_text, temperature=1.2, tries=2)
+        phrases = _ask_gemini(prompt_text, response_type=list, temperature=1.2, tries=2)
         valid = [p for p in phrases if 6 <= _count_words_no_markup(p) <= 12 and p.strip() not in used_phrases_set]
         if valid:
             chosen = _ensure_single_emphasis(random.choice(valid), lang)
@@ -308,29 +392,73 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
     logger.warning("Nenhuma frase curta inédita foi gerada, usando fallback.")
     return _get_fallback_phrase("motivacional_curta", lang)
 
+def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[str]:
+    """Lógica interna para gerar e validar frases longas com fallback de contagem de palavras."""
+    used_phrases = load_used_phrases(cache_file)
+    used_phrases_set = {p.strip() for p in used_phrases}
+
+    response_data = _ask_gemini(prompt_text, response_type=list, temperature=1.2, tries=2)
+    
+    phrases = []
+    if isinstance(response_data, list):
+        phrases = response_data
+    elif isinstance(response_data, dict):
+        phrases = [str(v) for v in response_data.values() if isinstance(v, str)]
+
+    if not phrases:
+        return None
+
+    ideal_min, ideal_max = 70, 160
+    valid = [p for p in phrases if ideal_min <= _count_words_no_markup(p) <= ideal_max and p.strip() not in used_phrases_set]
+    if valid:
+        chosen = random.choice(valid)
+        used_phrases.append(chosen)
+        save_used_phrases(used_phrases, cache_file)
+        logger.info("✅ Frase longa inédita (ideal: %d palavras) selecionada.", _count_words_no_markup(chosen))
+        return chosen
+
+    logger.warning("Nenhuma frase no intervalo ideal (%d-%d palavras). Verificando em intervalo flexível...", ideal_min, ideal_max)
+    flex_min, flex_max = 40, 200
+    valid_flex = [p for p in phrases if flex_min <= _count_words_no_markup(p) <= flex_max and p.strip() not in used_phrases_set]
+    if valid_flex:
+        chosen = max(valid_flex, key=_count_words_no_markup)
+        used_phrases.append(chosen)
+        save_used_phrases(used_phrases, cache_file)
+        logger.info("✅ Frase longa inédita (flex: %d palavras) selecionada.", _count_words_no_markup(chosen))
+        return chosen
+
+    return None
+
 def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
     lang = _lang_tag(idioma)
-    prompt_text = _load_prompt_template("long_motivational").format(target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE))
-    used_long_phrases = load_used_phrases(LONG_PHRASES_CACHE_FILE)
-    used_long_phrases_set = {p.strip() for p in used_long_phrases}
-    for attempt in range(1, 4):
-        logger.info(f"Tentando gerar frase longa inédita (tentativa {attempt}/3)...")
-        phrases = _ask_json_list(prompt_text, temperature=1.2, tries=2)
-        valid = [p for p in phrases if 25 <= _count_words_no_markup(p) <= 40 and p.strip() not in used_long_phrases_set]
-        if valid:
-            chosen = random.choice(valid)
-            used_long_phrases.append(chosen)
-            save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
-            logger.info("✅ Frase longa inédita selecionada para narração.")
+    
+    for creative_attempt in range(1, 4):
+        logger.info(f"Ciclo Criativo [{creative_attempt}/3]: Gerando novo contexto...")
+        
+        dynamic_context = _gerar_contexto_dinamico("motivacional", lang)
+        
+        prompt_text = _load_prompt_template("long_motivational").format(
+            dynamic_context=dynamic_context,
+            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), 
+            historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE)
+        )
+        
+        chosen = _gerar_e_validar_frase_longa(prompt_text, LONG_PHRASES_CACHE_FILE)
+        if chosen:
             return chosen
-        logger.warning(f"Tentativa {attempt} não encontrou frases novas. Re-gerando prompt com histórico atualizado.")
-        prompt_text = _load_prompt_template("long_motivational").format(target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE))
-        if attempt < 3: time.sleep(1)
-    logger.warning("Nenhuma frase longa inédita foi gerada após 3 tentativas, usando fallback.")
+        
+        logger.warning(f"O contexto gerado não resultou em uma frase válida. Tentando novo ciclo criativo...")
+        if creative_attempt < 3:
+            time.sleep(1)
+
+    logger.error("Falha em gerar uma frase longa válida após 3 ciclos criativos. Usando fallback.")
     return _get_fallback_phrase("motivacional_longa", lang)
 
 def gerar_prompt_tarot(idioma: str = "en") -> str:
-    return gerar_prompts_de_imagem_variados("mesa de tarô mística", 1, idioma)[0]
+    """Retorna um tema simples e fixo para ser usado na busca de imagens de tarot."""
+    tema_fixo = "mesa de tarô mística"
+    logger.info("Usando tema base para tarot: '%s'", tema_fixo)
+    return tema_fixo
 
 def gerar_frase_tarot_curta(idioma: str = "en") -> str:
     lang = _lang_tag(idioma)
@@ -338,7 +466,7 @@ def gerar_frase_tarot_curta(idioma: str = "en") -> str:
     used_phrases = load_used_phrases(PHRASES_CACHE_FILE)
     used_phrases_set = {p.strip() for p in used_phrases}
     for _ in range(3):
-        phrases = _ask_json_list(prompt_text, temperature=1.2)
+        phrases = _ask_gemini(prompt_text, response_type=list, temperature=1.2)
         valid = [p for p in phrases if p.strip() not in used_phrases_set]
         if valid:
             chosen = _ensure_single_emphasis(random.choice(valid), lang)
@@ -350,19 +478,25 @@ def gerar_frase_tarot_curta(idioma: str = "en") -> str:
 
 def gerar_frase_tarot_longa(idioma: str = "en") -> str:
     lang = _lang_tag(idioma)
-    prompt_text = _load_prompt_template("long_tarot").format(target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE))
-    used_long_phrases = load_used_phrases(LONG_PHRASES_CACHE_FILE)
-    used_long_phrases_set = {p.strip() for p in used_long_phrases}
-    for attempt in range(1, 4):
-        logger.info(f"Tentando gerar frase longa de tarot inédita (tentativa {attempt}/3)...")
-        phrases = _ask_json_list(prompt_text, temperature=1.2, tries=2)
-        valid = [p for p in phrases if 25 <= _count_words_no_markup(p) <= 40 and p.strip() not in used_long_phrases_set]
-        if valid:
-            chosen = random.choice(valid)
-            used_long_phrases.append(chosen)
-            save_used_phrases(used_long_phrases, LONG_PHRASES_CACHE_FILE)
-            logger.info("✅ Frase longa de tarot inédita selecionada para narração.")
+
+    for creative_attempt in range(1, 4):
+        logger.info(f"Ciclo Criativo [{creative_attempt}/3]: Gerando novo contexto...")
+
+        dynamic_context = _gerar_contexto_dinamico("tarot", lang)
+
+        prompt_text = _load_prompt_template("long_tarot").format(
+            dynamic_context=dynamic_context,
+            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), 
+            historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE)
+        )
+
+        chosen = _gerar_e_validar_frase_longa(prompt_text, LONG_PHRASES_CACHE_FILE)
+        if chosen:
             return chosen
-        if attempt < 3: time.sleep(1)
-    logger.warning("Nenhuma frase longa de tarot inédita foi gerada, usando fallback.")
+
+        logger.warning(f"O contexto gerado não resultou em uma frase válida. Tentando novo ciclo criativo...")
+        if creative_attempt < 3:
+            time.sleep(1)
+
+    logger.error("Falha em gerar uma frase longa válida após 3 ciclos criativos. Usando fallback.")
     return _get_fallback_phrase("tarot_longa", lang)

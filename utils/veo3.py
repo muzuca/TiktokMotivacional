@@ -4,6 +4,8 @@
 # - Normaliza cada cena para 9:16 (1080x1920) via scale+pad (SEM zoom)
 # - Junta cenas (concat) + BGM opcional (com Audio Ducking); aplica PÓS-ZOOM opcional no final
 # - Menus com "b/voltar": testar, gerar+postar, reutilizar, **exportar (sem postar)** e auto-config do modo automático
+# - (NOVO) Resume inteligente: só gera cenas faltantes/sem áudio
+# - (NOVO) Menu 5: Regerar faltantes a partir de prompts salvos e postar
 
 from __future__ import annotations
 import os, re, json, time, shutil, random, logging, subprocess
@@ -119,7 +121,6 @@ def _has_audio_stream(path: str) -> bool:
 
 def _video_duration(path: str) -> float:
     info = _probe_json(path)
-    # tenta em streams e depois em format.duration
     for s in info.get("streams", []):
         if s.get("codec_type") == "video":
             try:
@@ -237,7 +238,7 @@ def _variation_policy_text(mode: str) -> str:
     if mode == "change_wardrobe":
         return "Keep baseline background; VARY wardrobe color/style between scenes, still coherent with character."
     if mode == "change_both":
-        return "VARY both wardrobe (color/style) AND background between scenes, coherent with the character."
+        return "VARY both wardrobe (color/style) AND background, coherent with the character."
     return "Keep the baseline wardrobe AND baseline background consistent across all scenes."
 
 def _scene_roles_text(n: int) -> str:
@@ -276,6 +277,7 @@ def _build_gemini_command_full(
     strict_rules_extra = (
         f"- Dialogue duration must be ≤ 8s. Word count must be strictly between {D_MIN}–{D_MAX}.\n"
         f"- End Dialogue with a full stop. No ellipses '...' or em dashes '—'.\n"
+        f"- NEVER include the character name inside the Dialogue, and NEVER end the Dialogue with a name.\n"
     )
     cta_policy = (
         "CTA policy (engagement-only):\n"
@@ -312,11 +314,9 @@ def _parse_prompts_from_gemini_json(raw_text: str, n: int) -> List[str]:
     return prompts
 
 def _regenerate_short_dialogue(client: "genai.Client", original_dialogue: str, max_words: int) -> Optional[str]:
-    """Pede ao Gemini para reescrever um diálogo para ser mais curto."""
     try:
         logger.info(f"🔄 Diálogo muito longo. Pedindo ao Gemini para reescrever com no máximo {max_words} palavras...")
         word_count = len(original_dialogue.split())
-        
         prompt = (
             f"A frase a seguir tem {word_count} palavras, o que é muito longo. "
             f"Por favor, reescreva-a para transmitir exatamente a mesma ideia e tom, "
@@ -324,10 +324,8 @@ def _regenerate_short_dialogue(client: "genai.Client", original_dialogue: str, m
             f"Responda APENAS com a frase reescrita, terminando com um ponto final.\n\n"
             f"Frase original: \"{original_dialogue}\""
         )
-        
         resp = client.models.generate_content(model=TEXT_MODEL, contents=prompt)
         new_dialogue = (resp.text or "").strip()
-
         if new_dialogue and len(new_dialogue.split()) <= max_words:
             logger.info(f"✅ Diálogo reescrito com sucesso: \"{new_dialogue}\"")
             return new_dialogue
@@ -338,7 +336,20 @@ def _regenerate_short_dialogue(client: "genai.Client", original_dialogue: str, m
         logger.error(f"Erro ao tentar regenerar diálogo: {e}")
         return None
 
-# --- FUNÇÃO CORRIGIDA E MAIS ROBUSTA ---
+def _strip_persona_name(dialogue: str, persona: str) -> str:
+    if not dialogue:
+        return dialogue
+    names = {
+        "yasmina": ["Yasmina", "ياسمينا", "YASMina"],
+        "luisa": ["Luísa", "Luisa"],
+    }
+    alts = names.get((persona or "").lower(), [])
+    if not alts:
+        alts = [persona, persona.title()]
+    tail = r"(?:\s*[-–—]?\s*(?:%s))\s*\.$" % "|".join(map(re.escape, alts))
+    cleaned = re.sub(tail, ".", dialogue, flags=re.IGNORECASE | re.UNICODE)
+    return cleaned
+
 def _ask_gemini_scene_prompts(
     persona: str, idioma: str, tema: str, n: int, variation_mode: str, viral_context: Dict[str, str]
 ) -> List[str]:
@@ -350,46 +361,36 @@ def _ask_gemini_scene_prompts(
     print("\n===================================================================\n")
     cfg = types.GenerateContentConfig(response_mime_type="application/json")
     resp = client.models.generate_content(model=TEXT_MODEL, contents=cmd, config=cfg)
-    
     prompts = _parse_prompts_from_gemini_json(resp.text or "", n)
-    
-    # Define o padrão regex para encontrar o bloco de diálogo de forma segura
+
     dialogue_pattern = re.compile(
         r'(Dialogue:.*?spoken in .*?\n)(.*?)(?=\n\n|\nBackground sounds:)', 
         re.DOTALL
     )
 
-    # Função interna para processar cada match do regex
     def replacer(match: re.Match) -> str:
         header = match.group(1)
         original_dialogue = match.group(2).strip()
+        original_dialogue = _strip_persona_name(original_dialogue, persona)
         word_count = len(original_dialogue.split())
 
-        if word_count <= D_MAX:
-            return match.group(0) # Retorna o bloco original sem alterações
+        if D_MIN <= word_count <= D_MAX:
+            return f"{header}{original_dialogue}"
 
-        logger.warning(
-            f"Diálogo gerado pelo Gemini excedeu o limite de {D_MAX} palavras (tinha {word_count}). "
-            "Tentando regenerar uma versão mais curta..."
-        )
-        
-        # Plano A: Tenta regenerar
-        new_dialogue = _regenerate_short_dialogue(client, original_dialogue, D_MAX)
+        if word_count > D_MAX:
+            logger.warning(f"Diálogo excedeu {D_MAX} palavras (tinha {word_count}). Tentando regenerar...")
+            new_dialogue = _regenerate_short_dialogue(client, original_dialogue, D_MAX)
+            if not new_dialogue:
+                words = original_dialogue.split()[:D_MAX]
+                new_dialogue = ' '.join(words)
+                if not new_dialogue.endswith('.'):
+                    new_dialogue = re.sub(r'[,;:]\s*$', '', new_dialogue).strip() + '.'
+            return f"{header}{_strip_persona_name(new_dialogue, persona)}"
 
-        # Plano B: Se a regeneração falhar, usa o fallback de truncamento
-        if not new_dialogue:
-            logger.warning("Fallback: O diálogo será cortado no limite de palavras.")
-            words = original_dialogue.split()[:D_MAX]
-            new_dialogue = ' '.join(words)
-            if not new_dialogue.endswith('.'):
-                new_dialogue = re.sub(r'[,;:]\s*$', '', new_dialogue).strip() + '.'
-        
-        return f"{header}{new_dialogue}"
+        return f"{header}{original_dialogue}"
 
-    # Itera sobre cada prompt e aplica a substituição segura
     validated_prompts = [dialogue_pattern.sub(replacer, p_text) for p_text in prompts]
     return validated_prompts
-
 
 # ------------------------ FFmpeg helpers ------------------------
 def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", bgm_db: float = BG_MIX_DB) -> str:
@@ -397,7 +398,6 @@ def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", b
         raise ValueError("Lista de vídeos vazia.")
     ffmpeg = _ffmpeg_or_die()
 
-    # Detecta áudio e duração de cada entrada
     has_aud = [ _has_audio_stream(p) for p in mp4s ]
     durations = [ max(0.0, _video_duration(p)) for p in mp4s ]
 
@@ -411,9 +411,7 @@ def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", b
         bgm_idx = len(mp4s)
 
     parts = []
-    # Vídeo + áudio (ou silêncio) por entrada
     for i in range(len(mp4s)):
-        # vídeo sempre normalizado
         parts.append(
             f"[{i}:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
             f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,fps={FPS_OUT},format=yuv420p,setsar=1/1[v{i}];"
@@ -428,22 +426,16 @@ def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", b
                 f"anullsrc=r={AUDIO_SR}:cl=stereo,atrim=0:{dur:.3f},asetpts=N/SR/TB[a{i}];"
             )
 
-    # concat
     va = "".join([f"[v{i}][a{i}]" for i in range(len(mp4s))])
     parts.append(f"{va}concat=n={len(mp4s)}:v=1:a=1[vcat][acat];")
 
-    # BGM opcional com ducking
     if bgm_idx >= 0:
-        # 1. Prepara a música de fundo com loop
         parts.append(
             f"[{bgm_idx}:a]aformat=sample_fmts=s16:channel_layouts=stereo:sample_rates={AUDIO_SR},"
             f"aloop=loop=-1:size=2e9,aresample={AUDIO_SR}[bg_looped];"
         )
-        # 2. Duplica o áudio da narração para usar em dois lugares diferentes
         parts.append("[acat]asplit[main_for_mix][voice_for_sc];")
-        # 3. Usa uma cópia da narração para controlar o sidechain (ducking)
         parts.append("[bg_looped][voice_for_sc]sidechaincompress=threshold=0.06:ratio=8:attack=100:release=500:detection=rms[bg_ducked];")
-        # 4. Usa a outra cópia da narração para a mixagem final com a música
         vol = 10 ** (bgm_db / 20.0)
         parts.append(f"[main_for_mix][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:weights='1 {vol}'[aout]")
         vmap, amap = "[vcat]", "[aout]"
@@ -489,20 +481,29 @@ def _post_zoom_ffmpeg(src_path: str, dst_path: str, zoom: float) -> str:
     return dst_path
 
 # ------------------------ TikTok posting ------------------------
+_AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
+def _sanitize_arabic_hashtag(text: str) -> str:
+    t = _AR_DIACRITICS.sub("", text or "")
+    t = re.sub(r"\s+", "", t)
+    return t
+
 def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
     out, seen = [], set()
+
     def _push(h: str):
         h = (h or "").strip()
         if not h:
             return
+        if re.search(r"[\u0600-\u06FF]", h):
+            h = _sanitize_arabic_hashtag(h)
         if not h.startswith("#"):
-            h = "#" + re.sub(r"^\W+", "", h)
-        if h not in seen:
+            h = "#" + re.sub(r"^[^\w\u0600-\u06FF]+", "", h, flags=re.UNICODE)
+        if h and h not in seen:
             seen.add(h)
             out.append(h)
+
     if isinstance(hashtags, str):
-        tokens = re.findall(r"#\w+", hashtags) or re.split(r"\s+", hashtags.strip())
-        for t in tokens:
+        for t in re.split(r"\s+", hashtags.strip()):
             _push(t)
     else:
         try:
@@ -513,7 +514,6 @@ def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
     return out[:k]
 
 def _postar_video(final_video: str, idioma: str) -> bool:
-    """Gera descrição (no IDIOMA certo) e envia para o TikTok. Retorna True se a postagem foi confirmada."""
     try:
         frase    = gerar_frase_motivacional(idioma=idioma)
         hashtags = gerar_hashtags_virais(frase, idioma=idioma, n=HASHTAGS_TOP_N)
@@ -572,6 +572,28 @@ def _listar_slugs() -> Dict[str, Dict[str, List[str]]]:
         for k in d:
             d[k].sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return items
+
+def _is_ok_video(path: str) -> bool:
+    """Arquivo válido para pular geração: existe, duração > 1s e **tem trilha de áudio**."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        if _video_duration(path) < 1.0:
+            return False
+        return _has_audio_stream(path)
+    except Exception:
+        return False
+
+def _load_saved_prompts(slug: str) -> List[str]:
+    prompts = []
+    for i in range(1, 9):  # até 8 cenas se um dia aumentar
+        p = os.path.join(PROMPTS_DIR, f"veo3_{slug}_c{i}.prompt.txt")
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                prompts.append(f.read())
+        else:
+            break
+    return prompts
 
 def _menu_reutilizar_videos(idioma: str) -> None:
     slugs = _listar_slugs()
@@ -738,11 +760,22 @@ def _submenu_acao() -> Optional[str]:
     print("2. Gerar e POSTAR")
     print("3. REUTILIZAR vídeo(s)")
     print("4. Gerar e **EXPORTAR** (sem postar)")
+    print("5. Gerar FALTANTES (dos prompts salvos) e POSTAR")  # NOVO
     print("b. Voltar")
-    op = input("Digite 1, 2, 3, 4 ou b: ").strip().lower()
+    op = input("Digite 1, 2, 3, 4, 5 ou b: ").strip().lower()
     if op in _BACK_TOKENS:
         return None
-    return op if op in {"1", "2", "3", "4"} else "1"
+    return op if op in {"1", "2", "3", "4", "5"} else "1"
+
+def _regenerar_cenas_faltantes(slug: str, idioma: str, persona: str) -> List[str]:
+    """Lê prompts salvos e gera APENAS as cenas faltantes/sem áudio para o slug."""
+    prompts = _load_saved_prompts(slug)
+    if not prompts:
+        print("Não encontrei prompts salvos para este slug.")
+        return []
+    out_paths = [os.path.join(VIDEOS_DIR, f"veo3_{slug}_c{i+1}.mp4") for i in range(len(prompts))]
+    logger.info("♻️ Regenerando cenas faltantes (%d no total); manterei as OK.", len(prompts))
+    return _veo3_generate_batch(prompts, out_paths, idioma=idioma, persona=persona)
 
 def executar_interativo(persona: str, idioma: str) -> None:
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
@@ -750,25 +783,46 @@ def executar_interativo(persona: str, idioma: str) -> None:
     while True:
         tema = _selecionar_assunto(persona)
         if tema is None:
-            return  # voltar ao menu anterior (main)
+            return
 
         n_cenas = _selecionar_qtd_cenas()
         if n_cenas is None:
-            continue  # volta para escolher o assunto novamente
+            continue
 
         variacao = _selecionar_variacao()
         if variacao is None:
-            continue  # volta para escolher o assunto novamente
+            continue
 
         escolha = _submenu_acao()
         if escolha is None:
-            continue  # volta e recomeça o pequeno fluxo interno
+            continue
+
+        slug = re.sub(r"[^a-z0-9]+", "-", f"{persona}-{tema.lower()}").strip("-")
 
         if escolha == "3":
             _menu_reutilizar_videos(idioma)
             return
 
-        slug = re.sub(r"[^a-z0-pessoal]", "-", f"{persona}-{tema.lower()}").strip("-")
+        if escolha == "5":
+            # Regerar faltantes a partir de prompts salvos e seguir como POSTAR
+            mp4s = _regenerar_cenas_faltantes(slug, idioma, persona)
+            if not mp4s:
+                return
+            trilha = _pick_bgm_path()
+            saida  = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
+            try:
+                final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
+            except Exception as e:
+                logger.warning("Falha ao juntar/BGM (%s). Usarei a primeira cena.", e)
+                final_video = mp4s[0]
+            if POST_ZOOM > 1.0001:
+                z_out = os.path.splitext(final_video)[0] + f"_z{POST_ZOOM:.2f}.mp4"
+                try:
+                    final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
+                except Exception as e:
+                    logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
+            _postar_video(final_video, idioma)
+            return
 
         try:
             viral_context = _ask_gemini_viral_analysis(tema, persona, idioma)
@@ -784,7 +838,7 @@ def executar_interativo(persona: str, idioma: str) -> None:
 
         approved = _preview_and_confirm_prompts(slug, prompts)
         if approved is None:
-            continue  # usuário escolheu voltar
+            continue
         if not approved:
             print("❌ Prompts reprovados. Voltando ao menu.")
             continue
@@ -800,7 +854,7 @@ def executar_interativo(persona: str, idioma: str) -> None:
             print("\n✅ Cenas de teste geradas:")
             for p in mp4s:
                 print(" -", p)
-            print("\nUse 'Reutilizar' para juntar/postar/exportar.")
+            print("\nUse 'Reutilizar' ou a opção 5 para juntar/postar/exportar.")
             return
 
         trilha = _pick_bgm_path()
@@ -827,53 +881,83 @@ def executar_interativo(persona: str, idioma: str) -> None:
 
 # ------------------------ Batch (Flow/API) ------------------------
 def _veo3_generate_single_api(prompt_text: str, out_path: str, idioma: str, persona: str) -> str:
-    # Placeholder: mantido por compatibilidade; o projeto atual usa o backend Flow.
-    # Se você quiser ativar API pura, implemente aqui.
     raise NotImplementedError("Backend API não implementado. Use VEO3_BACKEND=flow.")
 
 def _veo3_generate_batch(prompts: List[str], out_paths: List[str], idioma: str, persona: str) -> List[str]:
+    """Geração que respeita arquivos já prontos (resume)."""
     assert len(prompts) == len(out_paths) and prompts, "prompts/out_paths inconsistentes"
+
+    # 1) separa cenas já OK x faltantes
+    ok_paths, todo_prompts, todo_outs = [], [], []
+    for pr, op in zip(prompts, out_paths):
+        if _is_ok_video(op):
+            logger.info("⏭️  Pulando cena já pronta (com áudio): %s", os.path.basename(op))
+            ok_paths.append(op)
+        else:
+            todo_prompts.append(pr)
+            todo_outs.append(op)
+
+    done_paths: List[str] = ok_paths[:]
+
+    if not todo_prompts:
+        logger.info("Todas as cenas já estavam prontas.")
+        return out_paths
+
     if USE_BACKEND == "flow":
         if not (FLOW_PROJECT_URL and os.path.isfile(FLOW_COOKIES_FILE) and _HAVE_FLOW):
             raise RuntimeError("Backend Flow mal configurado (URL, cookies ou utils/veo3_flow.py).")
-        if _HAVE_FLOW_MANY:
-            logger.info("🌐 Flow backend: generate_many_via_flow (%d cenas)…", len(prompts))
+
+        # 2) gera somente as faltantes
+        if len(todo_prompts) > 1 and _HAVE_FLOW_MANY:
+            logger.info("🌐 Flow backend: generate_many_via_flow (%d cenas faltantes)…", len(todo_prompts))
             try:
-                return generate_many_via_flow(
-                    prompts=prompts,
-                    out_paths=out_paths,
+                new_paths = generate_many_via_flow(
+                    prompts=todo_prompts,
+                    out_paths=todo_outs,
                     project_url=FLOW_PROJECT_URL,
                     cookies_file=FLOW_COOKIES_FILE,
                     headless=VEO3_HEADLESS,
                     timeout_sec=int(float(os.getenv("FLOW_TIMEOUT_SEC", "600"))),
                 )
+                done_paths.extend(new_paths)
+                return sorted(done_paths, key=lambda p: p)
             except Exception as e:
                 logger.warning("generate_many_via_flow falhou (%s); farei single por cena.", e)
 
-        logger.info("🌐 Flow backend: generate_single_via_flow por cena…")
-        done = []
-        for ptxt, outp in zip(prompts, out_paths):
-            done.append(generate_single_via_flow(
+        logger.info("🌐 Flow backend: generate_single_via_flow por cena (faltantes)…")
+        for ptxt, outp in zip(todo_prompts, todo_outs):
+            got = generate_single_via_flow(
                 prompt_text=ptxt,
                 out_path=outp,
                 project_url=FLOW_PROJECT_URL,
                 cookies_file=FLOW_COOKIES_FILE,
                 headless=VEO3_HEADLESS,
                 timeout_sec=int(float(os.getenv("FLOW_TIMEOUT_SEC", "600"))),
-            ))
-        return done
+            )
+            # garante que o arquivo final está no caminho esperado
+            if got and got != outp and os.path.isfile(got):
+                try:
+                    shutil.move(got, outp)
+                except Exception:
+                    shutil.copy2(got, outp)
+            done_paths.append(outp)
+        return sorted(done_paths, key=lambda p: p)
 
-    logger.info("🧠 API backend: gerando %d cena(s)…", len(prompts))
-    return [_veo3_generate_single_api(p, o, idioma, persona) for p, o in zip(prompts, out_paths)]
+    logger.info("🧠 API backend: gerando %d cena(s)…", len(todo_prompts))
+    for p, o in zip(todo_prompts, todo_outs):
+        got = _veo3_generate_single_api(p, o, idioma, persona)
+        if got and got != o and os.path.isfile(got):
+            try:
+                shutil.move(got, o)
+            except Exception:
+                shutil.copy2(got, o)
+        done_paths.append(o)
+    return sorted(done_paths, key=lambda p: p)
 
 # ------------------------ Automático (com pré-config) ------------------------
 def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
-    """Loop automático com pré-configuração (tema/nº cenas/variação).
-       Opções 'aleatório a cada ciclo' estão disponíveis.
-       Retry automático se falhar (AUTO_RETRY_MINUTES, 0 = desliga)."""
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
 
-    # Pré-config interativa
     print("\n=== Configuração do Veo3 Automático ===")
     tema_fix = _selecionar_assunto(persona)
     if tema_fix is None:
@@ -940,7 +1024,6 @@ def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
             except Exception as e:
                 logger.exception("Falha no ciclo Veo3: %s", e)
 
-            # Próximo agendamento
             retry_min = _auto_retry_minutes()
             if not success and retry_min > 0:
                 proxima = datetime.now() + timedelta(minutes=retry_min)

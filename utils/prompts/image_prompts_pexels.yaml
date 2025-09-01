@@ -1,11 +1,15 @@
+# prompts/image_prompts_pexels.yaml (Copie e cole este conteúdo)
 template: >
   Você é um especialista em encontrar as melhores fotos em bancos de imagem como Pexels e Unsplash.
 
   TAREFA:
-  Gere uma lista JSON com {quantidade} termos de busca curtos, descritivos e variados para encontrar fotos inspiradoras e cinematográficas em um banco de imagens.
+  Gere uma lista JSON com {quantidade} termos de busca curtos, descritivos e **muito variados** para encontrar fotos inspiradoras e cinematográficas.
 
   TEMA CENTRAL: "{tema}"
   IDIOMA DOS TERMOS: inglês
+
+  **HISTÓRICO DE TERMOS JÁ USADOS (EVITE GERAR TERMOS SIMILARES A ESTES):**
+  {historico_prompts}
 
   REGRAS:
   - Os termos devem ser curtos (2 a 5 palavras).
@@ -19,4 +23,4 @@ template: >
   - "nascer do sol sobre o oceano"
   - "olhar determinado"
 
-  Agora, gere a lista de {quantidade} termos de busca para o tema "{tema}". A resposta deve ser APENAS uma lista JSON de strings.
+  Agora, gere a lista de {quantidade} termos de busca para o tema "{tema}", garantindo que sejam diferentes do histórico. A resposta deve ser APENAS uma lista JSON de strings.
