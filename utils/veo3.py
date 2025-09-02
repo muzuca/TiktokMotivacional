@@ -6,8 +6,8 @@
 # - Menus com "b/voltar": testar, gerar+postar, reutilizar, **exportar (sem postar)** e auto-config do modo automático
 # - (NOVO) Resume inteligente: só gera cenas faltantes/sem áudio
 # - (NOVO) Menu 5: Regerar faltantes a partir de prompts salvos e postar
-
 from __future__ import annotations
+
 import os, re, json, time, shutil, random, logging, subprocess
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
@@ -66,7 +66,7 @@ NEGATIVE_PROMPT = (
 USE_BACKEND = os.getenv("VEO3_BACKEND", "flow").strip().lower()
 FLOW_PROJECT_URL  = os.getenv("FLOW_PROJECT_URL", "").strip()
 FLOW_COOKIES_FILE = os.getenv("FLOW_COOKIES_FILE", "cookies_veo3.txt").strip()
-VEO3_HEADLESS     = os.getenv("VEO3_CHROME_HEADLESS", "1").strip() != "0"
+VEO3_HEADLESS     = os.getenv("VEO3_CHROME_HEADLESS", "1").strip() != "0"  # default do .env
 
 # Retry automático em caso de falha (modo automático)
 def _auto_retry_minutes() -> int:
@@ -480,6 +480,37 @@ def _post_zoom_ffmpeg(src_path: str, dst_path: str, zoom: float) -> str:
     subprocess.run(cmd, check=True)
     return dst_path
 
+# ------------------------ TikTok headless (pergunta 1x) ------------------------
+_TT_HEADLESS_CONFIRMED = False
+
+def _perguntar_headless_tiktok(default_on: bool) -> Optional[bool]:
+    padrao = "Sim" if default_on else "Não"
+    print("\nPostar no TikTok em modo headless?")
+    print(f"Enter = {padrao}  |  1. Sim  |  2. Não  |  b. Voltar")
+    op = input("Escolha: ").strip().lower()
+    if op in _BACK_TOKENS:
+        return None
+    if op in {"1", "s", "sim"}:
+        return True
+    if op in {"2", "n", "nao", "não"}:
+        return False
+    return default_on
+
+def _ensure_tiktok_headless_prompt() -> bool:
+    """Pergunta uma vez por execução e grava em TIKTOK_HEADLESS."""
+    global _TT_HEADLESS_CONFIRMED
+    if _TT_HEADLESS_CONFIRMED:
+        return True
+    default_tt = os.getenv("TIKTOK_HEADLESS", "1").strip() != "0"
+    ans = _perguntar_headless_tiktok(default_tt)
+    if ans is None:
+        print("Cancelado antes da postagem.")
+        return False
+    os.environ["TIKTOK_HEADLESS"] = "1" if ans else "0"
+    logger.info("→ TikTok headless: %s", "ON" if ans else "OFF")
+    _TT_HEADLESS_CONFIRMED = True
+    return True
+
 # ------------------------ TikTok posting ------------------------
 _AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
 def _sanitize_arabic_hashtag(text: str) -> str:
@@ -514,6 +545,10 @@ def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
     return out[:k]
 
 def _postar_video(final_video: str, idioma: str) -> bool:
+    # pergunta headless do TikTok (uma única vez por execução)
+    if not _ensure_tiktok_headless_prompt():
+        return False
+
     try:
         frase    = gerar_frase_motivacional(idioma=idioma)
         hashtags = gerar_hashtags_virais(frase, idioma=idioma, n=HASHTAGS_TOP_N)
@@ -695,6 +730,7 @@ def _selecionar_assunto(persona: str) -> Optional[str]:
     exemplos = _sugerir_assuntos(persona)
     for i, e in enumerate(exemplos, 1):
         print(f"{i}. {e}")
+    print("7. Aleatório **opção nova**")
     print("0. Outro (digitar manualmente)")
     op = input("Opção: ").strip().lower()
     if op in _BACK_TOKENS:
@@ -702,6 +738,8 @@ def _selecionar_assunto(persona: str) -> Optional[str]:
     if op == "0":
         tema = input("Digite o tema (curto): ").strip()
         return tema or "Prosperidade"
+    if op == "7":
+        return random.choice(exemplos)
     if op.isdigit() and 1 <= int(op) <= len(exemplos):
         return exemplos[int(op) - 1]
     return "Prosperidade"
@@ -737,6 +775,19 @@ def _selecionar_variacao() -> Optional[str]:
         print(f"(Aleatório) Selecionado: {mode.replace('_',' ')}")
     return mode
 
+def _perguntar_headless_flow(default_on: bool) -> Optional[bool]:
+    padrao = "Sim" if default_on else "Não"
+    print("\nExecutar o Flow (Veo3) em modo headless?")
+    print(f"Enter = {padrao}  |  1. Sim  |  2. Não  |  b. Voltar")
+    op = input("Escolha: ").strip().lower()
+    if op in _BACK_TOKENS: 
+        return None
+    if op in {"1", "s", "sim"}:
+        return True
+    if op in {"2", "n", "nao", "não"}:
+        return False
+    return default_on
+
 def _save_text(path: str, text: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -760,15 +811,25 @@ def _submenu_acao() -> Optional[str]:
     print("2. Gerar e POSTAR")
     print("3. REUTILIZAR vídeo(s)")
     print("4. Gerar e **EXPORTAR** (sem postar)")
-    print("5. Gerar FALTANTES (dos prompts salvos) e POSTAR")  # NOVO
+    print("5. Gerar FALTANTES (dos prompts salvos) e POSTAR")
     print("b. Voltar")
     op = input("Digite 1, 2, 3, 4, 5 ou b: ").strip().lower()
     if op in _BACK_TOKENS:
         return None
     return op if op in {"1", "2", "3", "4", "5"} else "1"
 
+def _load_saved_prompts(slug: str) -> List[str]:
+    prompts = []
+    for i in range(1, 9):
+        p = os.path.join(PROMPTS_DIR, f"veo3_{slug}_c{i}.prompt.txt")
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                prompts.append(f.read())
+        else:
+            break
+    return prompts
+
 def _regenerar_cenas_faltantes(slug: str, idioma: str, persona: str) -> List[str]:
-    """Lê prompts salvos e gera APENAS as cenas faltantes/sem áudio para o slug."""
     prompts = _load_saved_prompts(slug)
     if not prompts:
         print("Não encontrei prompts salvos para este slug.")
@@ -779,6 +840,16 @@ def _regenerar_cenas_faltantes(slug: str, idioma: str, persona: str) -> List[str
 
 def executar_interativo(persona: str, idioma: str) -> None:
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
+
+    # Pergunta de headless do Flow (apenas quando backend=flow)
+    global VEO3_HEADLESS
+    if USE_BACKEND == "flow":
+        ans = _perguntar_headless_flow(VEO3_HEADLESS)
+        if ans is None:
+            return
+        VEO3_HEADLESS = bool(ans)
+        os.environ["VEO3_CHROME_HEADLESS"] = "1" if VEO3_HEADLESS else "0"
+        logger.info("→ Flow headless: %s", "ON" if VEO3_HEADLESS else "OFF")
 
     while True:
         tema = _selecionar_assunto(persona)
@@ -797,6 +868,12 @@ def executar_interativo(persona: str, idioma: str) -> None:
         if escolha is None:
             continue
 
+        # Se for postar (2 ou 5), já confirma o headless do TikTok aqui
+        if escolha in {"2", "5"}:
+            if not _ensure_tiktok_headless_prompt():
+                print("Cancelado antes da postagem.")
+                return
+
         slug = re.sub(r"[^a-z0-9]+", "-", f"{persona}-{tema.lower()}").strip("-")
 
         if escolha == "3":
@@ -804,7 +881,6 @@ def executar_interativo(persona: str, idioma: str) -> None:
             return
 
         if escolha == "5":
-            # Regerar faltantes a partir de prompts salvos e seguir como POSTAR
             mp4s = _regenerar_cenas_faltantes(slug, idioma, persona)
             if not mp4s:
                 return
@@ -817,10 +893,7 @@ def executar_interativo(persona: str, idioma: str) -> None:
                 final_video = mp4s[0]
             if POST_ZOOM > 1.0001:
                 z_out = os.path.splitext(final_video)[0] + f"_z{POST_ZOOM:.2f}.mp4"
-                try:
-                    final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
-                except Exception as e:
-                    logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
+            ...
             _postar_video(final_video, idioma)
             return
 
@@ -957,6 +1030,22 @@ def _veo3_generate_batch(prompts: List[str], out_paths: List[str], idioma: str, 
 # ------------------------ Automático (com pré-config) ------------------------
 def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
+
+    # 1) Pergunta headless do TikTok uma vez antes do loop (upload)
+    if not _ensure_tiktok_headless_prompt():
+        print("Cancelado.")
+        return
+
+    # 2) (NOVO) Pergunta headless do Flow no modo automático também
+    global VEO3_HEADLESS
+    if USE_BACKEND == "flow":
+        ans = _perguntar_headless_flow(VEO3_HEADLESS)
+        if ans is None:
+            print("Cancelado.")
+            return
+        VEO3_HEADLESS = bool(ans)
+        os.environ["VEO3_CHROME_HEADLESS"] = "1" if VEO3_HEADLESS else "0"
+        logger.info("→ Flow headless: %s", "ON" if VEO3_HEADLESS else "OFF")
 
     print("\n=== Configuração do Veo3 Automático ===")
     tema_fix = _selecionar_assunto(persona)
