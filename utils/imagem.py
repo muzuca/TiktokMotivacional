@@ -215,7 +215,7 @@ def _make_session(region: Optional[str] = None) -> requests.Session:
             if IMAGE_LOG_PROXY:
                 logger.info("🌐 Proxy %s habilitado", (region or "DEFAULT"))
         else:
-             logger.debug("🌐 Proxy desabilitado (configuração %s ausente)", region or "DEFAULT")
+            logger.debug("🌐 Proxy desabilitado (configuração %s ausente)", region or "DEFAULT")
     
     s.headers.update({"User-Agent": USER_AGENT})
     return s
@@ -258,7 +258,9 @@ def _get_media_session(idioma: Optional[str]) -> requests.Session:
     usar_proxy = MEDIA_PROXY_MODE == 'always' or (MEDIA_PROXY_MODE == 'auto' and region_candidato)
     return _get_session(region_candidato if usar_proxy else None)
 
-
+# -----------------------------------------------------------------------------#
+# Fontes
+# -----------------------------------------------------------------------------#
 ARABIC_FONT_IMAGE_REG  = os.getenv("ARABIC_FONT_IMAGE_REG",  "NotoNaskhArabic-Regular.ttf")
 ARABIC_FONT_IMAGE_BOLD = os.getenv("ARABIC_FONT_IMAGE_BOLD", "NotoNaskhArabic-Bold.ttf")
 _FONT_CACHE: dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
@@ -307,6 +309,7 @@ def _load_font(fname: str, size: int) -> ImageFont.FreeTypeFont:
 
 def _text_size(draw, text, font):
     b = draw.textbbox((0,0), text, font=font); return b[2]-b[0], b[3]-b[1]
+
 def _wrap_words(draw, words, font, maxw):
     lines, cur = [], []
     for w in words:
@@ -315,6 +318,7 @@ def _wrap_words(draw, words, font, maxw):
         else: lines.append(cur); cur = [w]
     if cur: lines.append(cur)
     return lines
+
 def _best_font_and_wrap(draw, text, font_name, maxw, min_size, max_size, max_lines=3):
     words = text.split(); lo, hi = min_size, max_size
     best_font = _load_font(font_name, lo)
@@ -326,27 +330,67 @@ def _best_font_and_wrap(draw, text, font_name, maxw, min_size, max_size, max_lin
         else:
             hi = mid - 2
     return best_font, [" ".join(l) for l in best_lines]
+
 def _draw_text_with_stroke(draw, xy, text, font, fill, stroke_fill, stroke_w):
     x, y = xy
-    for dx, dy in [(-stroke_w,0),(stroke_w,0),(0,-stroke_w),(0,stroke_w),(-stroke_w,-stroke_w),(-stroke_w,stroke_w),(stroke_w,-stroke_w),(stroke_w,stroke_w)]:
-        if stroke_w > 0: draw.text((x+dx, y+dy), text, font=font, fill=stroke_fill)
+    for dx, dy in [(-stroke_w,0),(stroke_w,0),(0,-stroke_w),(0,stroke_w),
+                   (-stroke_w,-stroke_w),(-stroke_w,stroke_w),(stroke_w,-stroke_w),(stroke_w,stroke_w)]:
+        if stroke_w > 0:
+            draw.text((x+dx, y+dy), text, font=font, fill=stroke_fill)
     draw.text((x, y), text, font=font, fill=fill)
-def _draw_line_colored(draw, x, y, line_text, font, highlight_set, fill="white", hl_fill=(243, 179, 74), style=None, stroke_w=None):
-    style = style or IMAGE_TEXT_OUTLINE_STYLE; stroke_w = stroke_w or max(1, IMAGE_STROKE_WIDTH)
-    tokens = line_text.split(" "); cur_x = x
-    for i, raw in enumerate(tokens):
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# RTL-AWARE: desenha LTR (padrão) ou RTL (árabe) token a token.
+def _draw_line_colored(
+    draw, x, y, line_text, font, highlight_set,
+    fill="white", hl_fill=(243, 179, 74),
+    style=None, stroke_w=None, rtl: bool=False, right_edge: Optional[int]=None,
+):
+    """
+    Desenha uma linha com realce por palavra.
+    - LTR (default): começa em x e avança para a direita.
+    - RTL: ignora 'x' e usa 'right_edge' como borda direita; começa dali e caminha para a esquerda.
+    """
+    style = style or IMAGE_TEXT_OUTLINE_STYLE
+    stroke_w = stroke_w or max(1, IMAGE_STROKE_WIDTH)
+
+    tokens = line_text.split(" ")
+    space_w = draw.textbbox((0, 0), " ", font=font)[2]
+
+    if not rtl:
+        cur_x = x
+        it = tokens
+    else:
+        cur_x = right_edge if right_edge is not None else x
+        it = reversed(tokens)
+
+    for raw in it:
         key = re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", raw).lower()
         color = hl_fill if key in highlight_set else fill
-        if style == "stroke" and stroke_w > 0: _draw_text_with_stroke(draw, (cur_x, y), raw, font, color, (0,0,0,200), stroke_w)
+        token_w = draw.textbbox((0, 0), raw, font=font)[2]
+
+        draw_x = cur_x if not rtl else (cur_x - token_w)
+
+        if style == "stroke" and stroke_w > 0:
+            _draw_text_with_stroke(draw, (draw_x, y), raw, font, color, (0, 0, 0, 200), stroke_w)
         elif style == "shadow":
-            sx, sy = IMAGE_SHADOW_OFFSET; shadow_col = (0, 0, 0, IMAGE_SHADOW_ALPHA)
-            draw.text((cur_x + sx, y + sy), raw, font=font, fill=shadow_col)
-            draw.text((cur_x, y), raw, font=font, fill=color)
-        else: draw.text((cur_x, y), raw, font=font, fill=color)
-        cur_x += draw.textbbox((0,0), raw + " ", font=font)[2]
+            sx, sy = IMAGE_SHADOW_OFFSET
+            shadow_col = (0, 0, 0, IMAGE_SHADOW_ALPHA)
+            draw.text((draw_x + sx, y + sy), raw, font=font, fill=shadow_col)
+            draw.text((draw_x, y), raw, font=font, fill=color)
+        else:
+            draw.text((draw_x, y), raw, font=font, fill=color)
+
+        if not rtl:
+            cur_x += token_w + space_w
+        else:
+            cur_x -= token_w + space_w
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 def _darken_and_vignette(img, base_dark_alpha, vig, softness, center_protect) -> Image.Image:
     w, h = img.size; out = img.convert("RGBA")
-    if base_dark_alpha > 0: out = Image.alpha_composite(out, Image.new("RGBA", (w, h), (0, 0, 0, int(base_dark_alpha))))
+    if base_dark_alpha > 0:
+        out = Image.alpha_composite(out, Image.new("RGBA", (w, h), (0, 0, 0, int(base_dark_alpha))))
     if vig > 0:
         mask = Image.new("L", (w, h), 255); d = ImageDraw.Draw(mask)
         inner_scale = 0.72 + 0.16 * _clamp(softness,0,1) + 0.12 * _clamp(center_protect,0,1)
@@ -357,12 +401,14 @@ def _darken_and_vignette(img, base_dark_alpha, vig, softness, center_protect) ->
         overlay = Image.new("RGBA", (w,h), (0,0,0,0)); overlay.putalpha(mask.point(lambda v: int(v*vig)))
         out = Image.alpha_composite(out, overlay)
     return out.convert("RGB")
+
 def _ensure_1080x1920(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("RGB")
     tw, th = 1080, 1920; iw, ih = img.size
     scale = max(tw/iw, th/ih); new = img.resize((int(iw*scale), int(ih*scale)), Image.LANCZOS)
     left, top = (new.size[0]-tw)//2, (new.size[1]-th)//2
     return new.crop((left, top, left+tw, top+th))
+
 def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None, max_retries: int = 3):
     os.makedirs(os.path.dirname(arquivo_saida) or ".", exist_ok=True); used = load_used_images()
     session = _get_media_session(idioma)
@@ -390,33 +436,60 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[
         except Exception as e:
             logger.warning("⚠️ Falha na geração (tentativa %d/%d): %s", attempt, max_retries, e)
     logger.error("❌ Não conseguiu gerar nova imagem após %d tentativas.", max_retries)
+
 def _prepare_bg(img, base_dark, template):
     base = _ensure_1080x1920(img)
     return _darken_and_vignette(base, int(255*base_dark), IMAGE_VIGNETTE_STRENGTH, IMAGE_VIGNETTE_SOFTNESS, IMAGE_DARK_CENTER_PROTECT) if IMAGE_DARK_ENABLE else base
+
 def _render_modern_block(img, frase, *, idioma=None):
     img = _prepare_bg(img, IMAGE_DARK_MODERN, "modern_block").convert("RGBA"); W, H = img.size; draw = ImageDraw.Draw(img)
     intro, punch, hl_words = _split_for_emphasis(frase)
     is_ar = _idioma_norm(idioma) == "ar"
     if IMAGE_TEXT_UPPER and not is_ar: intro, punch = intro.upper(), punch.upper()
+
     base_scale = (W / 1080.0) * IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MODERN
     margin = int(W*0.08); maxw = W - 2*margin; y = int(H*0.14)
+    right_edge = W - margin  # borda direita para RTL
+
     if intro:
-        f_small, lines1 = _best_font_and_wrap(draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, False), maxw, int(38*base_scale), int(70*base_scale), 2)
-        for ln in lines1: _draw_line_colored(draw, margin, y, ln, f_small, set(), hl_fill=IMAGE_HL_COLOR); y += int(f_small.size*1.16)
+        f_small, lines1 = _best_font_and_wrap(
+            draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, False),
+            maxw, int(38*base_scale), int(70*base_scale), 2
+        )
+        for ln in lines1:
+            _draw_line_colored(draw, margin, y, ln, f_small, set(), hl_fill=IMAGE_HL_COLOR,
+                               rtl=is_ar, right_edge=right_edge)
+            y += int(f_small.size*1.16)
         y += int(H*0.018)
-    f_main, lines2 = _best_font_and_wrap(draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, True), maxw, int(68*base_scale), int(104*base_scale), 4)
-    for ln in lines2: _draw_line_colored(draw, margin, y, ln, f_main, set(hl_words), hl_fill=IMAGE_HL_COLOR); y += int(f_main.size*1.10)
+
+    f_main, lines2 = _best_font_and_wrap(
+        draw, punch, _font_for_lang("Montserrat-ExtraBold.ttf", idioma, True),
+        maxw, int(68*base_scale), int(104*base_scale), 4
+    )
+    for ln in lines2:
+        _draw_line_colored(draw, margin, y, ln, f_main, set(hl_words), hl_fill=IMAGE_HL_COLOR,
+                           rtl=is_ar, right_edge=right_edge)
+        y += int(f_main.size*1.10)
     return img.convert("RGB")
+
 def _render_classic_serif(img, frase, *, idioma=None):
     clean, explicit = _parse_highlights_from_markdown(frase.strip()); hl_set = set(explicit)
     img = _prepare_bg(img, IMAGE_DARK_CLASSIC, "classic_serif").convert("RGBA"); W, H = img.size; draw = ImageDraw.Draw(img)
     is_ar = _idioma_norm(idioma) == "ar"; text = clean.upper() if IMAGE_TEXT_UPPER and not is_ar else clean
     margin = int(W*0.12); maxw = W - 2*margin
+    right_edge = W - margin
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
-    f_serif, lines = _best_font_and_wrap(draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, True), maxw, int(54*scls), int(80*scls), 4)
+    f_serif, lines = _best_font_and_wrap(
+        draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, True),
+        maxw, int(54*scls), int(80*scls), 4
+    )
     y = int(H*0.20)
-    for ln in lines: _draw_line_colored(draw, margin, y, ln, f_serif, hl_set, hl_fill=IMAGE_HL_COLOR); y += int(f_serif.size*1.18)
+    for ln in lines:
+        _draw_line_colored(draw, margin, y, ln, f_serif, hl_set, hl_fill=IMAGE_HL_COLOR,
+                           rtl=is_ar, right_edge=right_edge)
+        y += int(f_serif.size*1.18)
     return img.convert("RGB")
+
 def _render_minimal_center(img, frase, *, idioma=None):
     img = _prepare_bg(img, IMAGE_DARK_MINIMAL, "minimal_center").convert("RGBA"); W, H = img.size; draw = ImageDraw.Draw(img)
     is_ar = _idioma_norm(idioma) == "ar"; scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MINIMAL
@@ -424,16 +497,30 @@ def _render_minimal_center(img, frase, *, idioma=None):
     clean, _ = _parse_highlights_from_markdown(frase); two = quebrar_em_duas_linhas(clean)
     if IMAGE_TEXT_UPPER and not is_ar: two = two.upper()
     parts = two.split("\n"); l1 = parts[0].strip(); l2 = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
-    small = _load_font(small_name, max(36, int(W*0.039*scls))); big = _load_font(big_name, max(90, int(W*0.102*scls)))
-    tw1, th1 = _text_size(draw, l1, small); x1 = (W-tw1)//2; y = int(H*0.20)
+
+    small = _load_font(small_name, max(36, int(W*0.039*scls)))
+    big   = _load_font(big_name,   max(90, int(W*0.102*scls)))
+
+    margin = int(W*0.08)
+    right_edge = W - margin
+
+    # linha 1 (menor)
+    tw1, th1 = _text_size(draw, l1, small)
+    x1 = (W - tw1)//2 if not is_ar else (right_edge - tw1)
+    y = int(H*0.20)
     _draw_text_with_stroke(draw, (x1, y), l1, small, "white", "black", max(1, int(small.size*0.05)))
     y += th1 + int(H*0.02)
+
+    # linhas grandes (quebra e centraliza ou alinha à direita)
     maxw = int(W * 0.92)
-    for ln in _wrap_words(draw, l2.split(), big, maxw):
-        tw, th = _text_size(draw, ln, big); x = (W-tw)//2
+    for ln_words in _wrap_words(draw, l2.split(), big, maxw):
+        ln = " ".join(ln_words)
+        tw, th = _text_size(draw, ln, big)
+        x = (W - tw)//2 if not is_ar else (right_edge - tw)
         _draw_text_with_stroke(draw, (x, y), ln, big, "white", "black", max(2, int(big.size*0.05)))
         y += th + int(big.size*0.06)
     return img.convert("RGB")
+
 def escrever_frase_na_imagem(imagem_path, frase, saida_path, *, idioma="pt-br", template="auto"):
     img = Image.open(imagem_path)
     if template == "auto": template = random.choice(["classic_serif", "modern_block", "minimal_center"])
@@ -443,6 +530,7 @@ def escrever_frase_na_imagem(imagem_path, frase, saida_path, *, idioma="pt-br", 
     os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True); out.save(saida_path, quality=92)
     w, h, size_kb = out.size[0], out.size[1], os.path.getsize(saida_path)//1024
     logger.info("✅ Imagem final salva (%s) | %dx%d | %d KB", template, w, h, size_kb)
+
 def montar_slides_pexels(query, count=4, primeira_imagem=None, *, idioma=None):
     if not PEXELS_API_KEY: logger.error("❌ PEXELS_API_KEY não configurado."); return []
     session = _get_media_session(idioma)

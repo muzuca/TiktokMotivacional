@@ -8,8 +8,8 @@ template: >
   ---
 
   TAREFA:
-  Crie uma narrações longa, baseadas estritamente no dossiê acima.
-  A narração deve ter aproximadamente 45 segundos de fala. 
+  Crie uma narração longa, baseada estritamente no dossiê acima.
+  A narração deve ter aproximadamente 30 segundos de fala. 
   Seja detalhado e profundo na mensagem para atingir este tamanho.
   Gere as frases no idioma **{target_lang_name}**.
 
