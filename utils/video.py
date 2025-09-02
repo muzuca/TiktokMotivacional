@@ -95,7 +95,6 @@ SUB_FONT_SCALE_3 = _env_float("SUB_FONT_SCALE_3", 0.044)
 REQUIRE_FONTFILE = _env_bool("REQUIRE_FONTFILE", False)
 ARABIC_FONT = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
 
-
 # ================== Helpers ==================
 def _ffmpeg_or_die() -> str:
     return os.getenv("FFMPEG_BIN") or "ffmpeg"
@@ -236,9 +235,7 @@ def _render_modern_block(img, frase, *, idioma=None):
     if IMAGE_TEXT_UPPER and not is_ar: intro, punch = intro.upper(), punch.upper()
     base_scale = (W / 1080.0) * IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MODERN
     left_margin, right_margin, maxw = int(W*0.08), int(W*0.08), int(W*0.84)
-    
-    # ### AJUSTE DE ALTURA ###
-    y = int(H * 0.20) # Começa a desenhar mais para cima, como no estilo clássico desejado
+    y = int(H * 0.20) # começa mais alto
 
     if intro:
         f_small, lines1 = _best_font_and_wrap(draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False), maxw, int(38*base_scale), int(70*base_scale), max_lines=2)
@@ -262,11 +259,7 @@ def _render_classic_serif(img, frase, *, idioma=None):
     left_margin, right_margin, maxw = int(W*0.12), int(W*0.10), int(W*0.78)
     scls = IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_CLASSIC
     f_serif, lines = _best_font_and_wrap(draw, text, _font_for_lang("PlayfairDisplay-Bold.ttf", idioma, bold=True), maxw, int(54*scls), int(80*scls), max_lines=4)
-    
-    # ### AJUSTE DE ALTURA ###
-    # Em vez de centralizar na imagem toda, definimos um ponto de partida mais alto
-    y = int(H * 0.20) 
-
+    y = int(H * 0.20)
     for ln in lines:
         _draw_line_colored(draw, left_margin, y, ln, f_serif, highlight_set=hl_set, hl_fill=_hex_to_rgba(IMAGE_HL_COLOR))
         y += int(f_serif.size * 1.18)
@@ -309,15 +302,64 @@ def _write_textfile_for_drawtext(content: str, idx: int) -> str:
     path = os.path.join(CACHE_DIR, f"drawtext_{idx:02d}.txt")
     with open(path, "w", encoding="utf-8") as f: f.write(re.sub(r"\s+", " ", content.strip()))
     return path
-def _build_subs_drawtext_chain(H: int, style_id: str, segments: List[Tuple[float, float, str]], font_path: Optional[str]) -> str:
+
+def _build_subs_drawtext_chain(
+    H: int,
+    style_id: str,
+    segments: List[Tuple[float, float, str]],
+    font_path: Optional[str],
+    *,
+    rtl: bool = False
+) -> str:
+    """
+    Gera uma cadeia de drawtext para queimar as legendas.
+    - LTR (padrão): centraliza (x = (w-text_w)/2)
+    - RTL (árabe): alinha à direita (x = w - (text_w + margin))
+    """
     fs, borderw, margin = _style_fontsize_from_H(H, style_id)
     font_opt = f":fontfile={_ff_q(font_path)}" if font_path and os.path.isfile(font_path) else ""
-    if not font_opt and REQUIRE_FONTFILE: raise RuntimeError("Fonte de legendas não encontrada.")
-    blocks = [f"drawtext=textfile={_ff_q(_write_textfile_for_drawtext(txt, idx))}{font_opt}:fontsize={fs}:fontcolor=white:borderw={borderw}:bordercolor=black@0.85:shadowcolor=black@0.7:shadowx=2:shadowy=2:x=(w-text_w)/2:y=h-(text_h+{margin}):enable='between(t,{ini:.3f},{fim:.3f})'" for idx, (ini, fim, txt) in enumerate(segments, start=1)]
+    if not font_opt and REQUIRE_FONTFILE:
+        raise RuntimeError("Fonte de legendas não encontrada.")
+
+    # X expr de acordo com a direção do texto
+    if rtl:
+        x_expr = f"w-(text_w+{margin})"
+    else:
+        x_expr = "(w-text_w)/2"
+
+    y_expr = f"h-(text_h+{margin})"
+
+    # Observação: não colocamos text_shaping=1 para evitar falha em builds sem harfbuzz/fribidi
+    blocks = []
+    for idx, (ini, fim, txt) in enumerate(segments, start=1):
+        tf = _write_textfile_for_drawtext(txt, idx)
+        block = (
+            f"drawtext=textfile={_ff_q(tf)}{font_opt}"
+            f":fontsize={fs}:fontcolor=white"
+            f":borderw={borderw}:bordercolor=black@0.85"
+            f":shadowcolor=black@0.7:shadowx=2:shadowy=2"
+            f":x={x_expr}:y={y_expr}"
+            f":enable='between(t,{ini:.3f},{fim:.3f})'"
+        )
+        blocks.append(block)
     return ",".join(blocks)
 
 # ================== Pipeline Principal ==================
-def gerar_video(imagem_path, saida_path, *, frase_principal="", preset="fullhd", idioma="auto", tts_engine="gemini", legendas=True, video_style="1", motion="none", slides_paths=None, transition=None, content_mode="motivacional"):
+def gerar_video(
+    imagem_path,
+    saida_path,
+    *,
+    frase_principal="",
+    preset="fullhd",
+    idioma="auto",
+    tts_engine="gemini",
+    legendas=True,
+    video_style="1",
+    motion="none",
+    slides_paths=None,
+    transition=None,
+    content_mode="motivacional"
+):
     staged_images: List[str] = []; staged_tts: Optional[str] = None
     staged_title_overlay: Optional[str] = None; extra_to_cleanup: List[str] = []
     try:
@@ -326,6 +368,7 @@ def gerar_video(imagem_path, saida_path, *, frase_principal="", preset="fullhd",
         slides_validos = [p for p in (slides_paths or [imagem_path]) if p and os.path.isfile(p)]
         if not slides_validos: raise FileNotFoundError("Nenhuma imagem de slide válida foi fornecida.")
         n_slides = len(slides_validos)
+
         lang_norm = _idioma_norm(idioma)
         if _text_contains_arabic(frase_principal): lang_norm = "ar"
         style_norm = _normalize_style(video_style)
@@ -341,6 +384,7 @@ def gerar_video(imagem_path, saida_path, *, frase_principal="", preset="fullhd",
             voice_audio_path = staged_tts
         background_audio_path = obter_caminho_audio(idioma=lang_norm)
         has_voice, has_bg = bool(voice_audio_path), bool(background_audio_path)
+
         segments = make_segments_for_audio(long_text, voice_audio_path, idioma=lang_norm) if legendas and has_voice else []
         if segments: logger.info("📝 %d segmentos de legenda gerados.", len(segments))
 
@@ -391,7 +435,12 @@ def gerar_video(imagem_path, saida_path, *, frase_principal="", preset="fullhd",
         if legendas and segments:
             font_path_subs = _get_subtitle_font_path(lang_norm)
             logger.info(f"🔤 Fonte das Legendas: {os.path.basename(font_path_subs) if font_path_subs else 'Padrão'}")
-            parts.append(f"{current_v}{_build_subs_drawtext_chain(H, style_norm, segments, font_path_subs)}[vout]")
+            # >>> Alinhamento RTL quando árabe
+            subs_chain = _build_subs_drawtext_chain(
+                H, style_norm, segments, font_path_subs,
+                rtl=(lang_norm == "ar")
+            )
+            parts.append(f"{current_v}{subs_chain}[vout]")
         else:
             parts.append(f"{current_v}null[vout]")
 
