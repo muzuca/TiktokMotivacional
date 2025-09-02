@@ -3,15 +3,16 @@
 Módulo `tiktok_uploader` para fazer upload de vídeos no TikTok.
 
 Atualizações desta versão:
-- Captura **robusta** do perfil autenticado logo após abrir o upload, com **retry automático** que
-  volta à rota `/tiktokstudio/upload` caso a página tenha redirecionado para o hub `/tiktokstudio`.
-- Suporte a **timezone/locale forçados via CDP** (ex.: `Africa/Cairo` + `ar-EG`) para agendamentos corretos por região.
-- Navegação resiliente para rede lenta/proxy: warm-up em `/explore`, múltiplas variantes da URL de upload,
-  espera por hidratação do SPA e antiredirecionamento para o hub.
-- Headless mais estável: flags de SwiftShader/WebGL para evitar os erros de GPU citados no log.
-- UI de upload mais robusta: tenta iframe e DOM principal; em falha reabre a rota e tenta novamente.
-
-Copie e cole este arquivo no lugar do seu `upload.py`.
+- Espera inteligente de carregamento: injeção de contador de fetch/XHR e espera por
+  "network idle" antes de prosseguir; hidratação de SPA sem sleeps fixos.
+- Grace dinâmico antes do Post: quando a rede está quieta e sem modais bloqueando,
+  o fluxo publica de imediato (ou com um grace mínimo configurável).
+- Captura robusta do perfil autenticado logo após abrir o upload, com retry que volta
+  à rota `/tiktokstudio/upload` caso a página redirecione para o hub `/tiktokstudio`.
+- Suporte a timezone/locale via CDP (ex.: `Africa/Cairo` + `ar-EG`) para agendamentos.
+- Navegação resiliente para rede lenta/proxy: warm-up em `/explore`, múltiplas variantes
+  da URL de upload, antiredirecionamento para o hub e fallback para detecção de iframe/DOM.
+- Headless estável: flags SwiftShader/WebGL para evitar erros de GPU.
 """
 
 from __future__ import annotations
@@ -180,7 +181,7 @@ except ImportError:
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--remote-debugging-pipe")
-            # Headless: habilitar SwiftShader/GL para evitar erros do log
+            # Headless: habilitar SwiftShader/GL para evitar erros
             if headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--ignore-certificate-errors")
@@ -289,7 +290,7 @@ IFRAME_MAX_RETRY  = _int_env("UPLOAD_IFRAME_RETRIES", 2)
 NAV_RETRY_BACKOFF = _float_env("UPLOAD_RETRY_BACKOFF_SEC", 3.0)
 
 # ——— Grace e overlays antes do Post ———
-POST_MIN_GRACE_SEC           = _int_env("POST_MIN_GRACE_SEC", 30)
+POST_MIN_GRACE_SEC           = _int_env("POST_MIN_GRACE_SEC", 30)  # usado quando DYNAMIC_POST_GRACE=0
 POST_AFTER_ENABLED_EXTRA_SEC = _int_env("POST_AFTER_ENABLED_EXTRA_SEC", 2)
 OVERLAYS_SETTLE_SEC          = _int_env("OVERLAYS_SETTLE_SEC", 3)
 
@@ -304,10 +305,17 @@ JITTER_START_MAX_SEC         = _int_env("JITTER_START_MAX_SEC", 0)
 
 # ——— Rede lenta/Proxy ———
 SLOW_NET_EXTRA_WAIT_SEC      = _int_env("SLOW_NET_EXTRA_WAIT_SEC", 60)
-UPLOAD_PAGE_SETTLE_SEC       = _int_env("UPLOAD_PAGE_SETTLE_SEC", 15)
+UPLOAD_PAGE_SETTLE_SEC       = _int_env("UPLOAD_PAGE_SETTLE_SEC", 15)   # fallback
 HEADER_MAX_WAIT_SEC          = _int_env("HEADER_MAX_WAIT_SEC", 90)
 WARMUP_EXPLORE_WAIT_SEC      = _int_env("WARMUP_EXPLORE_WAIT_SEC", 45)
 PROFILE_RETRIES              = _int_env("PROFILE_RETRIES", 3)
+
+# ——— Smart waits (NOVO) ———
+SMART_WAIT_ENABLE   = _bool_env("SMART_WAIT_ENABLE", True)
+NET_IDLE_QUIET_MS   = _int_env("NET_IDLE_QUIET_MS", 1200)   # 1.2s sem XHR/fetch
+SPA_READY_MAX_SEC   = _int_env("SPA_READY_MAX_SEC", 60)     # teto p/ hidratação SPA
+DYNAMIC_POST_GRACE  = _bool_env("DYNAMIC_POST_GRACE", True)
+POST_GRACE_MIN_SEC  = _int_env("POST_GRACE_MIN_SEC", 0)     # 0..5s de respiro opcional
 
 # Helpers de intervalo humano
 JITTER_MIN_MINUTES           = _int_env("JITTER_MIN_MINUTES", -15)
@@ -629,6 +637,110 @@ def _log_current_profile(driver: WebDriver, timeout: int = 20, *, want_proxy: bo
     finally:
         _close_any_menu(driver)
 
+# =================== Smart wait (network idle / SPA pronta) ===================
+
+def _install_network_watch(driver: WebDriver) -> None:
+    """Instrumenta fetch/XHR para contarmos requisições em voo."""
+    js = r"""
+    (function(){
+      if (window.__netmon_installed) return;
+      try {
+        window.__pendingRequests = 0;
+        const origFetch = window.fetch;
+        if (origFetch) {
+          window.fetch = function(){
+            window.__pendingRequests++;
+            return origFetch.apply(this, arguments).finally(function(){ window.__pendingRequests = Math.max(0, (window.__pendingRequests||1)-1); });
+          };
+        }
+        if (window.XMLHttpRequest && window.XMLHttpRequest.prototype.send) {
+          const origSend = XMLHttpRequest.prototype.send;
+          XMLHttpRequest.prototype.send = function(){
+            try { this.addEventListener('loadend', function(){ window.__pendingRequests = Math.max(0,(window.__pendingRequests||1)-1); }, {once:true}); } catch(e){}
+            window.__pendingRequests = (window.__pendingRequests||0)+1;
+            return origSend.apply(this, arguments);
+          };
+        }
+        window.__netmon_installed = true;
+      } catch(e) {}
+    })();
+    """
+    try:
+        driver.execute_script(js)
+    except Exception:
+        pass
+
+def _pending_requests(driver: WebDriver) -> int:
+    try:
+        return int(driver.execute_script("return window.__pendingRequests||0;") or 0)
+    except Exception:
+        return 0
+
+def _wait_network_idle(driver: WebDriver, quiet_ms: int, timeout: int) -> bool:
+    """Espera não haver XHR/fetch pendentes por `quiet_ms` consecutivos."""
+    deadline = time.time() + max(1, timeout)
+    last_change = time.time()
+    last_count = _pending_requests(driver)
+    while time.time() < deadline:
+        cnt = _pending_requests(driver)
+        if cnt != last_count:
+            last_count = cnt
+            last_change = time.time()
+        if cnt == 0 and (time.time() - last_change) >= (quiet_ms / 1000.0):
+            return True
+        time.sleep(0.1)
+    return False
+
+def _wait_spa_ready(driver: WebDriver, *, lang_tag: Optional[str], slow_network: bool) -> None:
+    """Garante SPA hidratada sem usar sleep fixo."""
+    settle_extra = SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0
+    _await_document_ready(driver, timeout=EXPLICIT_WAIT + settle_extra)
+    _install_network_watch(driver)
+
+    # raiz do app presente
+    WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(
+        EC.presence_of_element_located((By.ID, "root"))
+    )
+
+    # idle de rede + input de upload disponível (iframe OU DOM principal)
+    ok_idle = _wait_network_idle(driver, NET_IDLE_QUIET_MS, timeout=min(SPA_READY_MAX_SEC + settle_extra, 120))
+    if not ok_idle:
+        logger.info("SPA_READY: seguiu sem network-idle (teto de tempo atingido)")
+
+    # tenta localizar o input (iframe ou principal) – sem dormir fixo
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    selectors = config["selectors"]["upload"]
+    try:
+        iframe = WebDriverWait(driver, IMPLICIT_WAIT + settle_extra).until(
+            EC.presence_of_element_located((By.XPATH, selectors["iframe"]))
+        )
+        driver.switch_to.frame(iframe)
+        WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(
+            EC.presence_of_element_located((By.XPATH, selectors["upload_video"]))
+        )
+        logger.info("Upload UI pronta (iframe).")
+        return
+    except Exception:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(
+                EC.presence_of_element_located((By.XPATH, selectors["upload_video"]))
+            )
+            logger.info("Upload UI pronta (documento principal).")
+            return
+        except Exception:
+            pass
+
+    # Se não achou, deixa o fluxo normal tentar de novo (_ensure_upload_ui)
+    logger.info("Upload UI não evidente após hidratação; continuando com rotina de detecção.")
+
 # -------------------------------- Navegação Upload -----------------------------
 
 def _candidate_upload_urls(lang_tag: Optional[str]) -> List[str]:
@@ -693,11 +805,18 @@ def _nav_with_retries(driver: WebDriver, *, lang_tag: Optional[str] = None, slow
             try:
                 driver.get(target)
                 logger.info("Navegou para: %s", driver.current_url)
-                WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.ID, "root")))
-                time.sleep(min(UPLOAD_PAGE_SETTLE_SEC + settle_extra, 90))
+
+                # Espera “SPA pronta” baseada em rede/DOM (sem sleep fixo)
+                if SMART_WAIT_ENABLE:
+                    _wait_spa_ready(driver, lang_tag=lang_tag, slow_network=slow_network)
+                else:
+                    WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.ID, "root")))
+                    time.sleep(min(UPLOAD_PAGE_SETTLE_SEC + settle_extra, 90))
+
                 if _on_wrong_hub(driver.current_url):
                     logger.info("Redirecionado ao hub /tiktokstudio. Forçando novamente a rota de upload…")
                     continue
+
                 driver.switch_to.default_content()
                 return
             except Exception as e:
@@ -833,9 +952,13 @@ def upload_videos(
     # Autenticação (cookies/session)
     driver = auth.authenticate_agent(driver)
 
-    # Egito/árabe: forçar timezone e locale no navegador (vale para agendamento)
-    if _idioma_norm(idioma) == "ar":
+    # Força timezone conforme a região do proxy (US/EG); mantém locale coerente
+    resolved_region = _region_from_idioma(idioma)  # já existe acima; use a mesma variável 'region' se preferir
+    if resolved_region == "EG":
         _force_timezone(driver, os.getenv("TZ_EG", "Africa/Cairo"), locale="ar-EG")
+    elif resolved_region == "US":
+        _force_timezone(driver, os.getenv("TZ_US", "America/New_York"), locale="en-US")
+
 
     failed: List[VideoDict] = []
 
@@ -946,13 +1069,26 @@ def complete_upload_form(
     if product_id:
         _add_product_link(driver, product_id)
 
-    _wait_post_enabled(driver, timeout=UPLOADING_WAIT)
+    _wait_post_enabled(driver, timeout=UPLOADING_WAIT)  # botão "Post" habilitado
 
-    elapsed = time.time() - send_ts
-    remaining = max(0, POST_MIN_GRACE_SEC - int(elapsed))
-    if remaining > 0:
-        logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio do arquivo)…", remaining)
-        time.sleep(remaining)
+    # ===== Grace dinâmico ao invés de esperar 30s fixos =====
+    if DYNAMIC_POST_GRACE:
+        logger.info("⏳ Post: usando grace dinâmico (rede/overlays)…")
+        _install_network_watch(driver)
+        # 1) Espera rede ficar quieta (curta)
+        _wait_network_idle(driver, NET_IDLE_QUIET_MS, timeout=15)
+        # 2) Garante que não há modais/overlays bloqueando
+        _wait_blocking_overlays_gone(driver, timeout=OVERLAYS_SETTLE_SEC)
+        # 3) Grace mínimo opcional
+        if POST_GRACE_MIN_SEC > 0:
+            time.sleep(POST_GRACE_MIN_SEC)
+    else:
+        # comportamento antigo: garante X segundos desde o envio do arquivo
+        elapsed = time.time() - send_ts
+        remaining = max(0, POST_MIN_GRACE_SEC - int(elapsed))
+        if remaining > 0:
+            logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio)…", remaining)
+            time.sleep(remaining)
 
     if POST_AFTER_ENABLED_EXTRA_SEC > 0:
         time.sleep(POST_AFTER_ENABLED_EXTRA_SEC)
