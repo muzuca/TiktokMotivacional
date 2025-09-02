@@ -1,24 +1,26 @@
 # utils/veo3_flow.py — ATUALIZADO
 # Automação do Google Labs Flow (Veo3) via Selenium + cookies Netscape.
 #
-# 🔧 Principais melhorias nesta versão:
-# - **Debug por execução/cena**: prints HTML + PNG ficam em `cache/flow_run_<ts>/` com tags por cena
-#   (ex.: `scene2_attempt1_after_submit.png`). Em sucesso total, esses prints são removidos
-#   automaticamente, a menos que `FLOW_KEEP_DEBUG_ON_SUCCESS=1`.
-# - **Detecção de "Falha na geração"**: se o cartão exibir esse estado (PT/EN), a cena é re‑tentada
-#   sem derrubar a sessão inteira.
-# - **Logs mais claros**: cada cena loga o **arquivo de destino** e o **rótulo** (cena X/Y).
-# - **Anti‑stall reforçado**: screenshots periódicos durante espera longa (configuráveis via
-#   `FLOW_STUCK_SHOTS`, padrão: 120,240,360s) + refresh controlado quando detecta 99% travado.
-# - **Exceções com contexto**: timeouts incluem o rótulo da cena (ex.: `[scene3]`).
-# - **Não altera** a API pública: `generate_single_via_flow` e `generate_many_via_flow` mantêm
-#   a mesma assinatura para compatibilidade com seu `veo3.py`.
+# 🔧 Melhorias principais:
+# - Login interativo robusto:
+#   • Detecta sucesso por múltiplos sinais: cookies de sessão (next-auth/session), URL "logada"
+#     (/projects, /studio, /dashboard) e seletores configuráveis via FLOW_LOGIN_SUCCESS_SELECTORS.
+#   • Assim que reconhece o login, EXPORTA os cookies no formato Netscape e segue.
+#   • Compatível com suas env-vars: FLOW_INTERACTIVE_LOGIN / FLOW_LOGIN_MAX_MINUTES
+#     (e também lê VEO3_ALLOW_INTERACTIVE_LOGIN / VEO3_INTERACTIVE_LOGIN_TIMEOUT_SEC).
+# - Debug por execução/cena: HTML + PNG vão em cache/flow_run_<ts>/ (removidos em sucesso,
+#   a menos que FLOW_KEEP_DEBUG_ON_SUCCESS=1).
+# - Anti-stall 99%: screenshots periódicos (FLOW_STUCK_SHOTS) + refresh controlado.
+# - Detecção de "Falha na geração" PT/EN e re-tentativa só da cena.
+# - Verificação opcional de áudio via ffprobe (FLOW_CHECK_AUDIO=1).
+# - Força "Respostas por comando"=1 e seleção do modelo "Veo 3 - Fast" quando possível.
+# - Mantém API pública e logs amigáveis (como no seu base).
 #
-# Observação: Depende de Selenium + ChromeDriver compatível e ffprobe no PATH (para checar áudio).
-#             Se ffprobe não estiver disponível, a checagem de áudio é ignorada.
+# Observações:
+# - Requer Selenium + ChromeDriver compatível; ffprobe no PATH para checar áudio (opcional).
 
 from __future__ import annotations
-import os, time, glob, shutil, logging, subprocess, re
+import os, time, glob, shutil, logging, subprocess, re, json
 from typing import List, Dict, Tuple, Optional
 
 from selenium import webdriver
@@ -27,38 +29,80 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver import ActionChains
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 from selenium.webdriver.common.keys import Keys
 
 logger = logging.getLogger(__name__)
 
-# --- NOVA CONSTANTE DE CUSTO ---
+# --- Custo estimado por cena (usado apenas para log) ---
 CREDIT_COST_PER_SCENE = 20
 
 # ====================== Cookies (Netscape) ======================
+
+def _write_netscape_cookies(path: str, cookies: list) -> str:
+    """Escreve cookies no formato Netscape (compatível com o carregador atual)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# domain\tflag\tpath\tsecure\texpiration\tname\tvalue",
+    ]
+    for c in (cookies or []):
+        try:
+            domain = (c.get("domain") or "").strip()
+            flag = "FALSE" if domain and not domain.startswith(".") else "TRUE"
+            pathv = c.get("path") or "/"
+            secure = "TRUE" if c.get("secure") else "FALSE"
+            exp = c.get("expiry") or c.get("expirationDate") or 0
+            try:
+                exp = int(exp)
+            except Exception:
+                exp = 0
+            name = c.get("name") or ""
+            value = c.get("value") or ""
+            lines.append(f"{domain}\t{flag}\t{pathv}\t{secure}\t{exp}\t{name}\t{value}")
+        except Exception:
+            continue
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.replace(tmp, path)
+    except Exception:
+        shutil.copy2(tmp, path)
+    return path
+
 def _read_netscape_cookies(path: str) -> List[Dict]:
+    """Lê cookies no formato Netscape; também tolera JSON (retorna lista vazia se inválido)."""
     if not path or not os.path.isfile(path):
-        raise FileNotFoundError(f"Cookie file não encontrado: {path}")
+        return []
+    txt = open(path, "r", encoding="utf-8").read().strip()
+    if txt.startswith("["):
+        try:
+            arr = json.loads(txt)
+            return arr if isinstance(arr, list) else []
+        except Exception:
+            return []
     items: List[Dict] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln or ln.startswith(("#", "!")):
-                continue
-            parts = ln.split("\t")
-            if len(parts) != 7:
-                continue
-            domain, _flag, pathv, secure_s, expiry, name, value = parts
-            items.append({
-                "domain": (domain or "").strip(),
-                "path": (pathv or "/").strip(),
-                "secure": (secure_s.upper() == "TRUE"),
-                "expiry": int(expiry) if str(expiry).isdigit() else None,
-                "name": name.strip(),
-                "value": value.strip(),
-            })
-    if not items:
-        raise RuntimeError(f"Nenhum cookie válido lido de: {path}")
+    for ln in txt.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(("#", "!")):
+            continue
+        parts = ln.split("\t")
+        if len(parts) != 7:
+            continue
+        domain, _flag, pathv, secure_s, expiry, name, value = parts
+        try:
+            exp_i = int(expiry) if str(expiry).isdigit() else None
+        except Exception:
+            exp_i = None
+        items.append({
+            "domain": (domain or "").strip(),
+            "path": (pathv or "/").strip(),
+            "secure": (secure_s.upper() == "TRUE"),
+            "expiry": exp_i,
+            "name": name.strip(),
+            "value": value.strip(),
+        })
     return items
 
 def _group_cookie_domains(cookies: List[Dict]) -> List[str]:
@@ -70,30 +114,32 @@ def _group_cookie_domains(cookies: List[Dict]) -> List[str]:
     return sorted(hosts, key=lambda h: (h.count("."), len(h)))
 
 def _add_cookies_multi_domain(driver: webdriver.Chrome, cookies: List[Dict]) -> None:
+    """Injeta cookies por domínio (precisa visitar cada host para o add_cookie aceitar)."""
     for host in _group_cookie_domains(cookies):
         base = f"https://{host}/"
         try:
-            driver.get(base)
-            time.sleep(0.6)
+            driver.get(base); time.sleep(0.4)
         except Exception:
             continue
         for ck in cookies:
             if (ck.get("domain") or "").lstrip(".") != host:
                 continue
             c = {
-                "name": ck["name"],
-                "value": ck["value"],
-                "path": (ck.get("path") or "/"),
+                "name": ck.get("name"),
+                "value": ck.get("value"),
+                "path": ck.get("path") or "/",
                 "secure": bool(ck.get("secure", False)),
             }
             if ck.get("expiry"):
-                c["expiry"] = int(ck["expiry"])
+                try: c["expiry"] = int(ck["expiry"])
+                except Exception: pass
             try:
                 driver.add_cookie(c)
-            except Exception as e:
-                logger.debug("Cookie ignorado em %s (%s): %s", host, ck.get("name"), e)
+            except Exception:
+                pass
 
 # ====================== Chrome ======================
+
 def _chrome(download_dir: str, headless: bool = True) -> webdriver.Chrome:
     os.makedirs(download_dir, exist_ok=True)
     opts = Options()
@@ -116,6 +162,7 @@ def _chrome(download_dir: str, headless: bool = True) -> webdriver.Chrome:
     return webdriver.Chrome(options=opts)
 
 # ====================== DEBUG RUN DIR ======================
+
 _DEBUG_RUN_DIR: Optional[str] = None
 
 def _begin_debug_run() -> str:
@@ -136,7 +183,22 @@ def _end_debug_run(success: bool) -> None:
     finally:
         _DEBUG_RUN_DIR = None
 
+def _debug_dir() -> str:
+    return _begin_debug_run()
+
+def _dump_debug(driver: webdriver.Chrome, tag: str):
+    try:
+        base = _debug_dir()
+        ts = int(time.time())
+        os.makedirs(base, exist_ok=True)
+        driver.save_screenshot(os.path.join(base, f"{tag}_{ts}.png"))
+        with open(os.path.join(base, f"{tag}_{ts}.html"), "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+    except Exception:
+        pass
+
 # ====================== Util / Esperas ======================
+
 def _first_visible(driver, candidates: List[Tuple[str,str]], timeout: int = 20):
     end = time.time() + timeout
     last = None
@@ -152,53 +214,6 @@ def _first_visible(driver, candidates: List[Tuple[str,str]], timeout: int = 20):
     if last:
         raise last
     return None
-
-def _wait_download(download_dir: str, before: List[str], timeout: int = 300) -> str:
-    end = time.time() + timeout
-    before_set = set(map(os.path.abspath, before))
-    while time.time() < end:
-        files = [os.path.abspath(p) for p in glob.glob(os.path.join(download_dir, "*.mp4"))
-                 if not p.endswith(".crdownload")]
-        newf = [p for p in files if p not in before_set]
-        if newf:
-            newf.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            p = newf[0]
-            s1 = os.path.getsize(p); time.sleep(1.0); s2 = os.path.getsize(p)
-            if s1 == s2 and s1 > 0:
-                return p
-        time.sleep(0.7)
-    raise TimeoutException("Timeout aguardando download do .mp4.")
-
-def _debug_dir() -> str:
-    return _begin_debug_run()
-
-def _dump_debug(driver: webdriver.Chrome, tag: str):
-    try:
-        base = _debug_dir()
-        ts = int(time.time())
-        os.makedirs(base, exist_ok=True)
-        driver.save_screenshot(os.path.join(base, f"{tag}_{ts}.png"))
-        with open(os.path.join(base, f"{tag}_{ts}.html"), "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-    except Exception:
-        pass
-
-def _safe_click(driver: webdriver.Chrome, el):
-    driver.execute_script("arguments[0].scrollIntoView({behavior:'instant',block:'center'});", el)
-    try:
-        WebDriverWait(driver, 6).until(EC.element_to_be_clickable(el))
-        el.click(); return
-    except Exception:
-        pass
-    try:
-        ActionChains(driver).move_to_element(el).pause(0.05).click().perform(); return
-    except Exception:
-        pass
-    try:
-        ActionChains(driver).move_to_element_with_offset(el, 1, 1).pause(0.05).click().perform(); return
-    except Exception:
-        pass
-    driver.execute_script("arguments[0].click();", el)
 
 def _wait_overlays_gone(driver: webdriver.Chrome, timeout: int = 12):
     end = time.time() + timeout
@@ -220,6 +235,23 @@ def _wait_overlays_gone(driver: webdriver.Chrome, timeout: int = 12):
             if any_vis: break
         if not any_vis: return
         time.sleep(0.25)
+
+def _safe_click(driver: webdriver.Chrome, el):
+    driver.execute_script("arguments[0].scrollIntoView({behavior:'instant',block:'center'});", el)
+    try:
+        WebDriverWait(driver, 6).until(EC.element_to_be_clickable(el))
+        el.click(); return
+    except Exception:
+        pass
+    try:
+        ActionChains(driver).move_to_element(el).pause(0.05).click().perform(); return
+    except Exception:
+        pass
+    try:
+        ActionChains(driver).move_to_element_with_offset(el, 1, 1).pause(0.05).click().perform(); return
+    except Exception:
+        pass
+    driver.execute_script("arguments[0].click();", el)
 
 def _pause_all_videos(driver: webdriver.Chrome):
     try:
@@ -244,6 +276,7 @@ def _hover_latest_video(driver: webdriver.Chrome):
         return None
 
 # ====== Stall (99%) handling ======
+
 def _is_stuck_99(driver: webdriver.Chrome) -> bool:
     try:
         return bool(driver.execute_script("""
@@ -287,7 +320,8 @@ def _refresh(driver: webdriver.Chrome):
     except Exception:
         pass
 
-# ====================== Home helpers ======================
+# ====================== Home/Projeto helpers ======================
+
 def _open_flow_home(driver: webdriver.Chrome, entry_url: str):
     driver.get(entry_url)
     _first_visible(driver, [(By.CSS_SELECTOR, "body")], timeout=15)
@@ -304,13 +338,16 @@ def _unlock_home_scroll(driver: webdriver.Chrome):
 
 def _click_novo_projeto(driver: webdriver.Chrome):
     _unlock_home_scroll(driver)
+    # 1) tentativa direta
     try:
         btn = _first_visible(driver, [
-            (By.XPATH, "//button[contains(normalize-space(.), 'Novo projeto')]]"),
+            (By.XPATH, "//button[contains(normalize-space(.), 'Novo projeto')]"),
+            (By.XPATH, "//button[contains(normalize-space(.), 'New project')]"),
         ], timeout=10)
         _safe_click(driver, btn); return
     except Exception:
         pass
+    # 2) busca heurística no DOM
     try:
         el = driver.execute_script(r"""
 const matches = (el, txts) => {
@@ -326,9 +363,10 @@ return null;
         if el: _safe_click(driver, el); return
     except Exception:
         pass
-
     _dump_debug(driver, "novo_projeto_not_found")
     raise TimeoutException("Não consegui clicar em 'Novo projeto'.")
+
+# ----------- Forçadores de UI (opcional) -----------
 
 def _force_respostas_por_comando_1(driver: webdriver.Chrome):
     try:
@@ -338,64 +376,49 @@ def _force_respostas_por_comando_1(driver: webdriver.Chrome):
             (By.XPATH, "//button[contains(@aria-label, 'config') or contains(@aria-label, 'ajustes') or contains(@aria-label, 'settings')]")
         ], timeout=20)
         _safe_click(driver, ajustes_btn)
-        logger.info("   - Passo 1: Clicou no botão de Ajustes (tune).")
-
         select_btn = _first_visible(driver, [
             (By.XPATH, "//*[contains(normalize-space(.), 'Respostas por comando')]/ancestor::button"),
             (By.XPATH, "//button[contains(., 'Respostas por comando')]")
         ], timeout=10)
         _safe_click(driver, select_btn)
-        logger.info("   - Passo 2: Clicou no dropdown 'Respostas por comando'.")
-
         opt_1 = _first_visible(driver, [
             (By.XPATH, "//div[@role='option' or @role='menuitem'][normalize-space()='1']"),
         ], timeout=10)
         _safe_click(driver, opt_1)
-        logger.info("   - Passo 3: Selecionou a opção '1'.")
-
         WebDriverWait(driver, 10).until(
             EC.invisibility_of_element_located((By.XPATH, "//div[@role='option' or @role='menuitem']"))
         )
         time.sleep(0.5)
-        logger.info("   - Passo 4: Configuração de 'Respostas por comando' concluída e UI estabilizada.")
+        logger.info("✅ 'Respostas por comando' definido como 1.")
     except Exception as e:
-        logger.error("❌ Falha ao tentar forçar 'Respostas por comando' para 1.")
-        logger.error("   - Detalhes do erro: %s", e)
+        logger.error("⚠️ Não consegui forçar 'Respostas por comando'=1 (%s).", e)
         _dump_debug(driver, "respostas_comando_fail")
 
 def _force_model_veo3_fast(driver: webdriver.Chrome):
-    logger.info("🔧 Forçando a seleção do modelo para 'Veo 3 - Fast'...")
+    logger.info("🔧 Selecionando modelo 'Veo 3 - Fast' (se disponível)…")
     try:
-        logger.info("   - Passo 1: Procurando e clicando no botão do menu de modelo...")
         model_menu_button = _first_visible(driver, [
             (By.XPATH, "//button[.//span[normalize-space()='Modelo']]"),
             (By.XPATH, "//span[normalize-space()='Modelo']/ancestor::button[1]")
         ], timeout=20)
         _safe_click(driver, model_menu_button)
-        logger.info("   - Passo 1 SUCESSO: Menu de modelo clicado.")
-        time.sleep(1.5)
-    except Exception as e:
-        logger.error("❌ FALHA no Passo 1: Não foi possível abrir o menu de modelo: %s", e)
-        _dump_debug(driver, "model_menu_button_fail")
-        return
-    try:
-        logger.info("   - Passo 2: Procurando a opção 'Veo 3 - Fast' no menu...")
+        time.sleep(1.2)
         veo3_fast_option_container = _first_visible(driver, [
             (By.XPATH, "//div[@role='option'][.//span[normalize-space()='Veo 3 - Fast']]"),
             (By.XPATH, "//div[@role='option'][contains(., 'Veo 3 - Fast')]"),
         ], timeout=10)
         _safe_click(driver, veo3_fast_option_container)
-        logger.info("   - Passo 3: Verificando se a seleção foi aplicada...")
         WebDriverWait(driver, 10).until(
             EC.text_to_be_present_in_element((By.XPATH, "//button[contains(., 'Modelo')]"), "Veo 3 - Fast")
         )
-        logger.info("✅ SUCESSO: Modelo 'Veo 3 - Fast' selecionado e confirmado.")
-        time.sleep(0.5)
+        logger.info("✅ Modelo 'Veo 3 - Fast' selecionado.")
+        time.sleep(0.3)
     except Exception as e:
-        logger.error("❌ FALHA nos Passos 2/3: Não foi possível selecionar/confirmar 'Veo 3 - Fast': %s", e)
+        logger.warning("⚠️ Não consegui confirmar 'Veo 3 - Fast': %s", e)
         _dump_debug(driver, "model_option_fail")
 
-# ----------- Injeção segura do prompt -----------
+# ----------- Injeção do prompt -----------
+
 _def_js = r"""
 const el = arguments[0]; const val = arguments[1] ?? "";
 function setReactValue(input, v) {
@@ -419,7 +442,6 @@ if (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && (!el.type || el.type
 }
 return true;
 """
-
 
 def _set_text_multiline_js(driver: webdriver.Chrome, element, text: str) -> None:
     driver.execute_script(_def_js, element, text)
@@ -452,6 +474,7 @@ def _submit_prompt(driver: webdriver.Chrome, prompt_text: str):
     _safe_click(driver, submit_btn)
 
 # ----------- Download helpers -----------
+
 def _find_download_button(driver: webdriver.Chrome):
     exact = ("//button[@aria-haspopup='menu' and .//i[normalize-space()='download'] "
              "and .//span[normalize-space()='Baixar']]")
@@ -470,6 +493,22 @@ def _find_download_button(driver: webdriver.Chrome):
         if cand:
             return cand[-1]
     return None
+
+def _wait_download(download_dir: str, before: List[str], timeout: int = 300) -> str:
+    end = time.time() + timeout
+    before_set = set(map(os.path.abspath, before))
+    while time.time() < end:
+        files = [os.path.abspath(p) for p in glob.glob(os.path.join(download_dir, "*.mp4"))
+                 if not p.endswith(".crdownload")]
+        newf = [p for p in files if p not in before_set]
+        if newf:
+            newf.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            p = newf[0]
+            s1 = os.path.getsize(p); time.sleep(1.0); s2 = os.path.getsize(p)
+            if s1 == s2 and s1 > 0:
+                return p
+        time.sleep(0.7)
+    raise TimeoutException("Timeout aguardando download do .mp4.")
 
 def _click_download_720p_once(driver: webdriver.Chrome) -> bool:
     _wait_overlays_gone(driver, timeout=5)
@@ -513,7 +552,8 @@ def _click_download_720p_once(driver: webdriver.Chrome) -> bool:
     _safe_click(driver, target)
     return True
 
-# ----------- Limpeza de vídeos existentes no projeto -----------
+# ----------- Limpeza de vídeos (lista) -----------
+
 def _delete_card_menuitem_if_open(driver: webdriver.Chrome) -> bool:
     try:
         item = _first_visible(driver, [
@@ -559,6 +599,7 @@ def _clear_existing_videos(driver: webdriver.Chrome, max_loops: int = 8) -> int:
     return removed
 
 # ----------- Apagar o vídeo ATUAL -----------
+
 def _delete_current_video(driver: webdriver.Chrome, tries: int = 3, timeout: int = 20) -> bool:
     def _videos_visible() -> bool:
         vids = driver.find_elements(By.TAG_NAME, "video")
@@ -618,7 +659,8 @@ def _delete_current_video(driver: webdriver.Chrome, tries: int = 3, timeout: int
     vids = driver.find_elements(By.TAG_NAME, "video")
     return not any(v.is_displayed() for v in vids)
 
-# ----------- Download 720p (probes + retries + refresh em 99%) -----------
+# ----------- Download 720p (com anti-stall) -----------
+
 def _wait_download_720p(driver: webdriver.Chrome, download_dir: str, before: List[str], *, tag: str = "") -> str:
     total_wait = int(float(os.getenv("FLOW_DOWNLOAD_WAIT_SEC", "600")))
     probe = int(float(os.getenv("FLOW_PROBE_SEC", "10")))
@@ -632,8 +674,7 @@ def _wait_download_720p(driver: webdriver.Chrome, download_dir: str, before: Lis
     for part in shot_marks_env.split(','):
         try:
             v = int(part)
-            if v > 0:
-                stuck_marks.append(v)
+            if v > 0: stuck_marks.append(v)
         except Exception:
             pass
     stuck_marks = sorted(set(stuck_marks))
@@ -660,7 +701,7 @@ def _wait_download_720p(driver: webdriver.Chrome, download_dir: str, before: Lis
             if last_stall_mark is None:
                 last_stall_mark = time.time()
             if (time.time() - last_stall_mark) >= stall_sec and refreshes < stall_max:
-                logger.info("🔄 Detected 99%% por ≥%ds — dando refresh (%d/%d)…", stall_sec, refreshes+1, stall_max)
+                logger.info("🔄 99%% ≥%ds — refresh (%d/%d)…", stall_sec, refreshes+1, stall_max)
                 _dump_debug(driver, f"{tag or 'scene'}_stuck99_refresh{refreshes+1}")
                 _refresh(driver)
                 last_stall_mark = None
@@ -746,6 +787,7 @@ def _wait_download_720p(driver: webdriver.Chrome, download_dir: str, before: Lis
     raise TimeoutException(f"Timeout geral tentando efetuar o download 720p. [{tag or 'scene'}]")
 
 # ----------- Delete via menu do cartão atual -----------
+
 def _delete_card(driver: webdriver.Chrome):
     def _find_delete_item():
         xp = ("//div[@role='menuitem' and .//i[normalize-space()='delete'] "
@@ -770,6 +812,7 @@ def _delete_card(driver: webdriver.Chrome):
         logger.debug("Não foi possível excluir no Flow (seguindo): %s", e)
 
 # ====================== Áudio: ffprobe ======================
+
 def _ffprobe_path() -> Optional[str]:
     p = shutil.which("ffprobe")
     if not p:
@@ -791,7 +834,7 @@ def _has_audio_ffprobe(video_path: str) -> Optional[bool]:
 
 def _should_check_audio() -> bool:
     v = (os.getenv("FLOW_CHECK_AUDIO", "1").strip() or "1")
-    return v not in {"0", "false", "no", "off"}
+    return v.lower() not in {"0", "false", "no", "off"}
 
 def _noaudio_retries() -> int:
     try:
@@ -799,8 +842,7 @@ def _noaudio_retries() -> int:
     except Exception:
         return 2
 
-# --- CRÉDITOS ---
-import re as _re
+# ====================== Créditos (opcional) ======================
 
 def _check_and_log_credits(driver: webdriver.Chrome, stage: str) -> Optional[int]:
     try:
@@ -813,11 +855,10 @@ def _check_and_log_credits(driver: webdriver.Chrome, stage: str) -> Optional[int
         credit_element = _first_visible(driver, [
             (By.XPATH, "//a[contains(., 'Créditos de IA') or contains(., 'AI Credits')]")
         ], timeout=10)
-        text = credit_element.text
-        credits = None
-        match = _re.search(r"(\d+)", text)
-        if match:
-            credits = int(match.group(1))
+        text = credit_element.text or ""
+        match = re.search(r"(\d+)", text)
+        credits = int(match.group(1)) if match else None
+        if credits is not None:
             logger.info("💰 Créditos de IA (%s): %d", stage, credits)
         else:
             logger.warning("Não foi possível extrair o número de créditos do texto: '%s'", text)
@@ -826,13 +867,219 @@ def _check_and_log_credits(driver: webdriver.Chrome, stage: str) -> Optional[int
         return credits
     except Exception as e:
         logger.warning("Não foi possível verificar os créditos de IA: %s", e)
-        try:
-            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-        except Exception:
-            pass
+        try: ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+        except Exception: pass
         return None
 
+# ====================== AUTH HELPERS (robustos) ======================
+
+def _get_success_xpaths_from_env() -> List[str]:
+    raw = os.getenv("FLOW_LOGIN_SUCCESS_SELECTORS", "")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if parts:
+        return parts
+    # Defaults razoáveis
+    return [
+        "//button[contains(., 'Novo projeto')]",
+        "//button[contains(., 'New project')]",
+        "//*[@data-testid='new-project-button']",
+        "//a[contains(@href, 'new-project')]",
+        "//button[contains(., 'Create') and contains(., 'project')]",
+        "//*[contains(@class, 'new-project')]",
+    ]
+
+def _auth_is_login_gate(driver) -> bool:
+    try:
+        url = (driver.current_url or "").lower()
+        if "accounts.google." in url or "signin" in url or "sign-in" in url or "login" in url or "oauth" in url:
+            return True
+        html = (driver.page_source or "").lower()
+        return any(k in html for k in [
+            "sign in with google","continuar com o google","entrar com o google",
+            "try signing in with a different account"
+        ])
+    except Exception:
+        return False
+
+def _auth_has_session_cookie(driver) -> bool:
+    try:
+        for ck in driver.get_cookies() or []:
+            name = (ck.get("name") or "").lower()
+            if "next" in name and "auth" in name:
+                return True
+            if "session" in name and ck.get("value"):
+                return True
+        return False
+    except WebDriverException:
+        return False
+
+def _auth_is_logged_in(driver) -> bool:
+    """Sucesso se: tem cookie de sessão OU URL interna OU algum seletor 'sucesso'."""
+    if _auth_has_session_cookie(driver):
+        return True
+    try:
+        url = (driver.current_url or "").lower()
+    except Exception:
+        url = ""
+    if any(k in url for k in ["/projects", "/studio", "/home", "/dashboard"]):
+        return True
+    for xp in _get_success_xpaths_from_env():
+        try:
+            el = driver.find_element("xpath", xp)
+            if el:
+                return True
+        except NoSuchElementException:
+            continue
+        except WebDriverException:
+            break
+    return False
+
+def _auth_dump(driver, tag="signin"):
+    try:
+        debug_dir = _debug_dir()
+        os.makedirs(debug_dir, exist_ok=True)
+        html_path = os.path.join(debug_dir, f"{tag}_{int(time.time())}.html")
+        png_path  = os.path.join(debug_dir, f"{tag}_{int(time.time())}.png")
+        try:
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(driver.page_source or "")
+        except Exception:
+            pass
+        try:
+            driver.save_screenshot(png_path)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _auth_export_cookies(driver, cookie_path: str) -> None:
+    try:
+        cookies = driver.get_cookies() or []
+        _write_netscape_cookies(cookie_path, cookies)
+        logger.info("🍪 Cookies exportados para: %s (%d itens)", cookie_path, len(cookies))
+    except Exception as e:
+        logger.warning("Falha ao exportar cookies para %s: %s", cookie_path, e)
+
+def _env_interactive_allowed() -> bool:
+    # Compat: FLOW_INTERACTIVE_LOGIN e VEO3_ALLOW_INTERACTIVE_LOGIN
+    flow = os.getenv("FLOW_INTERACTIVE_LOGIN", "").strip().lower()
+    veo  = os.getenv("VEO3_ALLOW_INTERACTIVE_LOGIN", "").strip().lower()
+    def truthy(v: str) -> Optional[bool]:
+        if v == "": return None
+        return v not in {"0","false","no","off"}
+    v = truthy(flow)
+    if v is None:
+        v = truthy(veo)
+        if v is None:
+            return True  # default: permitido
+    return bool(v)
+
+def _env_login_timeout_minutes() -> int:
+    # Usa FLOW_LOGIN_MAX_MINUTES; fallback para VEO3_INTERACTIVE_LOGIN_TIMEOUT_SEC/60
+    try:
+        mins = int(float(os.getenv("FLOW_LOGIN_MAX_MINUTES", "").strip()))
+        if mins > 0: return mins
+    except Exception:
+        pass
+    try:
+        secs = int(float(os.getenv("VEO3_INTERACTIVE_LOGIN_TIMEOUT_SEC", "").strip()))
+        if secs > 0: return max(1, secs // 60)
+    except Exception:
+        pass
+    return 10
+
+def auth_wait_login_and_export(driver, cookie_path: str, max_minutes: int = 10) -> bool:
+    """Espera login manual (janela já aberta). Ao detectar sucesso (cookies/URL/elemento),
+    exporta cookies e retorna True."""
+    deadline = time.time() + max(1, int(max_minutes)) * 60
+    logged_once = False
+    last_log = 0.0
+    while time.time() < deadline:
+        try:
+            if _auth_is_logged_in(driver):
+                if not logged_once:
+                    logger.info("✅ Login reconhecido (cookies/URL/seletor). Exportando cookies…")
+                    _auth_export_cookies(driver, cookie_path)
+                    logged_once = True
+                time.sleep(2.5)
+                return True
+            if _auth_is_login_gate(driver):
+                now = time.time()
+                if now - last_log > 10:
+                    logger.info("⏳ Aguardando sua autenticação… (restante ~%ds)", int(deadline - now))
+                    last_log = now
+            else:
+                # Não parece login nem logado: tenta ir à área interna
+                try: driver.get("https://www.tiktok.com/tiktokstudio/upload")
+                except Exception: pass
+            time.sleep(1.2)
+        except WebDriverException:
+            break
+    logger.error("[AUTH] Tempo esgotado aguardando autenticação manual.")
+    return False
+
+def _auth_ensure(driver, project_url: str, cookies_file: str, *, headless: bool) -> webdriver.Chrome:
+    """Garante autenticação: se gate detectado e modo interativo habilitado, abre janela visível
+    para login e exporta cookies; depois reabre headless (se necessário) com cookies atualizados."""
+    try:
+        if not _auth_is_login_gate(driver):
+            return driver
+
+        _auth_dump(driver, "signin_detected")
+        logger.error("❌ Gate de login do Flow detectado — é necessário renovar os cookies.")
+
+        if not _env_interactive_allowed():
+            raise RuntimeError("Gate de login detectado e modo interativo desabilitado. "
+                               "Habilite FLOW_INTERACTIVE_LOGIN=1 ou atualize manualmente os cookies.")
+        timeout_min = _env_login_timeout_minutes()
+
+        try: driver.quit()
+        except Exception: pass
+
+        logger.warning("🔐 Abrindo Chrome VISÍVEL para autenticação manual (até %d min)…", timeout_min)
+        drv2 = _chrome(download_dir=os.path.abspath("videos"), headless=False)
+        drv2.get(project_url)
+
+        # Tenta clicar no botão "Sign in with Google" se presente (ajuda a ir para a conta correta).
+        try:
+            btn = WebDriverWait(drv2, 10).until(EC.element_to_be_clickable((
+                By.XPATH, "//form[contains(@action,'/fx/api/auth/signin/google')]//button"
+                          "|//button[contains(., 'Sign in with Google') or contains(., 'Entrar com o Google')]"
+            )))
+            try: btn.click()
+            except Exception:
+                try: drv2.execute_script("arguments[0].click();", btn)
+                except Exception: pass
+        except Exception:
+            pass
+
+        ok = auth_wait_login_and_export(drv2, cookie_path=cookies_file, max_minutes=timeout_min)
+        if not ok:
+            _auth_dump(drv2, "signin_timeout")
+            try: drv2.quit()
+            except Exception: pass
+            raise TimeoutException("LOGIN_TIMEOUT: não consegui confirmar o login no tempo limite.")
+
+        logger.info("🟢 [AUTH] Cookies renovados. Prosseguindo.")
+        if headless:
+            drv3 = _chrome(download_dir=os.path.abspath("videos"), headless=True)
+            try:
+                cookies = _read_netscape_cookies(cookies_file)
+                if cookies: _add_cookies_multi_domain(drv3, cookies)
+            except Exception:
+                pass
+            drv3.get(project_url)
+            try: drv2.quit()
+            except Exception: pass
+            return drv3
+        else:
+            return drv2
+    except Exception as e:
+        logger.error("[AUTH] Falha ao garantir autenticação: %s", e)
+        return driver
+
 # ====================== APIs públicas ======================
+
 def generate_single_via_flow(
     prompt_text: str,
     out_path: str,
@@ -848,23 +1095,30 @@ def generate_single_via_flow(
     driver = _chrome(download_dir=download_dir, headless=headless)
     try:
         logger.info("Destino do arquivo: %s", out_path)
-        cookies = _read_netscape_cookies(cookies_file)
-        _add_cookies_multi_domain(driver, cookies)
 
+        # 1) carrega cookies existentes (se houver) e tenta abrir direto
+        cookies = _read_netscape_cookies(cookies_file)
+        if cookies:
+            _add_cookies_multi_domain(driver, cookies)
+        driver.get(project_url)
+
+        # 2) se mesmo assim caiu no login, faz o fluxo interativo e reabre headless
+        if _auth_is_login_gate(driver):
+            driver = _auth_ensure(driver, project_url, cookies_file, headless=headless)
+
+        # 3) navegação inicial / criação de projeto
         if "/tools/flow" in project_url and "/project/" not in project_url:
             logger.info("Abrindo Flow e criando 'Novo projeto'…")
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
-        else:
-            driver.get(project_url)
 
+        # 4) (opcional) créditos
         creditos_iniciais = _check_and_log_credits(driver, "início")
         if creditos_iniciais is not None and creditos_iniciais < CREDIT_COST_PER_SCENE:
-            logger.error(
-                f"❌ CRÉDITOS INSUFICIENTES! Disponíveis: {creditos_iniciais}, Necessários: {CREDIT_COST_PER_SCENE}. Processo abortado.")
+            logger.error("❌ CRÉDITOS INSUFICIENTES! Disp.: %d | Nec.: %d.", creditos_iniciais, CREDIT_COST_PER_SCENE)
             raise RuntimeError("Créditos insuficientes para gerar 1 cena.")
         elif creditos_iniciais is None:
-            logger.warning("Não foi possível verificar o saldo de créditos. O processo continuará.")
+            logger.warning("Não foi possível verificar o saldo de créditos. Continuando.")
 
         _force_respostas_por_comando_1(driver)
         _force_model_veo3_fast(driver)
@@ -887,7 +1141,7 @@ def generate_single_via_flow(
                 has_aud = _has_audio_ffprobe(mp4_tmp)
                 if has_aud is False:
                     ok = False
-                    logger.warning("⚠️ Arquivo sem trilha de áudio. Vou excluir e re‑gerar (tentativa %d).", attempt)
+                    logger.warning("⚠️ Arquivo sem trilha de áudio. Vou excluir e re-gerar (tentativa %d).", attempt)
                 elif has_aud is None:
                     logger.debug("Não foi possível confirmar áudio via ffprobe — seguindo com este arquivo.")
                 else:
@@ -922,14 +1176,12 @@ def generate_single_via_flow(
         return out_path
 
     except Exception:
-        _dump_debug(driver, "exception")
+        _dump_debug(driver, "exception_single")
         _end_debug_run(success=False)
         raise
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass
 
 def generate_many_via_flow(
     prompts: List[str],
@@ -948,27 +1200,33 @@ def generate_many_via_flow(
 
     driver = _chrome(download_dir=download_dir, headless=headless)
     try:
+        # 1) cookies e navegação
         cookies = _read_netscape_cookies(cookies_file)
-        _add_cookies_multi_domain(driver, cookies)
+        if cookies:
+            _add_cookies_multi_domain(driver, cookies)
+        driver.get(project_url)
 
+        # 2) garante auth se gate
+        if _auth_is_login_gate(driver):
+            driver = _auth_ensure(driver, project_url, cookies_file, headless=headless)
+
+        # 3) home/projeto
         if "/tools/flow" in project_url and "/project/" not in project_url:
             logger.info("Abrindo Flow e criando 'Novo projeto'…")
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
-        else:
-            driver.get(project_url)
 
+        # 4) créditos
         creditos_iniciais = _check_and_log_credits(driver, "início")
         if creditos_iniciais is not None:
             num_cenas = len(prompts)
             custo_total = num_cenas * CREDIT_COST_PER_SCENE
-            logger.info(f"Custo estimado para {num_cenas} cena(s): {custo_total} créditos.")
+            logger.info("Custo estimado para %d cena(s): %d créditos.", num_cenas, custo_total)
             if creditos_iniciais < custo_total:
-                logger.error(
-                    f"❌ CRÉDITOS INSUFICIENTES! Disponíveis: {creditos_iniciais}, Necessários: {custo_total}. Processo abortado.")
+                logger.error("❌ CRÉDITOS INSUFICIENTES! Disp.: %d | Nec.: %d.", creditos_iniciais, custo_total)
                 raise RuntimeError(f"Créditos insuficientes para gerar {num_cenas} cenas.")
         else:
-            logger.warning("Não foi possível verificar o saldo de créditos. O processo continuará por sua conta e risco.")
+            logger.warning("Não foi possível verificar o saldo de créditos. Continuando por sua conta e risco.")
 
         _force_respostas_por_comando_1(driver)
         _force_model_veo3_fast(driver)
@@ -992,9 +1250,8 @@ def generate_many_via_flow(
                 try:
                     mp4_tmp = _wait_download_720p(driver, download_dir, before, tag=f"{base_tag}_attempt{attempt}")
                 except Exception as e:
-                    logger.warning("Cena %d: erro ao aguardar download (%s). Re‑tentando…", idx, e)
+                    logger.warning("Cena %d: erro ao aguardar download (%s). Re-tentando…", idx, e)
                     _dump_debug(driver, f"{base_tag}_attempt{attempt}_wait_err")
-                    # Se falhou antes de gerar arquivo, apenas recomeça a tentativa
                     continue
 
                 logger.info("Vídeo baixado: %s", mp4_tmp)
@@ -1004,7 +1261,7 @@ def generate_many_via_flow(
                     has_aud = _has_audio_ffprobe(mp4_tmp)
                     if has_aud is False:
                         ok = False
-                        logger.warning("⚠️ Cena %d: arquivo sem trilha de áudio. Re‑gerando (tentativa %d)…", idx, attempt)
+                        logger.warning("⚠️ Cena %d: arquivo sem trilha de áudio. Re-gerando (tentativa %d)…", idx, attempt)
                     elif has_aud is None:
                         logger.debug("Cena %d: não foi possível confirmar áudio via ffprobe — seguindo.", idx)
                     else:
@@ -1055,7 +1312,5 @@ def generate_many_via_flow(
         _end_debug_run(success=False)
         raise
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass

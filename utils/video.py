@@ -10,7 +10,13 @@ from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
-# Importa apenas o necessário do frase.py
+# >>> cache por idioma
+try:
+    from cache_store import cache
+except Exception:
+    cache = None
+
+# Importa geradores de frase e helpers compartilhados
 from .frase import gerar_frase_motivacional_longa, _split_for_emphasis, quebrar_em_duas_linhas
 try:
     from .frase import gerar_frase_tarot_longa
@@ -42,8 +48,8 @@ AUDIO_SR = 44100
 # Diretórios
 IMAGES_DIR = os.getenv("IMAGES_DIR", "imagens")
 AUDIO_DIR  = os.getenv("AUDIO_DIR", "audios")
-FONTS_DIR = "fonts"
-CACHE_DIR = "cache"
+FONTS_DIR  = "fonts"
+CACHE_DIR  = os.getenv("CACHE_DIR", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(os.path.join(AUDIO_DIR, "tts"), exist_ok=True)
@@ -70,7 +76,7 @@ VIDEO_TAIL_PAD     = _env_float("VIDEO_TAIL_PAD", 0.40)
 VIDEO_MAX_S        = _env_float("VIDEO_MAX_S", 0.0)
 DUCK_ENABLE        = _env_bool("DUCK_ENABLE", True)
 
-# Parâmetros de Estilo de Texto (espelhados de imagem.py)
+# Estilo de Texto (espelhado de imagem.py)
 IMAGE_TEXT_UPPER           = _env_bool("IMAGE_TEXT_UPPER", True)
 IMAGE_TEXT_OUTLINE_STYLE   = os.getenv("IMAGE_TEXT_OUTLINE_STYLE", "shadow").strip().lower()
 IMAGE_STROKE_WIDTH         = _env_int("IMAGE_STROKE_WIDTH", 2)
@@ -88,12 +94,12 @@ IMAGE_TEXT_SCALE_MINIMAL   = _env_float("IMAGE_TEXT_SCALE_MINIMAL", 0.95)
 ARABIC_FONT_IMAGE_REG      = os.getenv("ARABIC_FONT_IMAGE_REG",  "NotoNaskhArabic-Regular.ttf")
 ARABIC_FONT_IMAGE_BOLD     = os.getenv("ARABIC_FONT_IMAGE_BOLD", "NotoNaskhArabic-Bold.ttf")
 
-# Parâmetros de Legendas
+# Legendas
 SUB_FONT_SCALE_1 = _env_float("SUB_FONT_SCALE_1", 0.050)
 SUB_FONT_SCALE_2 = _env_float("SUB_FONT_SCALE_2", 0.056)
 SUB_FONT_SCALE_3 = _env_float("SUB_FONT_SCALE_3", 0.044)
 REQUIRE_FONTFILE = _env_bool("REQUIRE_FONTFILE", False)
-ARABIC_FONT = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
+ARABIC_FONT      = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
 
 # ================== Helpers ==================
 def _ffmpeg_or_die() -> str:
@@ -160,7 +166,7 @@ def _build_slide_branch(idx: int, W: int, H: int, motion: str, per_slide: float)
         return f"[{idx}:v]{func(W,H,F)},format=yuv420p,setsar=1/1,fps={FPS_OUT}[v{idx}]"
     return f"[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,setsar=1/1,fps={FPS_OUT}[v{idx}]"
 
-# ================== Lógica de Renderização de Título (Sincronizada com imagem.py) ==================
+# ================== Render de título (coerente com imagem.py) ==================
 _FONT_CACHE: dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
 def _load_font(fname: str, size: int) -> ImageFont.FreeTypeFont:
     key = (fname, size)
@@ -235,7 +241,7 @@ def _render_modern_block(img, frase, *, idioma=None):
     if IMAGE_TEXT_UPPER and not is_ar: intro, punch = intro.upper(), punch.upper()
     base_scale = (W / 1080.0) * IMAGE_TEXT_SCALE * IMAGE_TEXT_SCALE_MODERN
     left_margin, right_margin, maxw = int(W*0.08), int(W*0.08), int(W*0.84)
-    y = int(H * 0.20) # começa mais alto
+    y = int(H * 0.20)
 
     if intro:
         f_small, lines1 = _best_font_and_wrap(draw, intro, _font_for_lang("Montserrat-Regular.ttf", idioma, bold=False), maxw, int(38*base_scale), int(70*base_scale), max_lines=2)
@@ -267,11 +273,11 @@ def _render_classic_serif(img, frase, *, idioma=None):
 
 def _title_overlay_png(text: str, style_id: str, idioma: str, W: int, H: int) -> str:
     img = Image.new("RGBA", (W, H), (0,0,0,0))
-    if style_id == "1": # Clássico
+    if style_id == "1": 
         final_img = _render_classic_serif(img, text, idioma=idioma)
-    else: # Moderno e outros
+    else:
         final_img = _render_modern_block(img, text, idioma=idioma)
-    out_path = os.path.join("cache", f"title_overlay_{_uuid_suffix()}.png")
+    out_path = os.path.join(CACHE_DIR, f"title_overlay_{_uuid_suffix()}.png")
     final_img.save(out_path, "PNG")
     return out_path
 
@@ -312,8 +318,8 @@ def _build_subs_drawtext_chain(
     rtl: bool = False
 ) -> str:
     """
-    Gera uma cadeia de drawtext para queimar as legendas.
-    - LTR (padrão): centraliza (x = (w-text_w)/2)
+    Gera cadeia drawtext para queimar as legendas.
+    - LTR: centraliza (x = (w-text_w)/2)
     - RTL (árabe): alinha à direita (x = w - (text_w + margin))
     """
     fs, borderw, margin = _style_fontsize_from_H(H, style_id)
@@ -321,15 +327,9 @@ def _build_subs_drawtext_chain(
     if not font_opt and REQUIRE_FONTFILE:
         raise RuntimeError("Fonte de legendas não encontrada.")
 
-    # X expr de acordo com a direção do texto
-    if rtl:
-        x_expr = f"w-(text_w+{margin})"
-    else:
-        x_expr = "(w-text_w)/2"
-
+    x_expr = f"w-(text_w+{margin})" if rtl else "(w-text_w)/2"
     y_expr = f"h-(text_h+{margin})"
 
-    # Observação: não colocamos text_shaping=1 para evitar falha em builds sem harfbuzz/fribidi
     blocks = []
     for idx, (ini, fim, txt) in enumerate(segments, start=1):
         tf = _write_textfile_for_drawtext(txt, idx)
@@ -373,15 +373,25 @@ def gerar_video(
         if _text_contains_arabic(frase_principal): lang_norm = "ar"
         style_norm = _normalize_style(video_style)
 
-        long_text = gerar_frase_tarot_longa(idioma) if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG else gerar_frase_motivacional_longa(idioma)
+        # ===== Geração da frase longa =====
+        long_text = gerar_frase_tarot_longa(idioma) if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG \
+                    else gerar_frase_motivacional_longa(idioma)
+        # >>> registra no cache por idioma (se existir)
+        if cache:
+            cache.add("used_long_phrases", long_text, lang=lang_norm)
+
+        # ===== TTS e BG =====
         voice_audio_path = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
         dur_voz = _duracao_audio_segundos(voice_audio_path)
         logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz or 0.0)
 
         if voice_audio_path:
             staged_tts = _stage_to_dir(voice_audio_path, os.path.join(AUDIO_DIR, "tts"), "tts")
-            if os.path.basename(os.path.dirname(voice_audio_path)).lower() in ("audios_tts", "tts"): extra_to_cleanup.append(voice_audio_path)
+            # evita deletar arquivos que já estão dentro de audios/tts
+            if os.path.basename(os.path.dirname(voice_audio_path)).lower() not in ("audios_tts", "tts"):
+                extra_to_cleanup.append(voice_audio_path)
             voice_audio_path = staged_tts
+
         background_audio_path = obter_caminho_audio(idioma=lang_norm)
         has_voice, has_bg = bool(voice_audio_path), bool(background_audio_path)
 
@@ -394,13 +404,14 @@ def gerar_video(
         trans_dur = max(0.45, min(0.85, (total_video / n_slides) * 0.135)) if n_slides > 1 else 0.0
         per_slide = (total_video + (n_slides - 1) * trans_dur) / n_slides if n_slides > 0 else 0
 
+        # ===== INPUTS =====
         cmd_base = [_ffmpeg_or_die(), "-y", "-loglevel", "error", "-stats"]
         staged_inputs = [_stage_to_dir(p, IMAGES_DIR, "stage") for p in slides_validos]
         staged_images.extend(staged_inputs)
-
         for sp in staged_inputs:
             cmd_base += ["-framerate", str(FPS_OUT), "-loop", "1", "-i", sp]
         
+        # Overlay de título (opcional)
         use_title = bool(frase_principal and frase_principal.strip())
         if use_title:
             logger.info("✍️ Gerando overlay de título (PNG transparente)...")
@@ -410,6 +421,7 @@ def gerar_video(
         if has_voice: cmd_base += ["-i", voice_audio_path]
         if has_bg:    cmd_base += ["-i", background_audio_path]
 
+        # ===== FILTER COMPLEX (vídeo) =====
         parts: List[str] = []
         for i in range(n_slides):
             parts.append(_build_slide_branch(i, W, H, motion, per_slide))
@@ -435,7 +447,6 @@ def gerar_video(
         if legendas and segments:
             font_path_subs = _get_subtitle_font_path(lang_norm)
             logger.info(f"🔤 Fonte das Legendas: {os.path.basename(font_path_subs) if font_path_subs else 'Padrão'}")
-            # >>> Alinhamento RTL quando árabe
             subs_chain = _build_subs_drawtext_chain(
                 H, style_norm, segments, font_path_subs,
                 rtl=(lang_norm == "ar")
@@ -444,9 +455,9 @@ def gerar_video(
         else:
             parts.append(f"{current_v}null[vout]")
 
+        # ===== Áudio =====
         fade_in_dur, fade_out_dur = 0.30, 0.60
         fade_out_start = max(0.0, total_video - fade_out_dur)
-        
         audio_inputs_offset = n_slides + (1 if use_title and staged_title_overlay else 0)
         
         if has_voice and has_bg:
@@ -469,39 +480,47 @@ def gerar_video(
             parts.append(f"[amono]atrim=end={total_video:.3f},asetpts=PTS-STARTPTS,afade=in:st=0:d={fade_in_dur:.2f},afade=out:st={fade_out_start:.2f}:d={fade_out_dur:.2f}[aout]")
         else:
             parts.append(f"anullsrc=channel_layout=stereo:sample_rate={AUDIO_SR}:d={total_video:.3f}[aout]")
-        
-        filter_complex = ";".join(parts)
-        fc_path = os.path.join(CACHE_DIR, "last_filter.txt")
-        with open(fc_path, "w", encoding="utf-8") as f: f.write(filter_complex)
 
+        filter_complex = ";".join(parts)
+        with open(os.path.join(CACHE_DIR, "last_filter.txt"), "w", encoding="utf-8") as f:
+            f.write(filter_complex)
+
+        # ===== OUTPUT =====
         common_out = [
-            "-r", str(FPS_OUT), "-vsync", "cfr", "-pix_fmt", "yuv420p", "-c:v", "libx264",
-            "-preset", "superfast", "-tune", "stillimage", "-b:v", BR_V, "-maxrate", BR_V,
-            "-bufsize", "6M", "-profile:v", "high", "-level", LEVEL,
-            "-c:a", "aac", "-b:a", BR_A, "-ar", str(AUDIO_SR), "-ac", "2",
-            "-movflags", "+faststart+use_metadata_tags",
-            "-x264-params", f"keyint={FPS_OUT*2}:min-keyint={FPS_OUT*2}:scenecut=0",
-            "-map_metadata", "-1", "-threads", str(max(1, os.cpu_count()//2)),
+            "-map", "[vout]", "-map", "[aout]",
+            "-shortest",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-profile:v", "high", "-level", PRESETS[preset]["level"],
+            "-b:v", PRESETS[preset]["br_v"],
+            "-c:a", "aac", "-b:a", PRESETS[preset]["br_a"],
+            "-r", str(FPS_OUT),
+            "-movflags", "+faststart"
         ]
 
-        cmd = list(cmd_base) + ["-filter_complex_script", fc_path, "-map", "[vout]", "-map", "[aout]", "-t", f"{total_video:.3f}"] + common_out + [saida_path]
-        
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            logger.warning("⚠️  -filter_complex_script falhou (%s). Tentando fallback com -filter_complex…", e)
-            cmd_fb = list(cmd_base) + ["-filter_complex", filter_complex, "-map", "[vout]", "-map", "[aout]", "-t", f"{total_video:.3f}"] + common_out + [saida_path]
-            subprocess.run(cmd_fb, check=True)
+        cmd = cmd_base + ["-filter_complex", filter_complex] + common_out + [saida_path]
+        logger.info("🎬 Gerando vídeo com ffmpeg…")
+        subprocess.check_call(cmd)
 
-        logger.info("✅ Vídeo salvo: %s", saida_path)
+        logger.info("✅ Vídeo gerado: %s", saida_path)
+        return True
 
+    except subprocess.CalledProcessError as e:
+        logger.error("❌ ffmpeg falhou (%s)", e)
+        return False
+    except Exception as e:
+        logger.error("❌ Erro na geração do vídeo: %s", e)
+        return False
     finally:
-        for fp in staged_images + extra_to_cleanup:
-            try: os.remove(fp)
+        # limpeza
+        for p in (staged_images or []):
+            try: os.remove(p)
             except Exception: pass
-        if staged_tts:
+        if staged_tts and os.path.exists(staged_tts):
             try: os.remove(staged_tts)
             except Exception: pass
-        if staged_title_overlay:
+        if staged_title_overlay and os.path.exists(staged_title_overlay):
             try: os.remove(staged_title_overlay)
+            except Exception: pass
+        for p in (extra_to_cleanup or []):
+            try: os.remove(p)
             except Exception: pass
