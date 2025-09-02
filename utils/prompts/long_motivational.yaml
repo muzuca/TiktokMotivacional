@@ -1,7 +1,6 @@
-# prompts/long_motivational.yaml (Copie e cole para substituir o seu)
 template: >
   Você é um roteirista sênior. Sua tarefa é criar uma narração para um vídeo de TikTok baseado no dossiê criativo abaixo.
-  A narração deve ser poética, encorajadora e incorporar a persona, o tema e a metáfora fornecidos.
+  A narração deve ser inspiradora e incorporar a persona, o tema e a metáfora fornecidos.
 
   DOSSIÊ CRIATIVO DO DIA:
   ---
@@ -9,10 +8,13 @@ template: >
   ---
 
   TAREFA:
-  Crie 2 narrações longas, entre 75 e 150 palavras, baseadas estritamente no dossiê acima.
+  Crie uma narrações longa, baseadas estritamente no dossiê acima.
+  A narração deve ter aproximadamente 45 segundos de fala. 
+  Seja detalhado e profundo na mensagem para atingir este tamanho.
   Gere as frases no idioma **{target_lang_name}**.
 
-  HISTÓRICO DE FRASES JÁ USADAS (EVITE TEMAS E ESTRUTURAS SIMILARES):
+  HISTÓRICO DE NARRAÇÕES JÁ USADAS PARA EVITAR:
   {historico_frases}
 
-  Retorne APENAS um array JSON de strings.
+  **Retorne APENAS um array JSON contendo a string da narração.**
+  **Exemplo de formato: ["primeira narração longa..."]**
