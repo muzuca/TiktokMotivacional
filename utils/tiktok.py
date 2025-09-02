@@ -10,6 +10,12 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException,
 from socket import error as SocketError  # Para ConnectionResetError
 import logging
 
+# >>> cache por idioma
+try:
+    from cache_store import cache
+except Exception:
+    cache = None
+
 # Configuração do logging com timestamps
 logging.basicConfig(
     level=logging.INFO,
@@ -48,28 +54,22 @@ def _dedupe_hashtags_in_desc(desc: str, max_n: Optional[int] = None) -> str:
     if not desc:
         return ""
 
-    # captura todas as hashtags (com #)
     tags_encontradas = ["#" + m.group(1) for m in _HASHTAG_RE.finditer(desc)]
 
-    # dedup (case-insensitive) preservando ordem
     seen = set()
     ordered = []
     for t in tags_encontradas:
         k = t.lower()
         if k not in seen and len(t) > 1:
-            seen.add(k)
-            ordered.append(t)
+            seen.add(k); ordered.append(t)
 
     if isinstance(max_n, int) and max_n >= 0:
         ordered = ordered[:max_n]
 
-    # remove do texto base e recoloca no final
     base = _HASHTAG_RE.sub("", desc)
     base = re.sub(r"\s{2,}", " ", base).strip()
 
     return (base + " " + " ".join(ordered)).strip() if ordered else base
-
-# ------------------------------------------------------
 
 def obter_ultimo_video(pasta=PASTA_VIDEOS):
     """Encontra o vídeo mais recente na pasta de vídeos (baseado na data de modificação)."""
@@ -104,7 +104,6 @@ def postar_no_tiktok_e_renomear(
     if not video_path:
         return False
 
-    # Evita caso "0 bytes" local
     try:
         if os.path.getsize(video_path) <= 0:
             logger.error("❌ Vídeo está com 0 bytes localmente: %s", video_path)
@@ -126,7 +125,7 @@ def postar_no_tiktok_e_renomear(
         return False
 
     try:
-        # Descrição base: vem do main já com hashtags do Gemini
+        # Descrição base
         if descricao_personalizada:
             base_desc = descricao_personalizada
         else:
@@ -144,8 +143,12 @@ def postar_no_tiktok_e_renomear(
                 logger.debug("🧹 Limpando markdown da descrição: '%s' -> '%s'", base_desc, cleaned)
             base_desc = cleaned
 
-        # >>> Sem hashtags fixas. Apenas deduplica as que já vieram (ex.: do Gemini via main.py)
-        description = _dedupe_hashtags_in_desc(base_desc)  # se quiser limitar: max_n=3
+        # Dedup de hashtags, mantendo só as que já vieram
+        description = _dedupe_hashtags_in_desc(base_desc)
+
+        # >>> grava no cache por idioma (para o Gemini não repetir)
+        if cache:
+            cache.add("used_phrases", description, lang=idioma_norm)
 
         schedule = None
         if agendar:
@@ -154,9 +157,8 @@ def postar_no_tiktok_e_renomear(
 
         logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
         logger.info("📝 Descrição final: %s", description)
-        time.sleep(1.5)  # pequeno delay
+        time.sleep(1.5)
 
-        # ========== EXECUTA UPLOAD ==========
         upload_video(
             filename=video_path,
             description=description,
@@ -164,31 +166,25 @@ def postar_no_tiktok_e_renomear(
             comment=True,
             stitch=True,
             duet=True,
-            headless=True,         # troque para True se quiser rodar invisível
+            headless=True,
             schedule=schedule,
-            idioma=idioma_norm      # ex.: 'ar' -> ar-EG na lib
+            idioma=idioma_norm
         )
         ok = True
 
-        # ========== LIMPEZA ==========
+        # Limpeza
         if imagem_base and os.path.exists(imagem_base):
-            os.remove(imagem_base)
-            logger.info("🗑️ Imagem base removida: %s", imagem_base)
+            os.remove(imagem_base); logger.info("🗑️ Imagem base removida: %s", imagem_base)
         if imagem_final and os.path.exists(imagem_final):
-            os.remove(imagem_final)
-            logger.info("🗑️ Imagem final removida: %s", imagem_final)
+            os.remove(imagem_final); logger.info("🗑️ Imagem final removida: %s", imagem_final)
         if video_final and os.path.exists(video_final):
-            os.remove(video_final)
-            logger.info("🗑️ Vídeo original removido: %s", video_final)
+            os.remove(video_final); logger.info("🗑️ Vídeo original removido: %s", video_final)
 
         # Remove o áudio mais recente (se existir)
         try:
             audio_files = [f for f in os.listdir(PASTA_AUDIOS) if f.endswith(".mp3")]
             if audio_files:
-                audio_to_remove = max(
-                    (os.path.join(PASTA_AUDIOS, f) for f in audio_files),
-                    key=os.path.getmtime
-                )
+                audio_to_remove = max((os.path.join(PASTA_AUDIOS, f) for f in audio_files), key=os.path.getmtime)
                 os.remove(audio_to_remove)
                 logger.info("🗑️ Áudio removido: %s", audio_to_remove)
         except Exception:
@@ -215,15 +211,13 @@ def postar_no_tiktok_e_renomear(
         logger.info("⏳ Aguardando 5 segundos antes de finalizar...")
         time.sleep(5)
 
-# Removida a leitura de variáveis HASHTAGS_* e a concatenação de hashtags fixas.
-
 _MD_PATTERNS = (
-    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),   # **bold**
-    (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),   # *italic*
-    (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),   # __underline__
-    (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),   # _italic_
-    (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),   # ~~strike~~
-    (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),   # `code`
+    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
+    (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),
+    (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),
+    (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),
+    (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),
+    (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),
 )
 
 def _strip_markdown(texto: str) -> str:
@@ -231,8 +225,6 @@ def _strip_markdown(texto: str) -> str:
     s = (texto or "")
     for pat, rep in _MD_PATTERNS:
         s = pat.sub(rep, s)
-    # Normaliza aspas “ ” ’
     s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
-    # Colapsa espaços múltiplos
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()

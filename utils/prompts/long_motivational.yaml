@@ -8,7 +8,7 @@ template: >
   ---
 
   TAREFA:
-  Crie uma narração longa, baseada estritamente no dossiê acima.
+  Crie uma narração longa, baseada estritamente no dossiê acima, mas não mencione a persona na narração.
   A narração deve ter aproximadamente 30 segundos de fala. 
   Seja detalhado e profundo na mensagem para atingir este tamanho.
   Gere as frases no idioma **{target_lang_name}**.
@@ -16,5 +16,5 @@ template: >
   HISTÓRICO DE NARRAÇÕES JÁ USADAS PARA EVITAR:
   {historico_frases}
 
-  **Retorne APENAS um array JSON contendo a string da narração.**
+  **Retorne APENAS um array JSON contendo a string da narração, sem uso de parenteses ou marcações, só o que deve ser narrado.**
   **Exemplo de formato: ["primeira narração longa..."]**

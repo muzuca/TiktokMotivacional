@@ -1,4 +1,4 @@
-# utils/frase.py
+# utils/frase.py — atualizado (separa cache por idioma + migração automática)
 import os
 import re
 import unicodedata
@@ -43,12 +43,120 @@ LOG_GEMINI_PROMPTS = os.getenv("LOG_GEMINI_PROMPTS", "True").lower() in ("true",
 CACHE_DIR = "cache"
 RESOURCES_DIR = "resources"
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Nomes legados (mistos) — mantidos para migração automática
 PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_phrases.json")
 LONG_PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_long_phrases.json")
 PEXELS_PROMPTS_CACHE_FILE = os.path.join(CACHE_DIR, "used_pexels_prompts.json")
+
 FALLBACK_PHRASES_FILE = os.path.join(RESOURCES_DIR, "fallback_phrases.json")
 _FALLBACK_PHRASES_CACHE: Optional[Dict] = None
 
+# --------------------- NOVO: helpers de cache por idioma --------------------- #
+def _idioma_norm(idioma: Optional[str]) -> str:
+    """Normaliza 'idioma' para 'en' | 'pt' | 'ar'."""
+    s = (idioma or "pt").lower()
+    if s.startswith("ar"): return "ar"
+    if s.startswith("pt"): return "pt"
+    return "en"
+
+def _cache_file(base_name: str, lang: str) -> str:
+    """
+    Retorna o caminho do cache por idioma:
+      base_name: 'used_phrases' | 'used_long_phrases' | 'used_pexels_prompts'
+    """
+    return os.path.join(CACHE_DIR, f"{base_name}_{lang}.json")
+
+def _guess_lang(s: str) -> str:
+    """Heurística simples para dividir arquivos legados por idioma."""
+    t = (s or "").strip()
+    if re.search(r"[\u0600-\u06FF]", t):  # caracteres árabes
+        return "ar"
+    if re.search(r"[áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ]", t) or any(
+        w in t.lower() for w in (" você", " voce", " que ", " de ", " é ", " pra ", " para ")
+    ):
+        return "pt"
+    return "en"
+
+def _read_legacy_list(path: str) -> List[str]:
+    if not os.path.exists(path): return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return [x for x in data if isinstance(x, str)]
+    except Exception:
+        pass
+    return []
+
+def _merge_save_list(target_path: str, items: List[str]) -> None:
+    try:
+        existing: List[str] = []
+        if os.path.exists(target_path):
+            with open(target_path, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+                if isinstance(cur, list):
+                    existing = [x for x in cur if isinstance(x, str)]
+        merged = sorted(list({*existing, *items}))
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Não consegui mesclar/salvar %s: %s", os.path.basename(target_path), e)
+
+def _migrate_legacy_once() -> None:
+    """Se existirem arquivos legados 'mistos', divide por idioma e renomeia como .legacy."""
+    # Frases curtas
+    legacy = _read_legacy_list(PHRASES_CACHE_FILE)
+    if legacy:
+        buckets = {"en": [], "pt": [], "ar": []}
+        for line in legacy:
+            buckets[_guess_lang(line)].append(line)
+        for lang, items in buckets.items():
+            if items:
+                _merge_save_list(_cache_file("used_phrases", lang), items)
+        try:
+            os.replace(PHRASES_CACHE_FILE, PHRASES_CACHE_FILE + ".legacy")
+            logger.info("🗂️ Migrei used_phrases.json -> *_<lang>.json (%s)",
+                        ", ".join(f"{k}:{len(v)}" for k, v in buckets.items()))
+        except Exception:
+            pass
+
+    # Frases longas
+    legacy = _read_legacy_list(LONG_PHRASES_CACHE_FILE)
+    if legacy:
+        buckets = {"en": [], "pt": [], "ar": []}
+        for line in legacy:
+            buckets[_guess_lang(line)].append(line)
+        for lang, items in buckets.items():
+            if items:
+                _merge_save_list(_cache_file("used_long_phrases", lang), items)
+        try:
+            os.replace(LONG_PHRASES_CACHE_FILE, LONG_PHRASES_CACHE_FILE + ".legacy")
+            logger.info("🗂️ Migrei used_long_phrases.json -> *_<lang>.json (%s)",
+                        ", ".join(f"{k}:{len(v)}" for k, v in buckets.items()))
+        except Exception:
+            pass
+
+    # Prompts do Pexels
+    legacy = _read_legacy_list(PEXELS_PROMPTS_CACHE_FILE)
+    if legacy:
+        buckets = {"en": [], "pt": [], "ar": []}
+        for line in legacy:
+            buckets[_guess_lang(line)].append(line)
+        for lang, items in buckets.items():
+            if items:
+                _merge_save_list(_cache_file("used_pexels_prompts", lang), items)
+        try:
+            os.replace(PEXELS_PROMPTS_CACHE_FILE, PEXELS_PROMPTS_CACHE_FILE + ".legacy")
+            logger.info("🗂️ Migrei used_pexels_prompts.json -> *_<lang>.json (%s)",
+                        ", ".join(f"{k}:{len(v)}" for k, v in buckets.items()))
+        except Exception:
+            pass
+
+# roda migração no import (barato e idempotente)
+_migrate_legacy_once()
+# ---------------------------------------------------------------------------- #
 
 def load_used_phrases(cache_file: str) -> List[str]:
     """Carrega uma lista de frases de um arquivo JSON."""
@@ -59,7 +167,6 @@ def load_used_phrases(cache_file: str) -> List[str]:
         except Exception:
             return []
     return []
-
 
 def save_used_phrases(used_phrases: List[str], cache_file: str) -> None:
     """Salva uma lista de frases em um arquivo JSON, removendo duplicatas."""
@@ -80,12 +187,6 @@ IMAGE_EMPHASIS_ONLY_MARKUP = os.getenv("IMAGE_EMPHASIS_ONLY_MARKUP", "True").low
 IMAGE_FORCE_EMPHASIS = os.getenv("IMAGE_FORCE_EMPHASIS", "False").lower() in ("true", "1", "yes")
 IMAGE_EMPHASIS_LAST_WORDS = int(os.getenv("IMAGE_EMPHASIS_LAST_WORDS", "1"))
 _PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca","coragem", "propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
-
-def _idioma_norm(idioma: Optional[str]) -> str:
-    s = (idioma or "pt").lower()
-    if s.startswith("ar"): return "ar"
-    if s.startswith("pt"): return "pt"
-    return "en"
 
 def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
     segs = re.findall(r"\*\*(.+?)\*\*", s, flags=re.S)
@@ -138,7 +239,6 @@ def quebrar_em_duas_linhas(frase: str) -> str:
 # -----------------------------------------------------------------------------#
 # Helpers do Módulo
 # -----------------------------------------------------------------------------#
-
 def _load_prompt_template(template_name: str) -> str:
     if not _HAVE_YAML:
         raise ImportError("PyYAML é necessário. Instale com: pip install PyYAML")
@@ -193,26 +293,24 @@ def _ask_gemini(prompt: str, response_type: type = list, temperature: float = 1.
             raw = (getattr(resp, "text", "") or "").strip()
             log_func("\n--------------- RESPOSTA RECEBIDA DO GEMINI ----------------\n%s\n----------------------------------------------------------", raw)
 
-            # --- MUDANÇA AQUI: Lógica de parse mais robusta ---
+            # Parse robusto (corrige respostas em string/array malformadas)
             data = None
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
-                # Tenta corrigir JSON malformado que às vezes vem dentro de uma lista de strings
                 if raw.startswith('["') and raw.endswith('"]'):
                     try:
                         potential_json_str = json.loads(raw)[0]
                         data = json.loads(potential_json_str)
                     except (IndexError, json.JSONDecodeError):
-                        raise e # Re-levanta o erro original se a correção falhar
+                        raise e
                 else:
-                    raise e # Re-levanta o erro original
+                    raise e
 
             if isinstance(data, response_type):
                 if response_type == list:
                     return [_clean_line(it) for it in data if isinstance(it, str)]
-                return data # Retorna o dicionário
-            # Se o tipo não bate, mas podemos extrair o que queremos, fazemos isso
+                return data
             elif response_type == list and isinstance(data, dict):
                  logger.debug("Resposta foi DICT, mas esperava LIST. Extraindo valores.")
                  return [_clean_line(v) for v in data.values() if isinstance(v, str)]
@@ -240,6 +338,7 @@ def gerar_slug(frase: str) -> str:
     frase_limpa = re.sub(r'[\*\.:\?!,"\'`´’]', '', frase.lower())
     return "_".join(frase_limpa.split()[:6])[:40]
 
+# -------------------------- CONTEXTO DINÂMICO (SEU) -------------------------- #
 def _gerar_contexto_dinamico(content_mode: str, lang: str) -> str:
     logger.info("Gerando contexto dinâmico para a narração...")
     try:
@@ -262,11 +361,17 @@ def _gerar_contexto_dinamico(content_mode: str, lang: str) -> str:
         logger.error("Falha ao gerar contexto dinâmico: %s", e)
     return "PERSONA: Um narrador sábio.\nTEMA: Perseverança.\nMETÁFORA: Uma luz na escuridão."
 
+# -----------------------------------------------------------------------------#
+# Histórico por idioma
+# -----------------------------------------------------------------------------#
 def _get_history_for_prompt(cache_file: str, limit: int = 15) -> str:
     used_phrases = load_used_phrases(cache_file)
     if not used_phrases: return ""
     return "\n".join([f'- "{phrase}"' for phrase in used_phrases[-limit:]])
 
+# -----------------------------------------------------------------------------#
+# Público
+# -----------------------------------------------------------------------------#
 def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3) -> List[str]:
     lang = _idioma_norm(idioma)
     try:
@@ -296,23 +401,25 @@ def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "
     
     template_name = "image_prompts_pexels" if pexels_mode else "image_prompts"
     try:
-        cache_file = PEXELS_PROMPTS_CACHE_FILE if pexels_mode else ""
+        lang = _idioma_norm(idioma)
+        cache_file = _cache_file("used_pexels_prompts", lang) if pexels_mode else ""
         used_prompts = load_used_phrases(cache_file) if pexels_mode else []
-        historico_prompts = _get_history_for_prompt(cache_file) if pexels_mode else ""
+        historico_prompts = _get_history_for_prompt(cache_file, limit=20) if pexels_mode else ""
         
         template = _load_prompt_template(template_name)
         prompt_text = template.format(quantidade=quantidade, tema=tema, historico_prompts=historico_prompts)
         descricoes = _ask_gemini(prompt_text, response_type=list, temperature=1.3, tries=3)
         
         if descricoes:
-            used_prompts_set = {p.strip().lower() for p in used_prompts}
-            novos_prompts = [p for p in descricoes if p.strip().lower() not in used_prompts_set]
+            used_set = {p.strip().lower() for p in used_prompts}
+            novos_prompts = [p for p in descricoes if p.strip().lower() not in used_set]
             final_prompts = novos_prompts[:quantidade]
             if len(final_prompts) < quantidade:
                 final_prompts.extend([f"{tema} cinematic variation {i+1}" for i in range(quantidade - len(final_prompts))])
             
             if pexels_mode:
                 save_used_phrases(used_prompts + final_prompts, cache_file)
+                logger.info("🗂️ Cache Pexels (%s) atualizado com %d novos termos.", os.path.basename(cache_file), len(final_prompts))
             
             logger.info(f"✅ {len(final_prompts)} prompts de imagem ({'Pexels' if pexels_mode else 'IA'}) gerados.")
             return final_prompts
@@ -323,35 +430,38 @@ def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "
 
 def gerar_frase_motivacional(idioma: str = "en") -> str:
     lang = _idioma_norm(idioma)
-    prompt_text = _load_prompt_template("short_motivational").format(target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), historico_frases=_get_history_for_prompt(PHRASES_CACHE_FILE))
-    used_phrases = load_used_phrases(PHRASES_CACHE_FILE)
-    used_phrases_set = {p.strip() for p in used_phrases}
+    cache_file = _cache_file("used_phrases", lang)
+    prompt_text = _load_prompt_template("short_motivational").format(
+        target_lang_name=LANG_NAME_MAP.get(lang, "inglês"),
+        historico_frases=_get_history_for_prompt(cache_file)
+    )
+    used_phrases = load_used_phrases(cache_file)
+    used_set = {p.strip() for p in used_phrases}
+
+    logger.info("🗂️ Cache de frases curtas em uso: %s", os.path.basename(cache_file))
+
     for _ in range(3):
         phrases = _ask_gemini(prompt_text, response_type=list, temperature=1.2, tries=2)
-        valid = [p for p in phrases if 6 <= _count_words_no_markup(p) <= 12 and p.strip() not in used_phrases_set]
+        valid = [p for p in phrases if 6 <= _count_words_no_markup(p) <= 12 and p.strip() not in used_set]
         if valid:
             chosen = _ensure_single_emphasis(random.choice(valid), lang)
             used_phrases.append(chosen)
-            save_used_phrases(used_phrases, PHRASES_CACHE_FILE)
+            save_used_phrases(used_phrases, cache_file)
             return chosen
     return _get_fallback_phrase("motivacional_curta", lang)
 
 def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[str]:
     used_phrases = load_used_phrases(cache_file)
-    used_phrases_set = {p.strip().lower() for p in used_phrases}
+    used_set = {p.strip().lower() for p in used_phrases}
     
-    # Pede uma lista, mas está preparado para receber um dicionário
     response_data = _ask_gemini(prompt_text, response_type=list, temperature=1.2, tries=2)
-    
-    # A função _ask_gemini já foi melhorada para extrair frases de um dict se necessário
     phrases = response_data if isinstance(response_data, list) else []
-
     if not phrases: return None
 
     phrases = [_clean_line(p) for p in phrases]
     
     ideal_min, ideal_max = 70, 160
-    valid = [p for p in phrases if ideal_min <= _count_words_no_markup(p) <= ideal_max and p.strip().lower() not in used_phrases_set]
+    valid = [p for p in phrases if ideal_min <= _count_words_no_markup(p) <= ideal_max and p.strip().lower() not in used_set]
     if valid:
         chosen = random.choice(valid)
         used_phrases.append(chosen); save_used_phrases(used_phrases, cache_file)
@@ -360,7 +470,7 @@ def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[
 
     logger.warning("Nenhuma frase no intervalo ideal (%d-%d). Verificando em intervalo flexível...", ideal_min, ideal_max)
     flex_min, flex_max = 40, 200
-    valid_flex = [p for p in phrases if flex_min <= _count_words_no_markup(p) <= flex_max and p.strip().lower() not in used_phrases_set]
+    valid_flex = [p for p in phrases if flex_min <= _count_words_no_markup(p) <= flex_max and p.strip().lower() not in used_set]
     if valid_flex:
         chosen = max(valid_flex, key=_count_words_no_markup)
         used_phrases.append(chosen); save_used_phrases(used_phrases, cache_file)
@@ -371,17 +481,20 @@ def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[
 
 def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
     lang = _idioma_norm(idioma)
+    cache_long = _cache_file("used_long_phrases", lang)
+    logger.info("🗂️ Cache de frases longas em uso: %s", os.path.basename(cache_long))
+
     for creative_attempt in range(1, 4):
         logger.info(f"Ciclo Criativo [{creative_attempt}/3]: Gerando novo contexto...")
         dynamic_context = _gerar_contexto_dinamico("motivacional", lang)
         prompt_text = _load_prompt_template("long_motivational").format(
             dynamic_context=dynamic_context,
-            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), 
-            historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE)
+            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"),
+            historico_frases=_get_history_for_prompt(cache_long)
         )
-        chosen = _gerar_e_validar_frase_longa(prompt_text, LONG_PHRASES_CACHE_FILE)
+        chosen = _gerar_e_validar_frase_longa(prompt_text, cache_long)
         if chosen: return chosen
-        logger.warning(f"Contexto não resultou em frase válida. Tentando novo ciclo...")
+        logger.warning("Contexto não resultou em frase válida. Tentando novo ciclo...")
         if creative_attempt < 3: time.sleep(1)
     
     logger.error("Falha em gerar frase longa após 3 ciclos. Usando fallback.")
@@ -392,31 +505,41 @@ def gerar_prompt_tarot(idioma: str = "en") -> str:
 
 def gerar_frase_tarot_curta(idioma: str = "en") -> str:
     lang = _idioma_norm(idioma)
-    prompt_text = _load_prompt_template("short_tarot").format(target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), historico_frases=_get_history_for_prompt(PHRASES_CACHE_FILE))
-    used_phrases = load_used_phrases(PHRASES_CACHE_FILE)
-    used_phrases_set = {p.strip() for p in used_phrases}
+    cache_file = _cache_file("used_phrases", lang)
+    prompt_text = _load_prompt_template("short_tarot").format(
+        target_lang_name=LANG_NAME_MAP.get(lang, "inglês"),
+        historico_frases=_get_history_for_prompt(cache_file)
+    )
+    used = load_used_phrases(cache_file)
+    used_set = {p.strip() for p in used}
+
+    logger.info("🗂️ Cache de tarot curto em uso: %s", os.path.basename(cache_file))
+
     for _ in range(3):
         phrases = _ask_gemini(prompt_text, response_type=list, temperature=1.2)
-        valid = [p for p in phrases if p.strip() not in used_phrases_set]
+        valid = [p for p in phrases if p.strip() not in used_set]
         if valid:
             chosen = _ensure_single_emphasis(random.choice(valid), lang)
-            used_phrases.append(chosen); save_used_phrases(used_phrases, PHRASES_CACHE_FILE)
+            used.append(chosen); save_used_phrases(used, cache_file)
             return chosen
     return _get_fallback_phrase("tarot_curta", lang)
 
 def gerar_frase_tarot_longa(idioma: str = "en") -> str:
     lang = _idioma_norm(idioma)
+    cache_long = _cache_file("used_long_phrases", lang)
+    logger.info("🗂️ Cache de tarot longo em uso: %s", os.path.basename(cache_long))
+
     for creative_attempt in range(1, 4):
         logger.info(f"Ciclo Criativo [{creative_attempt}/3]: Gerando novo contexto...")
         dynamic_context = _gerar_contexto_dinamico("tarot", lang)
         prompt_text = _load_prompt_template("long_tarot").format(
             dynamic_context=dynamic_context,
-            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), 
-            historico_frases=_get_history_for_prompt(LONG_PHRASES_CACHE_FILE)
+            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"),
+            historico_frases=_get_history_for_prompt(cache_long)
         )
-        chosen = _gerar_e_validar_frase_longa(prompt_text, LONG_PHRASES_CACHE_FILE)
+        chosen = _gerar_e_validar_frase_longa(prompt_text, cache_long)
         if chosen: return chosen
-        logger.warning(f"Contexto não resultou em frase válida. Tentando novo ciclo...")
+        logger.warning("Contexto não resultou em frase válida. Tentando novo ciclo...")
         if creative_attempt < 3: time.sleep(1)
 
     logger.error("Falha em gerar frase longa após 3 ciclos. Usando fallback.")

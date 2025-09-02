@@ -17,6 +17,17 @@ except Exception:
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 from dotenv import load_dotenv
 
+# >>> cache por idioma
+try:
+    from cache_store import cache, _norm_lang as _norm_lang_cache
+except Exception:
+    cache = None
+    def _norm_lang_cache(x: Optional[str]) -> str:
+        s = (x or "").lower()
+        if s.startswith("pt"): return "pt"
+        if s.startswith("ar"): return "ar"
+        return "en"
+
 try:
     from utils.chatgpt_image import gerar_imagem_chatgpt
     _HAVE_CHATGPT_AUTOMATION = True
@@ -33,12 +44,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------#
-# Helpers de Texto (Duplicados para independência)
+# Helpers de Texto (mantidos e compatíveis com seu fluxo)
 # -----------------------------------------------------------------------------#
 IMAGE_EMPHASIS_ONLY_MARKUP = os.getenv("IMAGE_EMPHASIS_ONLY_MARKUP", "True").lower() in ("true", "1", "yes")
 IMAGE_FORCE_EMPHASIS = os.getenv("IMAGE_FORCE_EMPHASIS", "False").lower() in ("true", "1", "yes")
 IMAGE_EMPHASIS_LAST_WORDS = int(os.getenv("IMAGE_EMPHASIS_LAST_WORDS", "1"))
-_PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca","coragem", "propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
+_PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca","coragem","propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
 
 def _idioma_norm(idioma: Optional[str]) -> str:
     s = (idioma or "pt").lower()
@@ -85,7 +96,6 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
         hl = _pick_highlights(punch)
     else:
         hl = []
-        
     return intro, punch, hl
 
 def quebrar_em_duas_linhas(frase: str) -> str:
@@ -95,17 +105,16 @@ def quebrar_em_duas_linhas(frase: str) -> str:
     return f'{" ".join(palavras[:ponto_de_quebra])}\n{" ".join(palavras[ponto_de_quebra:])}'
 
 # -----------------------------------------------------------------------------#
-# Configuração do Módulo
+# Config do módulo / ENV
 # -----------------------------------------------------------------------------#
 IMAGE_MODE = os.getenv("IMAGE_MODE", "pexels").lower()
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
-CACHE_DIR = "cache"
+CACHE_DIR = os.getenv("CACHE_DIR", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
-IMAGES_CACHE_FILE = os.path.join(CACHE_DIR, "used_images.json")
 
 FONTS_DIR = "fonts"
-IMAGENS_DIR = "imagens"
+IMAGENS_DIR = os.getenv("IMAGES_DIR", "imagens")
 os.makedirs(IMAGENS_DIR, exist_ok=True)
 
 USER_AGENT = "TiktokMotivacional/1.0 (+https://local)"
@@ -127,10 +136,8 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     v = v.strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
+    if v in ("1", "true", "yes", "on"): return True
+    if v in ("0", "false", "no", "off"): return False
     return default
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -174,6 +181,9 @@ MEDIA_PROXY_MODE = os.getenv("MEDIA_PROXY_MODE", "never").strip().lower()
 PROXY_AUTO_BY_LANG = os.getenv("PROXY_AUTO_BY_LANG", "1").strip().lower() not in ("0", "false", "no")
 DEFAULT_PROXY_REGION = (os.getenv("DEFAULT_PROXY_REGION", "") or "").upper() or None
 
+# -----------------------------------------------------------------------------#
+# Sessões HTTP + Proxy
+# -----------------------------------------------------------------------------#
 def _proxy_url_from_env(prefix: str) -> Optional[str]:
     host = os.getenv(f"{prefix}_HOST", "").strip()
     port = os.getenv(f"{prefix}_PORT", "").strip()
@@ -225,33 +235,6 @@ def _get_session(region: Optional[str]) -> requests.Session:
     if key not in _SESSIONS:
         _SESSIONS[key] = _make_session(region)
     return _SESSIONS[key]
-
-def load_used_images():
-    if os.path.exists(IMAGES_CACHE_FILE):
-        try:
-            with open(IMAGES_CACHE_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
-
-def save_used_images(s):
-    with open(IMAGES_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(s), f)
-
-def _slug(s: str, maxlen: int = 28) -> str:
-    s = s.lower().strip()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s[:maxlen] or "img"
-
-def gerar_imagem_dalle(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None):
-    if not _HAVE_CHATGPT_AUTOMATION:
-        raise ImportError("'gerar_imagem_chatgpt' não importada.")
-    cookies_filename = os.getenv("COOKIES_CHATGPT_FILENAME", "cookies_chatgpt.txt")
-    if not gerar_imagem_chatgpt(prompt=prompt, cookies_path=cookies_filename, arquivo_saida=arquivo_saida):
-        raise RuntimeError("Automação do ChatGPT falhou ao gerar imagem.")
-    logger.info("✅ Imagem DALL-E/ChatGPT gerada via automação.")
 
 def _get_media_session(idioma: Optional[str]) -> requests.Session:
     region_candidato = _pick_proxy_region(None, idioma)
@@ -339,27 +322,19 @@ def _draw_text_with_stroke(draw, xy, text, font, fill, stroke_fill, stroke_w):
             draw.text((x+dx, y+dy), text, font=font, fill=stroke_fill)
     draw.text((x, y), text, font=font, fill=fill)
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# RTL-AWARE: desenha LTR (padrão) ou RTL (árabe) token a token.
+# ==================== RTL-aware: desenho token a token =======================
 def _draw_line_colored(
     draw, x, y, line_text, font, highlight_set,
     fill="white", hl_fill=(243, 179, 74),
     style=None, stroke_w=None, rtl: bool=False, right_edge: Optional[int]=None,
 ):
-    """
-    Desenha uma linha com realce por palavra.
-    - LTR (default): começa em x e avança para a direita.
-    - RTL: ignora 'x' e usa 'right_edge' como borda direita; começa dali e caminha para a esquerda.
-    """
     style = style or IMAGE_TEXT_OUTLINE_STYLE
     stroke_w = stroke_w or max(1, IMAGE_STROKE_WIDTH)
-
     tokens = line_text.split(" ")
     space_w = draw.textbbox((0, 0), " ", font=font)[2]
 
     if not rtl:
-        cur_x = x
-        it = tokens
+        cur_x = x; it = tokens
     else:
         cur_x = right_edge if right_edge is not None else x
         it = reversed(tokens)
@@ -368,11 +343,10 @@ def _draw_line_colored(
         key = re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", raw).lower()
         color = hl_fill if key in highlight_set else fill
         token_w = draw.textbbox((0, 0), raw, font=font)[2]
-
         draw_x = cur_x if not rtl else (cur_x - token_w)
 
         if style == "stroke" and stroke_w > 0:
-            _draw_text_with_stroke(draw, (draw_x, y), raw, font, color, (0, 0, 0, 200), stroke_w)
+            _draw_text_with_stroke(draw, (draw_x, y), raw, font, color, (0,0,0,200), stroke_w)
         elif style == "shadow":
             sx, sy = IMAGE_SHADOW_OFFSET
             shadow_col = (0, 0, 0, IMAGE_SHADOW_ALPHA)
@@ -385,18 +359,20 @@ def _draw_line_colored(
             cur_x += token_w + space_w
         else:
             cur_x -= token_w + space_w
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
+# -----------------------------------------------------------------------------#
+# Pós-processamento de imagem / ajuste de fundo
+# -----------------------------------------------------------------------------#
 def _darken_and_vignette(img, base_dark_alpha, vig, softness, center_protect) -> Image.Image:
     w, h = img.size; out = img.convert("RGBA")
     if base_dark_alpha > 0:
         out = Image.alpha_composite(out, Image.new("RGBA", (w, h), (0, 0, 0, int(base_dark_alpha))))
     if vig > 0:
         mask = Image.new("L", (w, h), 255); d = ImageDraw.Draw(mask)
-        inner_scale = 0.72 + 0.16 * _clamp(softness,0,1) + 0.12 * _clamp(center_protect,0,1)
+        inner_scale = 0.72 + 0.16 * max(0,min(1,softness)) + 0.12 * max(0,min(1,center_protect))
         iw, ih = int(w*inner_scale), int(h*inner_scale); left, top = (w-iw)//2, (h-ih)//2
         d.ellipse((left, top, left+iw, top+ih), fill=0)
-        blur = max(6, int(min(w,h) * (0.06 + 0.16*_clamp(softness,0,1))))
+        blur = max(6, int(min(w,h) * (0.06 + 0.16*max(0,min(1,softness)))))
         mask = mask.filter(ImageFilter.GaussianBlur(radius=blur))
         overlay = Image.new("RGBA", (w,h), (0,0,0,0)); overlay.putalpha(mask.point(lambda v: int(v*vig)))
         out = Image.alpha_composite(out, overlay)
@@ -409,37 +385,78 @@ def _ensure_1080x1920(img: Image.Image) -> Image.Image:
     left, top = (new.size[0]-tw)//2, (new.size[1]-th)//2
     return new.crop((left, top, left+tw, top+th))
 
+# -----------------------------------------------------------------------------#
+# Geração de imagens (Pexels / ChatGPT) + registro em cache por idioma
+# -----------------------------------------------------------------------------#
+def gerar_imagem_dalle(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None):
+    if not _HAVE_CHATGPT_AUTOMATION:
+        raise ImportError("'gerar_imagem_chatgpt' não importada.")
+    cookies_filename = os.getenv("COOKIES_CHATGPT_FILENAME", "cookies_chatgpt.txt")
+    if not gerar_imagem_chatgpt(prompt=prompt, cookies_path=cookies_filename, arquivo_saida=arquivo_saida):
+        raise RuntimeError("Automação do ChatGPT falhou ao gerar imagem.")
+    logger.info("✅ Imagem DALL-E/ChatGPT gerada via automação.")
+    # cache de prompts/imagens
+    if cache: 
+        cache.add("used_pexels_prompts", prompt, lang=_norm_lang_cache(idioma))
+        cache.add("used_images", arquivo_saida, lang=_norm_lang_cache(idioma))
+
 def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None, max_retries: int = 3):
-    os.makedirs(os.path.dirname(arquivo_saida) or ".", exist_ok=True); used = load_used_images()
+    os.makedirs(os.path.dirname(arquivo_saida) or ".", exist_ok=True)
     session = _get_media_session(idioma)
+    idioma_norm = _norm_lang_cache(idioma)
+
     for attempt in range(1, max_retries + 1):
         try:
             if IMAGE_MODE == "chatgpt":
                 gerar_imagem_dalle(prompt, arquivo_saida, idioma=idioma)
-                if not os.path.exists(arquivo_saida): raise RuntimeError("Arquivo não criado pelo ChatGPT.")
+                if not os.path.exists(arquivo_saida): 
+                    raise RuntimeError("Arquivo não criado pelo ChatGPT.")
+                # cache
+                if cache:
+                    cache.add("used_pexels_prompts", prompt, lang=idioma_norm)
+                    cache.add("used_images", arquivo_saida, lang=idioma_norm)
                 return
+
+            # Pexels
             if not PEXELS_API_KEY: raise RuntimeError("PEXELS_API_KEY ausente.")
             headers = {"Authorization": PEXELS_API_KEY}
-            params = {"query": prompt, "orientation": "portrait", "size": "large", "per_page": 30, "page": random.randint(1,10)}
+            params = {
+                "query": prompt, "orientation": "portrait", "size": "large",
+                "per_page": 30, "page": random.randint(1,10)
+            }
             r = session.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
-            r.raise_for_status(); photos = r.json().get("photos", [])
+            r.raise_for_status()
+            photos = r.json().get("photos", [])
             if not photos: raise RuntimeError(f"Pexels sem fotos para: '{prompt}'")
-            choice = random.choice(photos); src = choice.get("src", {})
+
+            choice = random.choice(photos)
+            src = choice.get("src", {})
             url = src.get("large2x") or src.get("large") or src.get("portrait")
             raw_resp = session.get(url, timeout=20); raw_resp.raise_for_status()
-            with open(arquivo_saida, "wb") as f: f.write(raw_resp.content)
+            with open(arquivo_saida, "wb") as f: 
+                f.write(raw_resp.content)
+
             img = _ensure_1080x1920(Image.open(arquivo_saida))
             img.save(arquivo_saida, quality=92)
-            used.add(arquivo_saida); save_used_images(used)
+
             logger.info("✅ Imagem salva: %s", arquivo_saida)
+            # cache
+            if cache:
+                cache.add("used_pexels_prompts", prompt, lang=idioma_norm)
+                cache.add("used_images", arquivo_saida, lang=idioma_norm)
             return
         except Exception as e:
             logger.warning("⚠️ Falha na geração (tentativa %d/%d): %s", attempt, max_retries, e)
     logger.error("❌ Não conseguiu gerar nova imagem após %d tentativas.", max_retries)
 
-def _prepare_bg(img, base_dark, template):
+# -----------------------------------------------------------------------------#
+# Renderização do título na imagem (templates + RTL)
+# -----------------------------------------------------------------------------#
+def _prepare_bg(img, base_dark, _template):
     base = _ensure_1080x1920(img)
-    return _darken_and_vignette(base, int(255*base_dark), IMAGE_VIGNETTE_STRENGTH, IMAGE_VIGNETTE_SOFTNESS, IMAGE_DARK_CENTER_PROTECT) if IMAGE_DARK_ENABLE else base
+    if IMAGE_DARK_ENABLE:
+        return _darken_and_vignette(base, int(255*base_dark), IMAGE_VIGNETTE_STRENGTH, IMAGE_VIGNETTE_SOFTNESS, IMAGE_DARK_CENTER_PROTECT)
+    return base
 
 def _render_modern_block(img, frase, *, idioma=None):
     img = _prepare_bg(img, IMAGE_DARK_MODERN, "modern_block").convert("RGBA"); W, H = img.size; draw = ImageDraw.Draw(img)
@@ -511,7 +528,7 @@ def _render_minimal_center(img, frase, *, idioma=None):
     _draw_text_with_stroke(draw, (x1, y), l1, small, "white", "black", max(1, int(small.size*0.05)))
     y += th1 + int(H*0.02)
 
-    # linhas grandes (quebra e centraliza ou alinha à direita)
+    # linhas grandes (quebra e centraliza / alinha à direita)
     maxw = int(W * 0.92)
     for ln_words in _wrap_words(draw, l2.split(), big, maxw):
         ln = " ".join(ln_words)
@@ -523,34 +540,14 @@ def _render_minimal_center(img, frase, *, idioma=None):
 
 def escrever_frase_na_imagem(imagem_path, frase, saida_path, *, idioma="pt-br", template="auto"):
     img = Image.open(imagem_path)
-    if template == "auto": template = random.choice(["classic_serif", "modern_block", "minimal_center"])
-    if template == "classic_serif": out = _render_classic_serif(img, frase, idioma=idioma)
-    elif template == "minimal_center": out = _render_minimal_center(img, frase, idioma=idioma)
-    else: out = _render_modern_block(img, frase, idioma=idioma)
-    os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True); out.save(saida_path, quality=92)
-    w, h, size_kb = out.size[0], out.size[1], os.path.getsize(saida_path)//1024
-    logger.info("✅ Imagem final salva (%s) | %dx%d | %d KB", template, w, h, size_kb)
-
-def montar_slides_pexels(query, count=4, primeira_imagem=None, *, idioma=None):
-    if not PEXELS_API_KEY: logger.error("❌ PEXELS_API_KEY não configurado."); return []
-    session = _get_media_session(idioma)
-    headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "orientation": "portrait", "size": "large", "per_page": 30, "page": 1}
-    r = session.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=15)
-    r.raise_for_status(); photos = r.json().get("photos", [])
-    slides = [primeira_imagem] if primeira_imagem and os.path.isfile(primeira_imagem) else []
-    random.shuffle(photos)
-    for photo in photos:
-        if len(slides) >= count: break
-        if not (url := (photo.get("src") or {}).get("large2x")): continue
-        try:
-            resp = session.get(url, timeout=15); resp.raise_for_status()
-            pid = photo.get("id") or random.randint(100000,999999); name = f"{_slug(query)}_{pid}.jpg"
-            out = os.path.join(IMAGENS_DIR, name)
-            with open(out, "wb") as f: f.write(resp.content)
-            _ensure_1080x1920(Image.open(out)).save(out, quality=92)
-            slides.append(out)
-        except Exception as e:
-            logger.warning("⚠️ Falha ao baixar slide id=%s: %s", photo.get("id"), e)
-    logger.info("🖼️ %d slide(s) prontos.", len(slides))
-    return slides
+    if template == "auto":
+        template = random.choice(["classic_serif", "modern_block", "minimal_center"])
+    if template == "classic_serif":
+        out = _render_classic_serif(img, frase, idioma=idioma)
+    elif template == "minimal_center":
+        out = _render_minimal_center(img, frase, idioma=idioma)
+    else:
+        out = _render_modern_block(img, frase, idioma=idioma)
+    os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
+    out.save(saida_path, quality=92)
+    logger.info("🖼️ Frase renderizada em: %s", saida_path)
