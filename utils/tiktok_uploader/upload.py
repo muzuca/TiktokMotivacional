@@ -13,6 +13,8 @@ Atualizações desta versão:
 - Navegação resiliente para rede lenta/proxy: warm-up em `/explore`, múltiplas variantes
   da URL de upload, antiredirecionamento para o hub e fallback para detecção de iframe/DOM.
 - Headless estável: flags SwiftShader/WebGL para evitar erros de GPU.
+- **Descompartimentação de país/idioma/região** via funções e mapeamentos,
+  adicionando **Rússia (RU)**: `ru-RU`, timezone `Europe/Moscow`, e `PROXY_RU_*`.
 """
 
 from __future__ import annotations
@@ -50,6 +52,106 @@ from selenium.webdriver.common.action_chains import ActionChains
 from .auth import AuthBackend
 from . import config
 
+# ----------------------------------------------------------------------
+#  MAPAS CENTRALIZADOS (país/idioma/região/proxy/timezone)
+# ----------------------------------------------------------------------
+
+# Normalização simples de idioma para chaves curtas
+def _norm_lang(s: Optional[str]) -> str:
+    s = (s or "").strip().lower()
+    if s.startswith("ar"):
+        return "ar"
+    if s.startswith("pt"):
+        return "pt"
+    if s.startswith("ru"):
+        return "ru"
+    return "en"
+
+# Região padrão por idioma (permite expansão fácil)
+LANG_TO_REGION = {
+    "ar": "EG",
+    "en": "US",
+    "pt": "BR",
+    "ru": "RU",
+}
+
+# Tag de idioma (Accept-Language / navigator.language)
+LANG_TO_TAG = {
+    "ar": "ar-EG",
+    "en": "en-US",
+    "pt": "pt-BR",
+    "ru": "ru-RU",
+}
+
+# Locale/Timezone por região
+REGION_TO_TIME = {
+    "EG": {"tz": "Africa/Cairo",       "locale": "ar-EG"},
+    "US": {"tz": "America/New_York",   "locale": "en-US"},
+    "BR": {"tz": "America/Sao_Paulo",  "locale": "pt-BR"},
+    "RU": {"tz": "Europe/Moscow",      "locale": "ru-RU"},
+}
+
+# Proxy habilitado por padrão?
+def _want_proxy_default(idioma: Optional[str]) -> bool:
+    # Mantém comportamento atual: proxy em EN/AR e adiciona RU; BR sem proxy.
+    return _norm_lang(idioma) in ("en", "ar", "ru")
+
+# Resolve região por idioma
+def _region_default(idioma: Optional[str]) -> Optional[str]:
+    return LANG_TO_REGION.get(_norm_lang(idioma), None)
+
+# Resolve lang-tag por idioma
+def _lang_tag_default(idioma: Optional[str]) -> str:
+    return LANG_TO_TAG.get(_norm_lang(idioma), "en-US")
+
+# Helper para ordem de fallback em variáveis de ambiente
+def _env_first(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return default
+
+# Resolve proxy por região (suporta US/EG/BR/RU; BR normalmente sem uso)
+def _resolve_proxy_env(region: Optional[str]):
+    reg = (region or "").upper()
+    if reg == "US":
+        host = _env_first("PROXY_US_HOST", "PROXY_HOST_US", "PROXY_HOST")
+        port = _env_first("PROXY_US_PORT", "PROXY_PORT_US", "PROXY_PORT")
+        user = _env_first("PROXY_US_USER", "PROXY_USER_US", "PROXY_USER") or None
+        pw   = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
+        return host, port, user, pw
+    if reg == "EG":
+        host = _env_first("PROXY_EG_HOST", "PROXY_HOST_EG", "PROXY_HOST")
+        port = _env_first("PROXY_EG_PORT", "PROXY_PORT_EG", "PROXY_PORT")
+        user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
+        pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
+        return host, port, user, pw
+    if reg == "RU":
+        host = _env_first("PROXY_RU_HOST", "PROXY_HOST_RU", "PROXY_HOST")
+        port = _env_first("PROXY_RU_PORT", "PROXY_PORT_RU", "PROXY_PORT")
+        user = _env_first("PROXY_RU_USER", "PROXY_USER_RU", "PROXY_USER") or None
+        pw   = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
+        return host, port, user, pw
+    # BR ou genérico
+    host = _env_first("PROXY_BR_HOST", "PROXY_HOST_BR", "PROXY_HOST")
+    port = _env_first("PROXY_BR_PORT", "PROXY_PORT_BR", "PROXY_PORT")
+    user = _env_first("PROXY_BR_USER", "PROXY_USER_BR", "PROXY_USER") or None
+    pw   = _env_first("PROXY_BR_PASS", "PROXY_PASS_BR", "PROXY_PASS") or None
+    return host, port, user, pw
+
+# Aceita ru-RU corretamente
+def _accept_header_from_tag(tag: Optional[str]) -> str:
+    tag = (tag or "").strip() or "en-US"
+    tl = tag.lower()
+    if tl.startswith("pt"):
+        return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("ar"):
+        return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("ru"):
+        return "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+    return "en-US,en;q=0.9"
+
 # Preferimos o get_browser (com Selenium-Wire) do módulo browsers.
 try:
     from .browsers import get_browser  # respeita want_proxy/region/lang_tag
@@ -67,53 +169,7 @@ except ImportError:
     from selenium.webdriver.edge.service import Service as EdgeService
     from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
-    def _norm_lang(s: Optional[str]) -> str:
-        s = (s or "").strip().lower()
-        if s.startswith("ar"): return "ar"
-        if s.startswith("pt"): return "pt"
-        return "en"
-
-    def _want_proxy_default(idioma: Optional[str]) -> bool:
-        return _norm_lang(idioma) in ("en", "ar")
-
-    def _region_default(idioma: Optional[str]) -> Optional[str]:
-        n = _norm_lang(idioma)
-        if n == "ar": return "EG"
-        if n == "en": return "US"
-        return None
-
-    def _lang_tag_default(idioma: Optional[str]) -> str:
-        n = _norm_lang(idioma)
-        if n == "pt": return "pt-BR"
-        if n == "ar": return "ar-EG"
-        return "en-US"
-
-    def _env_first(*keys: str, default: str = "") -> str:
-        for k in keys:
-            v = os.getenv(k)
-            if v: return v
-        return default
-
-    def _resolve_proxy_env(region: Optional[str]):
-        load_dotenv()
-        reg = (region or "").upper()
-        if reg == "US":
-            host = _env_first("PROXY_US_HOST", "PROXY_HOST_US", "PROXY_HOST")
-            port = _env_first("PROXY_US_PORT", "PROXY_PORT_US", "PROXY_PORT")
-            user = _env_first("PROXY_US_USER", "PROXY_USER_US", "PROXY_USER") or None
-            pw   = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
-            return host, port, user, pw
-        if reg == "EG":
-            host = _env_first("PROXY_EG_HOST", "PROXY_HOST_EG", "PROXY_HOST")
-            port = _env_first("PROXY_EG_PORT", "PROXY_PORT_EG", "PROXY_PORT")
-            user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
-            pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
-            return host, port, user, pw
-        host = _env_first("PROXY_HOST")
-        port = _env_first("PROXY_PORT")
-        user = _env_first("PROXY_USER") or None
-        pw   = _env_first("PROXY_PASS") or None
-        return host, port, user, pw
+    load_dotenv()
 
     def _mk_sw_opts(use_proxy: bool, region: Optional[str]):
         opts = {
@@ -136,27 +192,9 @@ except ImportError:
             logging.warning("want_proxy=True mas variáveis de proxy ausentes (%s). Seguiremos sem upstream.", region or "DEFAULT")
         return opts
 
-    def _accept_header_from_tag(tag: Optional[str]) -> str:
-        tag = (tag or "").strip() or "en-US"
-        tl = tag.lower()
-        if tl.startswith("pt"):
-            return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-        if tl.startswith("ar"):
-            return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
-        return "en-US,en;q=0.9"
-
     def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto",
                     headless: bool = False, *, want_proxy: Optional[bool] = None,
                     region: Optional[str] = None, lang_tag: Optional[str] = None, **kwargs):
-        from seleniumwire import webdriver as wire_webdriver  # type: ignore
-        from selenium.webdriver.chrome.service import Service as ChromeService
-        from webdriver_manager.chrome import ChromeDriverManager
-        from selenium.webdriver.firefox.options import Options as FirefoxOptions
-        from selenium.webdriver.firefox.service import Service as FirefoxService
-        from webdriver_manager.firefox import GeckoDriverManager
-        from selenium.webdriver.edge.options import Options as EdgeOptions
-        from selenium.webdriver.edge.service import Service as EdgeService
-        from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
         if want_proxy is None:
             want_proxy = _want_proxy_default(idioma)
@@ -342,25 +380,16 @@ def sleep_jitter_before_post() -> int:
 
 # --------------------------- helpers de proxy/idioma ---------------------------
 def _idioma_norm(idioma: Optional[str]) -> str:
-    s = (idioma or "").strip().lower()
-    if s.startswith("ar"): return "ar"
-    if s.startswith("pt"): return "pt"
-    return "en"
+    return _norm_lang(idioma)
 
 def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
-    return _idioma_norm(idioma) in ("en", "ar")
+    return _want_proxy_default(idioma)
 
 def _region_from_idioma(idioma: Optional[str]) -> Optional[str]:
-    n = _idioma_norm(idioma)
-    if n == "ar": return "EG"
-    if n == "en": return "US"
-    return None
+    return _region_default(idioma)
 
 def _lang_tag_from_idioma(idioma: Optional[str]) -> str:
-    n = _idioma_norm(idioma)
-    if n == "pt": return "pt-BR"
-    if n == "ar": return "ar-EG"
-    return "en-US"
+    return _lang_tag_default(idioma)
 
 def _is_seleniumwire_driver(driver) -> bool:
     try:
@@ -952,13 +981,17 @@ def upload_videos(
     # Autenticação (cookies/session)
     driver = auth.authenticate_agent(driver)
 
-    # Força timezone conforme a região do proxy (US/EG); mantém locale coerente
-    resolved_region = _region_from_idioma(idioma)  # já existe acima; use a mesma variável 'region' se preferir
-    if resolved_region == "EG":
-        _force_timezone(driver, os.getenv("TZ_EG", "Africa/Cairo"), locale="ar-EG")
-    elif resolved_region == "US":
-        _force_timezone(driver, os.getenv("TZ_US", "America/New_York"), locale="en-US")
-
+    # Aplica timezone/locale coerente com a região
+    try:
+        reg = (region or "").upper()
+        tz_info = REGION_TO_TIME.get(reg, None)
+        if tz_info:
+            # permite override por .env: TZ_EG, TZ_US, TZ_BR, TZ_RU
+            env_tz_key = f"TZ_{reg}"
+            tz = os.getenv(env_tz_key, tz_info["tz"])
+            _force_timezone(driver, tz, locale=tz_info["locale"])
+    except Exception as e:
+        logger.warning("Falha ao configurar timezone/locale: %s", e)
 
     failed: List[VideoDict] = []
 
@@ -1225,7 +1258,7 @@ def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
         except Exception:
             pass
 
-        texts = ("Publicar agora", "Publish now", "انشر الآن")
+        texts = ("Publicar agora", "Publish now", "انشر الآن", "Опубликовать сейчас")
         for t in texts:
             try:
                 btn = driver.find_element(

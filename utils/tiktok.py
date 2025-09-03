@@ -66,7 +66,7 @@ def _dedupe_hashtags_in_desc(desc: str, max_n: Optional[int] = None) -> str:
 
 
 def _normalizar_idioma(v: Optional[str]) -> str:
-    """Normaliza a entrada do idioma para 'en', 'pt-br', 'ar' ou 'auto'."""
+    """Normaliza a entrada do idioma para 'en', 'pt-br', 'ar', 'ru' ou 'auto'."""
     s = (v or "").strip().lower()
     if s in ("1", "en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english"):
         return "en"
@@ -74,6 +74,8 @@ def _normalizar_idioma(v: Optional[str]) -> str:
         return "pt-br"
     if s in ("3", "ar", "ar-eg", "egito", "eg", "árabe", "arabe"):
         return "ar"
+    if s in ("4", "ru", "ru-ru", "russia", "rússia", "russo"):
+        return "ru"
     return "auto"
 
 
@@ -226,6 +228,7 @@ def postar_no_tiktok_e_renomear(
         "en":    os.getenv("COOKIES_US_FILENAME", "cookies_us.txt"),
         "pt-br": os.getenv("COOKIES_BR_FILENAME", "cookies_br.txt"),
         "ar":    os.getenv("COOKIES_EG_FILENAME", "cookies_eg.txt"),
+        "ru":    os.getenv("COOKIES_RU_FILENAME", "cookies_ru.txt"),
     }
     COOKIES_PATH = cookies_map.get(idioma_norm, os.getenv("COOKIES_US_FILENAME", "cookies_us.txt"))
     logger.info("🍪 Cookies utilizados: %s", COOKIES_PATH)
@@ -243,6 +246,8 @@ def postar_no_tiktok_e_renomear(
                 base_desc = "Conteúdo motivacional do dia!"
             elif idioma_norm == "ar":
                 base_desc = "رسالة اليوم ✨"
+            elif idioma_norm == "ru":
+                base_desc = "Вдохновляющее послание дня!"
             else:
                 base_desc = "Motivational content of the day!"
 
@@ -265,6 +270,11 @@ def postar_no_tiktok_e_renomear(
             schedule = datetime.now() + timedelta(minutes=20)
             logger.info("📅 Agendando post para: %s", schedule.strftime("%H:%M:%S"))
 
+        # Headless do TikTok (vem do main.py; default ON)
+        headless_env = os.getenv("TIKTOK_HEADLESS", "1").strip().lower()
+        tt_headless = headless_env not in ("0", "false", "no", "off")
+        logger.info("🌐 TikTok headless: %s", "ON" if tt_headless else "OFF")
+
         logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
         logger.info("📝 Descrição final: %s", description)
         time.sleep(1.2)
@@ -276,7 +286,7 @@ def postar_no_tiktok_e_renomear(
             comment=True,
             stitch=True,
             duet=True,
-            headless=True,  # controle de headless é feito upstream; mantemos ON por padrão aqui
+            headless=tt_headless,
             schedule=schedule,
             idioma=idioma_norm
         )

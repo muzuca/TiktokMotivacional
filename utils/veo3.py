@@ -187,7 +187,13 @@ def _ask_gemini_viral_analysis(tema: str, persona: str, idioma: str) -> Dict[str
     logger.info("🧠 Estágio 1: Analisando tendências e definindo direção de cena para o tema '%s'...", tema)
     client = _get_client()
     data_hoje = datetime.now().strftime("%Y-%m-%d")
-    target_lang_map = {"pt": "Brazilian Portuguese", "ar": "Arabic", "en": "English"}
+    # ✅ idioma dinâmico (inclui RU)
+    target_lang_map = {
+        "pt": "Brazilian Portuguese",
+        "ar": "Arabic",
+        "en": "English",
+        "ru": "Russian",
+    }
     target_lang_name = target_lang_map.get(idioma.lower()[:2], "English")
 
     try:
@@ -256,7 +262,13 @@ def _build_gemini_command_full(
 ) -> str:
     config = _load_persona_config(persona)
     role_persona = config["dossier"]
-    target_lang_map = {"pt": "Brazilian Portuguese (pt-BR)", "ar": "Egyptian Arabic", "en": "English"}
+    # ✅ idioma dinâmico (inclui RU)
+    target_lang_map = {
+        "pt": "Brazilian Portuguese (pt-BR)",
+        "ar": "Egyptian Arabic",
+        "en": "English",
+        "ru": "Russian",
+    }
     target_lang = target_lang_map.get((idioma or "pt").lower()[:2], "English")
     example_prompt = config["example_prompt"]
 
@@ -893,7 +905,10 @@ def executar_interativo(persona: str, idioma: str) -> None:
                 final_video = mp4s[0]
             if POST_ZOOM > 1.0001:
                 z_out = os.path.splitext(final_video)[0] + f"_z{POST_ZOOM:.2f}.mp4"
-            ...
+                try:
+                    final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
+                except Exception as e:
+                    logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
             _postar_video(final_video, idioma)
             return
 

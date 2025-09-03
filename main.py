@@ -119,6 +119,7 @@ def _selecionar_idioma() -> Optional[str]:
         print("1. EUA (Inglês) *padrão")
         print("2. Brasil (pt-br)")
         print("3. Árabe (egípcio)")
+        print("4. Rússia (Russo)")
         print("b. Voltar")
         op = input("Digite a opção: ").strip().lower()
         if op in _BACK_TOKENS:
@@ -129,6 +130,8 @@ def _selecionar_idioma() -> Optional[str]:
             return "pt-br"
         if op == "3":
             return "ar-eg"
+        if op == "4":
+            return "ru"
         print("Opção inválida!")
 
 def _submenu_conteudo_por_idioma(idioma: str):
@@ -154,6 +157,18 @@ def _submenu_conteudo_por_idioma(idioma: str):
         op = input("Digite a opção: ").strip().lower()
         if op in _BACK_TOKENS: return None
         if op == "3" and _HAVE_VEO3: return ("veo3", "luisa")
+        return ("tarot", None) if op == "2" else ("motivacional", None)
+
+    if idioma in ("ru", "ru-ru"):
+        print("\nSelecione o conteúdo (Rússia):")
+        print("1. Motivacional")
+        print("2. Cartomante")
+        if _HAVE_VEO3:
+            print("3. Veo3 (Alina)")
+        print("b. Voltar")
+        op = input("Digite a opção: ").strip().lower()
+        if op in _BACK_TOKENS: return None
+        if op == "3" and _HAVE_VEO3: return ("veo3", "alina")
         return ("tarot", None) if op == "2" else ("motivacional", None)
 
     print("\nSelecione o conteúdo (EUA):")
