@@ -1,6 +1,7 @@
 # utils/subtitles.py
 # Alinha legendas por palavra usando faster-whisper e cria blocos
 # curtos de 2–3 palavras (1 linha), evitando juntar "fim de frase + começo da outra".
+# Atualizado: suporte a RU (russo) e fallback inteligente se o ASR não retornar o script correto.
 
 import os
 import re
@@ -43,22 +44,25 @@ def _env_str(name: str, default: str) -> str:
     return s if s != "" else default
 
 # ===== Parâmetros (otimizados p/ 2–3 palavras) =====
-SUB_MIN_DUR_SEC       = _env_float("SUB_MIN_DUR_SEC", 0.70)
-SUB_MAX_DUR_SEC       = _env_float("SUB_MAX_DUR_SEC", 2.80)
-SUB_GAP_SEC           = _env_float("SUB_GAP_SEC", 0.12)
+SUB_MIN_DUR_SEC         = _env_float("SUB_MIN_DUR_SEC", 0.70)
+SUB_MAX_DUR_SEC         = _env_float("SUB_MAX_DUR_SEC", 2.80)
+SUB_GAP_SEC             = _env_float("SUB_GAP_SEC", 0.12)
 
 # Vírgula/macetes: quando o gap entre palavras passa disso, ajuda a quebrar
-WORD_HARD_GAP_SEC     = _env_float("WORD_HARD_GAP_SEC", 0.55)
-WORD_SOFT_GAP_SEC     = _env_float("WORD_SOFT_GAP_SEC", 0.33)
+WORD_HARD_GAP_SEC       = _env_float("WORD_HARD_GAP_SEC", 0.55)
+WORD_SOFT_GAP_SEC       = _env_float("WORD_SOFT_GAP_SEC", 0.33)
 
 # Tamanho “textual” (apenas para heurística de corte de palavras longas)
-SUB_MAX_CHARS         = _env_int("SUB_MAX_CHARS", 36)
+SUB_MAX_CHARS           = _env_int("SUB_MAX_CHARS", 36)
 
 # Quantidade de palavras por bloco (principal exigência)
 SUB_WORDS_PER_CHUNK_MIN = _env_int("SUB_WORDS_PER_CHUNK_MIN", 2)
 SUB_WORDS_PER_CHUNK_MAX = _env_int("SUB_WORDS_PER_CHUNK_MAX", 3)
 
-FFPROBE_BIN           = _env_str("FFPROBE_BIN", "ffprobe")
+FFPROBE_BIN             = _env_str("FFPROBE_BIN", "ffprobe")
+
+# Thresholds para validar se o ASR retornou o script esperado (ru/ar)
+SCRIPT_RATIO_MIN        = _env_float("SUB_SCRIPT_RATIO_MIN", 0.20)  # 20%
 
 @dataclass
 class Caption:
@@ -96,9 +100,14 @@ def _ffprobe_duration(path: str) -> float:
     return dur
 
 def _norm_lang(idioma: str) -> str:
+    """
+    Normaliza 'idioma' para código do Whisper.
+    Suporta: pt, ar, ru, en (default).
+    """
     i = (idioma or "en").lower()
     if i.startswith("pt"): return "pt"
     if i.startswith("ar"): return "ar"
+    if i.startswith("ru"): return "ru"   # <-- adicionado
     return "en"
 
 def _strip_invisibles(s: str) -> str:
@@ -124,8 +133,32 @@ def _join_tokens(tokens: List[str]) -> str:
     s = _strip_invisibles(s)
     return re.sub(r"\s+", " ", s).strip()
 
+# --- util para checar se o texto reconhecido está no script esperado ---
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+_ARABIC_RE   = re.compile(r"[\u0600-\u06FF]")
+
+def _script_ratio(text: str, *, lang: str) -> float:
+    """
+    Retorna a razão de chars do script esperado:
+      - lang='ru'  -> proporção de caracteres cirílicos
+      - lang='ar'  -> proporção de caracteres árabes
+      - outros     -> 1.0 (não verificamos)
+    """
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+    if lang == "ru":
+        total = len(t)
+        hits = len(_CYRILLIC_RE.findall(t))
+        return hits / max(1, total)
+    if lang == "ar":
+        total = len(t)
+        hits = len(_ARABIC_RE.findall(t))
+        return hits / max(1, total)
+    return 1.0
+
 def _align_words(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]:
-    """Retorna lista de (start, end, token_text)."""
+    """Retorna lista de (start, end, token_text) com ASR palavra a palavra."""
     try:
         from faster_whisper import WhisperModel
     except Exception:
@@ -142,7 +175,7 @@ def _align_words(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]
     model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=cache)
     segments, _ = model.transcribe(
         audio_path,
-        language=lang,
+        language=lang,            # <- agora envia 'ru' corretamente quando idioma='ru'
         beam_size=beam,
         vad_filter=vad,
         word_timestamps=True,
@@ -250,19 +283,30 @@ def make_segments_for_audio(text: str, audio_path: str, *, idioma: str = "pt-br"
     if not audio_path or not os.path.isfile(audio_path):
         return []
 
+    lang = _norm_lang(idioma)
     words = _align_words(audio_path, idioma)
-    if words:
-        caps = _make_caps_from_words(words)
-        return [(c.start, c.end, c.text) for c in caps]
 
-    # Fallback simples sem alinhamento
+    # Se alinhou e o script bate com o idioma esperado, seguimos com o ASR;
+    # Caso contrário (ex.: pediu 'ru' mas texto reconhecido veio todo 'en'),
+    # caímos para o fallback usando o 'text' fornecido (garante legenda no idioma certo).
+    if words:
+        joined = " ".join(w for _, _, w in words)
+        ratio = _script_ratio(joined, lang=lang)
+        if ratio >= SCRIPT_RATIO_MIN:
+            caps = _make_caps_from_words(words)
+            return [(c.start, c.end, c.text) for c in caps]
+        # Caso a proporção esteja baixa e a língua-alvo seja ru/ar, preferimos o fallback textual.
+
+    # Fallback simples sem alinhamento (usa o texto fornecido no idioma alvo)
     try:
         _ = _ffprobe_duration(audio_path)
     except Exception:
         pass
+
     toks = [t for t in re.split(r"\s+", (text or "").strip()) if t]
     if not toks:
         return []
+
     out: List[Tuple[float, float, str]] = []
     i = 0
     t = 0.0
