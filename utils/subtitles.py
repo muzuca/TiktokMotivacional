@@ -137,7 +137,7 @@ def _align_words(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]
     compute_type = _env_str("WHISPER_COMPUTE_TYPE", "int8")
     beam         = _env_int("WHISPER_BEAM_SIZE", 1)
     vad          = _env_bool("WHISPER_VAD", True)
-    cache        = _env_str("WHISPER_MODEL_CACHE", "./whisper_models")
+    cache        = _env_str("WHISPER_MODEL_CACHE", "./cache/whisper_models")
 
     model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=cache)
     segments, _ = model.transcribe(

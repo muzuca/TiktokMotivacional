@@ -1,4 +1,4 @@
-# utils/frase.py — atualizado (separa cache por idioma + migração automática)
+# utils/frase.py — atualizado (cache por idioma + ru + migração automática)
 import os
 import re
 import unicodedata
@@ -12,6 +12,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 import google.generativeai as genai
 import logging
+
+# -----------------------------------------------------------------------------#
+# (Opcional) integração com countries.normalize_lang; mantém fallback interno
+# -----------------------------------------------------------------------------#
+try:
+    from .countries import normalize_lang as _normalize_lang_external
+except Exception:
+    try:
+        from countries import normalize_lang as _normalize_lang_external  # type: ignore
+    except Exception:
+        _normalize_lang_external = None  # fallback
 
 try:
     import yaml
@@ -41,7 +52,7 @@ LOG_GEMINI_PROMPTS = os.getenv("LOG_GEMINI_PROMPTS", "True").lower() in ("true",
 # Cache & Resources
 # -----------------------------------------------------------------------------#
 CACHE_DIR = "cache"
-RESOURCES_DIR = "resources"
+RESOURCES_DIR = "utils/resources"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Nomes legados (mistos) — mantidos para migração automática
@@ -54,10 +65,23 @@ _FALLBACK_PHRASES_CACHE: Optional[Dict] = None
 
 # --------------------- NOVO: helpers de cache por idioma --------------------- #
 def _idioma_norm(idioma: Optional[str]) -> str:
-    """Normaliza 'idioma' para 'en' | 'pt' | 'ar'."""
-    s = (idioma or "pt").lower()
+    """
+    Normaliza 'idioma' para um dos códigos suportados:
+      'en' | 'pt' | 'ar' | 'ru'
+    Usa countries.normalize_lang se disponível; caso contrário, faz heurística simples.
+    """
+    s = (idioma or "pt").strip()
+    # tenta normalização externa (countries.normalize_lang), se existir
+    if _normalize_lang_external:
+        try:
+            s = _normalize_lang_external(s)
+        except Exception:
+            pass
+    s = s.lower()
     if s.startswith("ar"): return "ar"
     if s.startswith("pt"): return "pt"
+    if s.startswith("ru"): return "ru"
+    if s.startswith("en"): return "en"
     return "en"
 
 def _cache_file(base_name: str, lang: str) -> str:
@@ -70,12 +94,18 @@ def _cache_file(base_name: str, lang: str) -> str:
 def _guess_lang(s: str) -> str:
     """Heurística simples para dividir arquivos legados por idioma."""
     t = (s or "").strip()
-    if re.search(r"[\u0600-\u06FF]", t):  # caracteres árabes
+    # árabe
+    if re.search(r"[\u0600-\u06FF]", t):
         return "ar"
+    # cirílico (russo e línguas relacionadas)
+    if re.search(r"[\u0400-\u04FF]", t):
+        return "ru"
+    # português (acentos e palavras comuns)
     if re.search(r"[áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ]", t) or any(
         w in t.lower() for w in (" você", " voce", " que ", " de ", " é ", " pra ", " para ")
     ):
         return "pt"
+    # default
     return "en"
 
 def _read_legacy_list(path: str) -> List[str]:
@@ -109,7 +139,7 @@ def _migrate_legacy_once() -> None:
     # Frases curtas
     legacy = _read_legacy_list(PHRASES_CACHE_FILE)
     if legacy:
-        buckets = {"en": [], "pt": [], "ar": []}
+        buckets = {"en": [], "pt": [], "ar": [], "ru": []}
         for line in legacy:
             buckets[_guess_lang(line)].append(line)
         for lang, items in buckets.items():
@@ -125,7 +155,7 @@ def _migrate_legacy_once() -> None:
     # Frases longas
     legacy = _read_legacy_list(LONG_PHRASES_CACHE_FILE)
     if legacy:
-        buckets = {"en": [], "pt": [], "ar": []}
+        buckets = {"en": [], "pt": [], "ar": [], "ru": []}
         for line in legacy:
             buckets[_guess_lang(line)].append(line)
         for lang, items in buckets.items():
@@ -141,7 +171,7 @@ def _migrate_legacy_once() -> None:
     # Prompts do Pexels
     legacy = _read_legacy_list(PEXELS_PROMPTS_CACHE_FILE)
     if legacy:
-        buckets = {"en": [], "pt": [], "ar": []}
+        buckets = {"en": [], "pt": [], "ar": [], "ru": []}
         for line in legacy:
             buckets[_guess_lang(line)].append(line)
         for lang, items in buckets.items():
@@ -182,7 +212,15 @@ def save_used_phrases(used_phrases: List[str], cache_file: str) -> None:
 # -----------------------------------------------------------------------------#
 _PT_SW = {"a","o","os","as","um","uma","de","da","do","das","dos","em","no","na","nos","nas","e","ou","pra","para","por","que","se","com","sem","ao","à","às","aos","é","ser","ter"}
 _EN_SW = {"a","an","the","and","or","of","in","on","to","for","with","that","is","it","you","your"}
-LANG_NAME_MAP = {"pt": "português do Brasil", "en": "inglês", "ar": "árabe egípcio"}
+
+# ADICIONA 'ru' ao mapa de nomes (texto que vai para os prompts)
+LANG_NAME_MAP = {
+    "pt": "português do Brasil",
+    "en": "inglês",
+    "ar": "árabe egípcio",
+    "ru": "russo",
+}
+
 IMAGE_EMPHASIS_ONLY_MARKUP = os.getenv("IMAGE_EMPHASIS_ONLY_MARKUP", "True").lower() in ("true", "1", "yes")
 IMAGE_FORCE_EMPHASIS = os.getenv("IMAGE_FORCE_EMPHASIS", "False").lower() in ("true", "1", "yes")
 IMAGE_EMPHASIS_LAST_WORDS = int(os.getenv("IMAGE_EMPHASIS_LAST_WORDS", "1"))
@@ -264,6 +302,7 @@ def _get_fallback_phrase(theme: str, lang: str) -> str:
             _FALLBACK_PHRASES_CACHE = {}
     
     phrases = _FALLBACK_PHRASES_CACHE.get(theme, {}).get(lang, [])
+    # fallback neutro caso não haja ru
     return random.choice(phrases) if phrases else "Acredite nos seus sonhos."
 
 def _clean_line(s: str) -> str:
@@ -375,11 +414,20 @@ def _get_history_for_prompt(cache_file: str, limit: int = 15) -> str:
 def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3) -> List[str]:
     lang = _idioma_norm(idioma)
     try:
-        prompt = _load_prompt_template("hashtags").format(n=n, target_lang_name=LANG_NAME_MAP.get(lang, "inglês"), conteudo=conteudo.strip()[:1000])
+        prompt = _load_prompt_template("hashtags").format(
+            n=n,
+            target_lang_name=LANG_NAME_MAP.get(lang, "inglês"),
+            conteudo=conteudo.strip()[:1000]
+        )
         raw_list = _ask_gemini(prompt, response_type=list, temperature=0.9, tries=3)
         tags = sorted(list(set(_sanitize_hashtag(t, lang) for t in raw_list if t)), key=len)
         if len(tags) < n:
-            fallbacks = {"pt": ["#motivacao", "#inspiracao", "#mindset"], "ar": ["#تحفيز", "#الهام", "#عقلية"], "en": ["#motivation", "#inspiration", "#mindset"]}
+            fallbacks = {
+                "pt": ["#motivacao", "#inspiracao", "#mindset"],
+                "ar": ["#تحفيز", "#الهام", "#عقلية"],
+                "en": ["#motivation", "#inspiration", "#mindset"],
+                "ru": ["#мотивация", "#вдохновение", "#саморазвитие"],
+            }
             tags.extend(f for f in fallbacks.get(lang, []) if f not in tags and len(tags) < n)
         return tags[:n]
     except Exception as e:
@@ -389,9 +437,11 @@ def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3) -> Li
 def _sanitize_hashtag(tag: str, lang: str) -> str:
     t = tag.strip().lstrip("#")
     t = re.sub(r"\s+", "", t)
+    # Para pt/en removemos acentos e restringimos a [A-Za-z0-9_]
     if lang in ("pt", "en"):
         t = unicodedata.normalize("NFD", t).encode("ascii", "ignore").decode("ascii")
         t = re.sub(r"[^A-Za-z0-9_]", "", t)
+    # Para árabe/ru mantemos caracteres nativos
     return f"#{t}" if t else ""
 
 def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "en", pexels_mode: bool = False) -> List[str]:
@@ -407,7 +457,13 @@ def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "
         historico_prompts = _get_history_for_prompt(cache_file, limit=20) if pexels_mode else ""
         
         template = _load_prompt_template(template_name)
-        prompt_text = template.format(quantidade=quantidade, tema=tema, historico_prompts=historico_prompts)
+        # Nota: templates de Pexels costumam fixar inglês; se quiser termos em russo,
+        # adicione {target_lang_name} ao YAML e formate aqui também.
+        prompt_text = template.format(
+            quantidade=quantidade,
+            tema=tema,
+            historico_prompts=historico_prompts
+        )
         descricoes = _ask_gemini(prompt_text, response_type=list, temperature=1.3, tries=3)
         
         if descricoes:

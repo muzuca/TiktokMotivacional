@@ -1,4 +1,4 @@
-# utils/veo3_flow.py — versão estável com perfil persistente + login robusto
+# utils/veo3_flow.py — versão estável com perfil persistente + login robusto + idioma dinâmico
 from __future__ import annotations
 
 import os
@@ -23,6 +23,9 @@ from selenium.common.exceptions import (
     WebDriverException,
     NoSuchElementException,
 )
+
+# 🔑 País/idioma centralizados
+from .countries import normalize_lang, cookies_path_for, flow_cookies_file
 
 logger = logging.getLogger(__name__)
 
@@ -1162,10 +1165,16 @@ def generate_single_via_flow(
     prompt_text: str,
     out_path: str,
     project_url: str,
-    cookies_file: str,
+    idioma: str = "en",
     headless: bool = True,
     timeout_sec: int = 480,
 ) -> str:
+    lang = normalize_lang(idioma)
+    cookies_file = cookies_path_for(lang)
+    flow_cookie = flow_cookies_file()
+    logger.info("🌍 Idioma=%s | TikTok cookies=%s | Flow cookies=%s",
+                lang, cookies_file, flow_cookie)
+
     download_dir = os.path.abspath(os.path.dirname(out_path) or ".")
     os.makedirs(download_dir, exist_ok=True)
     _begin_debug_run()
@@ -1174,27 +1183,22 @@ def generate_single_via_flow(
     try:
         logger.info("Destino do arquivo: %s", out_path)
 
-        # 1) injeta cookies (backup ao perfil persistente) e abre
-        cookies = _read_netscape_cookies(cookies_file)
+        cookies = _read_netscape_cookies(flow_cookie)
         if cookies:
             _add_cookies_multi_domain(driver, cookies)
         driver.get(project_url)
-        time.sleep(0.8)  # dá tempo para redirecionar/estabilizar
+        time.sleep(0.8)
 
-        # 2) autenticação: primeiro checo se JÁ ESTÁ logado; só depois considero o gate
         if _auth_is_logged_in(driver):
             logger.info("🔓 Sessão reconhecida — seguindo.")
         elif _auth_is_login_gate(driver):
-            driver = _auth_ensure(driver, project_url, cookies_file, headless=headless)
-        # se não é gate nem logado, sigo (o fluxo costuma cair em /tools/flow/home não logado; o _click_novo_projeto vai falhar e debugar)
+            driver = _auth_ensure(driver, project_url, flow_cookie, headless=headless)
 
-        # 3) navegação inicial / criação de projeto
         if "/tools/flow" in project_url and "/project/" not in project_url:
             logger.info("Abrindo Flow e criando 'Novo projeto'…")
             _open_flow_home(driver, project_url)
             _click_novo_projeto(driver)
 
-        # 4) (opcional) créditos
         creditos_iniciais = _check_and_log_credits(driver, "início")
         if creditos_iniciais is not None and creditos_iniciais < CREDIT_COST_PER_SCENE:
             raise RuntimeError("Créditos insuficientes para gerar 1 cena.")
@@ -1234,14 +1238,10 @@ def generate_single_via_flow(
                     shutil.move(mp4_tmp, out_path)
                 break
             else:
-                try:
-                    _delete_card(driver)
-                except Exception:
-                    pass
-                try:
-                    os.remove(mp4_tmp)
-                except Exception:
-                    pass
+                try: _delete_card(driver)
+                except Exception: pass
+                try: os.remove(mp4_tmp)
+                except Exception: pass
                 if attempt >= (max_regen + 1):
                     logger.error("❌ Sem áudio após %d tentativa(s). Seguiremos com o último arquivo.", attempt)
                     if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
@@ -1267,20 +1267,24 @@ def generate_single_via_flow(
         _end_debug_run(success=False)
         raise
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass
 
 
 def generate_many_via_flow(
     prompts: List[str],
     out_paths: List[str],
     project_url: str,
-    cookies_file: str,
+    idioma: str = "en",
     headless: bool = True,
     timeout_sec: int = 480,
 ) -> List[str]:
+    lang = normalize_lang(idioma)
+    cookies_file = cookies_path_for(lang)
+    flow_cookie = flow_cookies_file()
+    logger.info("🌍 Idioma=%s | TikTok cookies=%s | Flow cookies=%s",
+                lang, cookies_file, flow_cookie)
+
     if len(prompts) != len(out_paths):
         raise ValueError("prompts e out_paths precisam ter o mesmo tamanho.")
 
@@ -1290,7 +1294,7 @@ def generate_many_via_flow(
 
     driver = _chrome(download_dir=download_dir, headless=headless)
     try:
-        cookies = _read_netscape_cookies(cookies_file)
+        cookies = _read_netscape_cookies(flow_cookie)
         if cookies:
             _add_cookies_multi_domain(driver, cookies)
         driver.get(project_url)
@@ -1299,7 +1303,7 @@ def generate_many_via_flow(
         if _auth_is_logged_in(driver):
             logger.info("🔓 Sessão reconhecida — seguindo.")
         elif _auth_is_login_gate(driver):
-            driver = _auth_ensure(driver, project_url, cookies_file, headless=headless)
+            driver = _auth_ensure(driver, project_url, flow_cookie, headless=headless)
 
         if "/tools/flow" in project_url and "/project/" not in project_url:
             logger.info("Abrindo Flow e criando 'Novo projeto'…")
@@ -1312,6 +1316,7 @@ def generate_many_via_flow(
             custo_total = num * CREDIT_COST_PER_SCENE
             if creditos_iniciais < custo_total:
                 raise RuntimeError(f"Créditos insuficientes para gerar {num} cenas.")
+
         _force_respostas_por_comando_1(driver)
         _force_model_veo3_fast(driver)
 
@@ -1345,9 +1350,9 @@ def generate_many_via_flow(
                     has_aud = _has_audio_ffprobe(mp4_tmp)
                     if has_aud is False:
                         ok = False
-                        logger.warning("⚠️ Cena %d: arquivo sem trilha de áudio. Re-gerando (tentativa %d)…", idx, attempt)
+                        logger.warning("⚠️ Cena %d: sem áudio. Re-gerando (tentativa %d)…", idx, attempt)
                     elif has_aud is None:
-                        logger.debug("Cena %d: não foi possível confirmar áudio via ffprobe — seguindo.", idx)
+                        logger.debug("Cena %d: não consegui confirmar áudio via ffprobe — seguindo.", idx)
                     else:
                         logger.info("Cena %d: ✅ Áudio presente.", idx)
 
@@ -1361,14 +1366,10 @@ def generate_many_via_flow(
                     success = True
                     break
                 else:
-                    try:
-                        _delete_card(driver)
-                    except Exception:
-                        pass
-                    try:
-                        os.remove(mp4_tmp)
-                    except Exception:
-                        pass
+                    try: _delete_card(driver)
+                    except Exception: pass
+                    try: os.remove(mp4_tmp)
+                    except Exception: pass
                     if attempt >= (max_regen + 1):
                         logger.error("Cena %d: ❌ Sem áudio após %d tentativas. Usando o último arquivo.", idx, attempt)
                         if os.path.abspath(mp4_tmp) != os.path.abspath(out_path):
@@ -1402,7 +1403,5 @@ def generate_many_via_flow(
         _end_debug_run(success=False)
         raise
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass

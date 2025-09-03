@@ -1,91 +1,97 @@
-# utils/countries.py
+# countries.py
+# Centraliza normalização de idioma, metadados por país e paths de cookies.
+
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-@dataclass(frozen=True)
-class CountryCfg:
-    key: str                 # ex: "US", "BR", "EG", "RU"
-    label: str               # como aparece no menu
-    idioma: str              # "en", "pt-br", "ar", "ru"
-    lang_tag: str            # ex: "en-US", "pt-BR", "ar-EG", "ru-RU"
-    region: str              # ex: "US", "BR", "EG", "RU" (para TikTok / profile)
-    timezone: str            # tz default; pode ser sobrescrito por proxy
-    cookies_env: str         # nome da ENV com o arquivo de cookies (ex: COOKIES_US_FILENAME)
-    cookies_default: str     # fallback do arquivo de cookies
-    proxy_env: str           # nome da ENV do proxy (ex: PROXY_US)
-    persona: str             # persona default para Veo3 (ex.: "luisa", "yasmina", "alina")
-    headless_defaults: dict  # {"flow": True, "tiktok": True, "chatgpt": False}
+TRUE_SET = {"1", "true", "yes", "on"}
 
-REGISTRY: Dict[str, CountryCfg] = {
-    "US": CountryCfg(
-        key="US",
-        label="EUA (Inglês)",
-        idioma="en",
-        lang_tag="en-US",
-        region="US",
-        timezone=os.getenv("TZ_US", "America/New_York"),
-        cookies_env="COOKIES_US_FILENAME",
-        cookies_default="cookies_us.txt",
-        proxy_env="PROXY_US",
-        persona=os.getenv("PERSONA_US", "sophia"),
-        headless_defaults={"flow": True, "tiktok": True, "chatgpt": False},
+# Diretórios padrão (podem ser sobrescritos no .env)
+COOKIES_DIR = os.path.abspath(os.getenv("COOKIES_DIR", "cache/cookies"))
+CHROME_PROFILES_DIR = os.path.abspath(os.getenv("CHROME_PROFILES_DIR", "cache/chrome_profiles"))
+CHROME_DISK_CACHE_DIR = os.path.abspath(os.getenv("CHROME_DISK_CACHE_DIR", "cache/chrome_cache"))
+
+os.makedirs(COOKIES_DIR, exist_ok=True)
+os.makedirs(CHROME_PROFILES_DIR, exist_ok=True)
+os.makedirs(CHROME_DISK_CACHE_DIR, exist_ok=True)
+
+@dataclass(frozen=True)
+class CountryConfig:
+    code: str          # "US", "BR", "EG", "RU", etc.
+    lang_key: str      # "en", "pt-br", "ar", "ru"
+    lang_tag: str      # "en-US", "pt-BR", "ar-EG", "ru-RU"
+    region: str        # "US", "BR", "EG", "RU"
+    cookies_env: str   # nome da env p/ nome do arquivo de cookies
+    cookies_default: str  # default do filename
+    proxy_env_key: Optional[str] = None  # se usar um proxy específico por país
+
+# Tabela de países suportados
+_COUNTRIES: Dict[str, CountryConfig] = {
+    "en": CountryConfig(
+        code="US", lang_key="en", lang_tag="en-US", region="US",
+        cookies_env="COOKIES_US_FILENAME", cookies_default="cookies_us.txt",
+        proxy_env_key="UPSTREAM_PROXY_US"
     ),
-    "BR": CountryCfg(
-        key="BR",
-        label="Brasil (pt-br)",
-        idioma="pt-br",
-        lang_tag="pt-BR",
-        region="BR",
-        timezone=os.getenv("TZ_BR", "America/Sao_Paulo"),
-        cookies_env="COOKIES_BR_FILENAME",
-        cookies_default="cookies_br.txt",
-        proxy_env="PROXY_BR",
-        persona=os.getenv("PERSONA_BR", "luisa"),
-        headless_defaults={"flow": True, "tiktok": True, "chatgpt": False},
+    "pt-br": CountryConfig(
+        code="BR", lang_key="pt-br", lang_tag="pt-BR", region="BR",
+        cookies_env="COOKIES_BR_FILENAME", cookies_default="cookies_br.txt",
+        proxy_env_key="UPSTREAM_PROXY_BR"
     ),
-    "EG": CountryCfg(
-        key="EG",
-        label="Árabe (egípcio)",
-        idioma="ar",
-        lang_tag="ar-EG",
-        region="EG",
-        timezone=os.getenv("TZ_EG", "Africa/Cairo"),
-        cookies_env="COOKIES_EG_FILENAME",
-        cookies_default="cookies_eg.txt",
-        proxy_env="PROXY_EG",
-        persona=os.getenv("PERSONA_EG", "yasmina"),
-        headless_defaults={"flow": True, "tiktok": True, "chatgpt": False},
+    "ar": CountryConfig(
+        code="EG", lang_key="ar", lang_tag="ar-EG", region="EG",
+        cookies_env="COOKIES_EG_FILENAME", cookies_default="cookies_eg.txt",
+        proxy_env_key="UPSTREAM_PROXY_EG"
     ),
-    "RU": CountryCfg(
-        key="RU",
-        label="Rússia (Russo)",
-        idioma="ru",
-        lang_tag="ru-RU",
-        region="RU",
-        timezone=os.getenv("TZ_RU", "Europe/Moscow"),
-        cookies_env="COOKIES_RU_FILENAME",
-        cookies_default="cookies_ru.txt",
-        proxy_env="PROXY_RU",
-        persona=os.getenv("PERSONA_RU", "alina"),
-        headless_defaults={"flow": True, "tiktok": True, "chatgpt": False},
+    "ru": CountryConfig(
+        code="RU", lang_key="ru", lang_tag="ru-RU", region="RU",
+        cookies_env="COOKIES_RU_FILENAME", cookies_default="cookies_ru.txt",
+        proxy_env_key="UPSTREAM_PROXY_RU"
     ),
 }
 
-# Helpers
+def normalize_lang(value: Optional[str]) -> str:
+    """Normaliza a entrada para 'en', 'pt-br', 'ar' ou 'ru'."""
+    s = (value or "").strip().lower()
+    if s in ("1", "en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english"):
+        return "en"
+    if s in ("2", "pt", "pt-br", "br", "brasil", "portugues", "português"):
+        return "pt-br"
+    if s in ("3", "ar", "ar-eg", "egito", "eg", "árabe", "arabe"):
+        return "ar"
+    if s in ("4", "ru", "ru-ru", "russia", "rússia", "russo"):
+        return "ru"
+    # fallback: en
+    return "en"
 
-def list_menu_items():
-    # Mantém a ordem padrão: US, BR, EG, RU
-    order = ["US", "BR", "EG", "RU"]
-    return [(i+1, REGISTRY[k]) for i, k in enumerate(order)]
+def get_config(lang_key: str) -> CountryConfig:
+    """Retorna a configuração do país para o lang_key normalizado."""
+    key = normalize_lang(lang_key)
+    return _COUNTRIES.get(key, _COUNTRIES["en"])
 
-def get_by_menu_choice(choice: str) -> Optional[CountryCfg]:
-    mapping = {str(i): cfg for i, cfg in list_menu_items()}
-    return mapping.get(choice)
+def cookies_filename_for(lang_key: str) -> str:
+    """Nome do arquivo de cookies (apenas o filename)."""
+    cfg = get_config(lang_key)
+    return os.getenv(cfg.cookies_env, cfg.cookies_default)
 
-def get_by_id(key_or_idioma: str) -> Optional[CountryCfg]:
-    s = (key_or_idioma or "").strip().lower()
-    for cfg in REGISTRY.values():
-        if s in (cfg.key.lower(), cfg.idioma.lower(), cfg.region.lower()):
-            return cfg
-    return None
+def cookies_path_for(lang_key: str) -> str:
+    """Caminho absoluto do arquivo de cookies, dentro de COOKIES_DIR."""
+    filename = cookies_filename_for(lang_key)
+    if os.path.isabs(filename):
+        # Se o usuário colocou um caminho absoluto no .env, respeitamos.
+        return filename
+    return os.path.join(COOKIES_DIR, filename)
+
+def flow_cookies_file() -> str:
+    """Caminho absoluto dos cookies do Flow (veo3) em COOKIES_DIR."""
+    name = os.getenv("COOKIES_VEO3_FILENAME", "cookies_veo3.txt")
+    if os.path.isabs(name):
+        return name
+    return os.path.join(COOKIES_DIR, name)
+
+def tiktok_headless_default() -> bool:
+    """Headless do TikTok (default ON)."""
+    v = (os.getenv("TIKTOK_HEADLESS", "1").strip().lower() or "1")
+    return v in TRUE_SET

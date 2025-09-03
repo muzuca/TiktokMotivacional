@@ -1,4 +1,7 @@
 # utils/tiktok_uploader/browsers.py
+# Navegador com/sem proxy upstream por região + perfil/cache persistentes por instância.
+# Atualizado: suporte completo a RU (ru-RU, PROXY_RU_*), diretórios DENTRO de "cache/".
+
 import logging
 import os
 import uuid
@@ -30,13 +33,15 @@ def _idioma_norm(idioma: Optional[str]) -> str:
         return "ar"
     if s.startswith("pt"):
         return "pt"
+    if s.startswith("ru"):
+        return "ru"
     return "en"
 
 
 def _use_proxy_from_idioma(idioma: Optional[str]) -> bool:
-    """Heurística: liga proxy para EN (US) e AR (EG)."""
+    """Heurística: liga proxy para EN (US), AR (EG) e RU (RU)."""
     lang = _idioma_norm(idioma)
-    return lang in ("en", "ar")
+    return lang in ("en", "ar", "ru")
 
 
 def _compute_region_from_idioma(idioma: Optional[str]) -> Optional[str]:
@@ -48,6 +53,8 @@ def _compute_region_from_idioma(idioma: Optional[str]) -> Optional[str]:
         return "US"
     if lang == "pt":
         return "BR"
+    if lang == "ru":
+        return "RU"
     return None
 
 
@@ -57,6 +64,8 @@ def _lang_tag_and_header_from_idioma(idioma: Optional[str]) -> Tuple[str, str]:
         return "pt-BR", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
     if lang == "ar":
         return "ar-EG", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+    if lang == "ru":
+        return "ru-RU", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
     return "en-US", "en-US,en;q=0.9"
 
 
@@ -67,6 +76,8 @@ def _accept_header_from_tag(tag: Optional[str]) -> str:
         return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
     if tl.startswith("ar"):
         return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("ru"):
+        return "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
     return "en-US,en;q=0.9"
 
 
@@ -109,6 +120,7 @@ def _resolve_proxy_env(region: Optional[str]) -> Tuple[str, str, Optional[str], 
     Suporta esquema semântico por região:
       - US => PROXY_US_HOST/PORT/USER/PASS (também aceita PROXY_HOST_US/PORT_US/..)
       - EG => PROXY_EG_HOST/PORT/USER/PASS (também aceita PROXY_HOST_EG/PORT_EG/..)
+      - RU => PROXY_RU_HOST/PORT/USER/PASS (também aceita PROXY_HOST_RU/PORT_RU/..)
     Fallback (sem região): PROXY_HOST/PORT/USER/PASS
     Retorna: host, port, user, pass, region_key_usada
     """
@@ -127,6 +139,12 @@ def _resolve_proxy_env(region: Optional[str]) -> Tuple[str, str, Optional[str], 
         user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
         pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
         return host, port, user, pw, "EG"
+    elif reg == "RU":
+        host = _env_first("PROXY_RU_HOST", "PROXY_HOST_RU", "PROXY_HOST")
+        port = _env_first("PROXY_RU_PORT", "PROXY_PORT_RU", "PROXY_PORT")
+        user = _env_first("PROXY_RU_USER", "PROXY_USER_RU", "PROXY_USER") or None
+        pw   = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
+        return host, port, user, pw, "RU"
     else:
         host = _env_first("PROXY_HOST")
         port = _env_first("PROXY_PORT")
@@ -173,7 +191,7 @@ def _mk_seleniumwire_options(
 # ---------- cache/perfil por região + instância ----------
 def _norm_region(region: Optional[str]) -> str:
     r = (region or "").strip().upper()
-    if r in {"US", "EG", "BR"}:
+    if r in {"US", "EG", "BR", "RU"}:
         return r
     return "DEFAULT"
 
@@ -183,15 +201,15 @@ def _instance_tag() -> str:
 
 def _profile_roots(region: Optional[str]) -> Tuple[str, str]:
     """
-    Diretórios por região E instância:
-      - base de perfis: CHROME_PROFILE_BASE (default: chrome_profiles)
-      - base de cache:  CHROME_DISK_CACHE_BASE (default: chrome_cache)
+    Diretórios por região E instância (agora DENTRO de cache/):
+      - base de perfis: CHROME_PROFILE_BASE (default: cache/chrome_profiles)
+      - base de cache:  CHROME_DISK_CACHE_BASE (default: cache/chrome_cache)
     Gera: <base>/<REGIÃO>/<INSTANCE_TAG>
     """
     reg = _norm_region(region)
     tag = _instance_tag()
-    base_profile = os.getenv("CHROME_PROFILE_BASE", "chrome_profiles")
-    base_cache   = os.getenv("CHROME_DISK_CACHE_BASE", "chrome_cache")
+    base_profile = os.getenv("CHROME_PROFILE_BASE", os.path.join("cache", "chrome_profiles"))
+    base_cache   = os.getenv("CHROME_DISK_CACHE_BASE", os.path.join("cache", "chrome_cache"))
     user_data_dir  = os.path.join(base_profile, reg, tag)
     disk_cache_dir = os.path.join(base_cache, reg, tag)
     os.makedirs(user_data_dir, exist_ok=True)
@@ -231,9 +249,9 @@ def get_browser(
     Cria um WebDriver:
     - Se want_proxy=True => Selenium-Wire + proxy upstream (PROXY_* ou PROXY_<REG>_*).
     - Se want_proxy=False => Selenium "puro".
-    - region pode ser 'US', 'EG' ou 'BR'. Se None, usa heurística por idioma.
+    - region pode ser 'US', 'EG', 'BR' ou 'RU'. Se None, usa heurística por idioma.
     - Define Accept-Language/--lang segundo lang_tag (ou deduz de 'idioma').
-    - Chrome/Edge: perfil e cache persistentes por **instância** (evita lock ao rodar em paralelo).
+    - Chrome/Edge: perfil e cache persistentes por **instância** (agora dentro de cache/).
     """
     _silenciar_ruido()
 
@@ -316,7 +334,7 @@ def get_browser(
             pass
 
         logging.info("🗂️ Perfil Chrome: %s | Cache: %s | Região: %s | Headless: %s",
-                     os.path.abspath(user_data_dir), os.path.abspath(disk_cache_dir), _norm_region(region), headless)
+                     os.path.abspath(user_data_dir), os.path.abspath(disk_cache_dir), (region or 'DEFAULT'), headless)
         return driver
 
     # ---------------- FIREFOX ----------------
@@ -407,7 +425,7 @@ def get_browser(
             pass
 
         logging.info("🗂️ Perfil Edge: %s | Cache: %s | Região: %s | Headless: %s",
-                     os.path.abspath(user_data_dir), os.path.abspath(disk_cache_dir), _norm_region(region), headless)
+                     os.path.abspath(user_data_dir), os.path.abspath(disk_cache_dir), (region or 'DEFAULT'), headless)
         return driver
 
     else:

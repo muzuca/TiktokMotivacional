@@ -2,22 +2,29 @@
 import os
 import re
 import time
+import shutil
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
-
-from .tiktok_uploader.upload import upload_video  # Import local da pasta tiktok_uploader
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from socket import error as SocketError
-import logging
-import shutil
 
-# >>> cache por idioma (quando disponível)
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+
+# Uploader local
+from .tiktok_uploader.upload import upload_video
+
+# Países / cookies / diretórios centralizados
+from .countries import (
+    normalize_lang, cookies_path_for, tiktok_headless_default,
+)
+
+# (opcional) cache_store para registrar frases já usadas por idioma
 try:
     from cache_store import cache
-except Exception:
+except Exception:  # pragma: no cover
     cache = None
 
-# Configuração do logging com timestamps
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -25,59 +32,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PASTA_VIDEOS = "videos"
+PASTA_VIDEOS  = "videos"
 PASTA_IMAGENS = "imagens"
-PASTA_AUDIOS = "audios"
-PASTA_CACHE  = os.getenv("CACHE_DIR", "cache")
+PASTA_AUDIOS  = "audios"
+PASTA_CACHE   = os.getenv("CACHE_DIR", "cache")
 
-# Controla se removemos marcações markdown da legenda
+# Controla remoção de markdown na descrição
 _STRIP_FLAG = os.getenv("STRIP_MARKDOWN_IN_DESC", "1").strip().lower()
 STRIP_MARKDOWN_IN_DESC = _STRIP_FLAG not in ("0", "false", "no", "off")
 
-# --- helper para deduplicar hashtags mantendo ordem ---
 _HASHTAG_RE = re.compile(r'(?<!\S)#([^\s#]+)', flags=re.UNICODE)
 
-
 def _dedupe_hashtags_in_desc(desc: str, max_n: Optional[int] = None) -> str:
-    """
-    Remove hashtags duplicadas (case-insensitive) mantendo a ordem da 1ª ocorrência.
-    Remove as hashtags do corpo e as recoloca no final, já deduplicadas.
-    """
     if not desc:
         return ""
-
-    tags_encontradas = ["#" + m.group(1) for m in _HASHTAG_RE.finditer(desc)]
-
+    tags = ["#" + m.group(1) for m in _HASHTAG_RE.finditer(desc)]
     seen = set()
     ordered = []
-    for t in tags_encontradas:
+    for t in tags:
         k = t.lower()
         if k not in seen and len(t) > 1:
             seen.add(k)
             ordered.append(t)
-
     if isinstance(max_n, int) and max_n >= 0:
         ordered = ordered[:max_n]
-
     base = _HASHTAG_RE.sub("", desc)
     base = re.sub(r"\s{2,}", " ", base).strip()
-
     return (base + " " + " ".join(ordered)).strip() if ordered else base
-
-
-def _normalizar_idioma(v: Optional[str]) -> str:
-    """Normaliza a entrada do idioma para 'en', 'pt-br', 'ar', 'ru' ou 'auto'."""
-    s = (v or "").strip().lower()
-    if s in ("1", "en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english"):
-        return "en"
-    if s in ("2", "pt", "pt-br", "br", "brasil", "portugues", "português"):
-        return "pt-br"
-    if s in ("3", "ar", "ar-eg", "egito", "eg", "árabe", "arabe"):
-        return "ar"
-    if s in ("4", "ru", "ru-ru", "russia", "rússia", "russo"):
-        return "ru"
-    return "auto"
-
 
 def _safe_remove(path: str) -> None:
     try:
@@ -90,12 +71,9 @@ def _safe_remove(path: str) -> None:
     except Exception as e:
         logger.debug("Não consegui remover %s (%s)", path, e)
 
-
 def _cleanup_cache_drawtext(cache_dir: str) -> None:
-    """Remove arquivos temporários gerados para drawtext/overlays, mantendo JSONs."""
     try:
-        if not os.path.isdir(cache_dir):
-            return
+        if not os.path.isdir(cache_dir): return
         for f in os.listdir(cache_dir):
             if f.startswith("drawtext_") and f.endswith(".txt"):
                 _safe_remove(os.path.join(cache_dir, f))
@@ -106,27 +84,21 @@ def _cleanup_cache_drawtext(cache_dir: str) -> None:
     except Exception as e:
         logger.debug("Falha limpando temporários do cache (%s): %s", cache_dir, e)
 
-
 def _cleanup_mid_artifacts() -> None:
-    """
-    Faxina robusta e conservadora para pós-upload OU uso manual:
-    - Remove imagens do diretório IMAGENS.
-    - Remove todos os áudios do diretório AUDIOS (inclui subpasta tts).
-    - Remove temporários de cache (drawtext_*.txt, title_overlay_*.png, last_filter.txt).
-    """
+    """Limpa imagens/, audios/ (inclui tts/) e temporários do cache."""
     try:
         # imagens/*
         if os.path.isdir(PASTA_IMAGENS):
             for f in os.listdir(PASTA_IMAGENS):
                 _safe_remove(os.path.join(PASTA_IMAGENS, f))
 
-        # audios/*  e audios/tts/*
+        # audios/* e audios/tts/*
         if os.path.isdir(PASTA_AUDIOS):
             for root, dirs, files in os.walk(PASTA_AUDIOS, topdown=False):
                 for name in files:
                     if any(name.lower().endswith(ext) for ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")):
                         _safe_remove(os.path.join(root, name))
-                # limpa pastas vazias (inclusive tts)
+                # remove pastas vazias
                 for d in dirs:
                     try:
                         full = os.path.join(root, d)
@@ -135,37 +107,40 @@ def _cleanup_mid_artifacts() -> None:
                     except Exception:
                         pass
 
-        # cache/drawtext_*.txt e title_overlay_*.png
+        # cache temporários
         _cleanup_cache_drawtext(PASTA_CACHE)
-
     except Exception as e:
         logger.debug("Falha na limpeza intermediária: %s", e)
 
-
 def _cleanup_prompts_and_video(video_path: Optional[str]) -> None:
-    """
-    Após post bem-sucedido:
-    - Remove 'videos/prompts/' inteiro (se existir).
-    - Remove o próprio arquivo de vídeo postado (se existir).
-    - Executa limpeza intermediária por segurança.
-    """
+    """Após post, remove videos/prompts e o próprio vídeo postado."""
     try:
         prompts_dir = os.path.join(PASTA_VIDEOS, "prompts")
         if os.path.isdir(prompts_dir):
             _safe_remove(prompts_dir)
-
         if video_path and os.path.isfile(video_path):
             _safe_remove(video_path)
-
-        # Por redundância (casos de reuso/erros no fluxo), limpa temporários também aqui.
         _cleanup_mid_artifacts()
-
     except Exception as e:
         logger.debug("Falha limpando prompts/vídeo: %s", e)
 
+def _strip_markdown(texto: str) -> str:
+    patterns = (
+        (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
+        (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),
+        (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),
+        (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),
+        (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),
+        (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),
+    )
+    s = (texto or "")
+    for pat, rep in patterns:
+        s = pat.sub(rep, s)
+    s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
 
-def obter_ultimo_video(pasta=PASTA_VIDEOS):
-    """Encontra o vídeo mais recente na pasta de vídeos (baseado na data de modificação)."""
+def obter_ultimo_video(pasta=PASTA_VIDEOS) -> Optional[str]:
     try:
         arquivos = [os.path.join(pasta, f) for f in os.listdir(pasta) if f.endswith(".mp4")]
         if not arquivos:
@@ -177,107 +152,75 @@ def obter_ultimo_video(pasta=PASTA_VIDEOS):
         logger.error("❌ Erro ao buscar último vídeo: %s", str(e))
         return None
 
-
-def _strip_markdown(texto: str) -> str:
-    """Remove marcações básicas de Markdown e normaliza espaços."""
-    _MD_PATTERNS = (
-        (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),
-        (re.compile(r"\*(.+?)\*",     re.DOTALL), r"\1"),
-        (re.compile(r"__(.+?)__",     re.DOTALL), r"\1"),
-        (re.compile(r"_(.+?)_",       re.DOTALL), r"\1"),
-        (re.compile(r"~~(.+?)~~",     re.DOTALL), r"\1"),
-        (re.compile(r"`([^`]+)`",     re.DOTALL), r"\1"),
-    )
-    s = (texto or "")
-    for pat, rep in _MD_PATTERNS:
-        s = pat.sub(rep, s)
-    s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
-    s = re.sub(r"\s{2,}", " ", s)
-    return s.strip()
-
-
 def postar_no_tiktok_e_renomear(
-    descricao_personalizada=None,
-    imagem_base=None,
-    imagem_final=None,
-    video_final=None,
-    agendar=False,
-    idioma='en'
+    descricao_personalizada: Optional[str] = None,
+    imagem_base: Optional[str] = None,
+    imagem_final: Optional[str] = None,
+    video_final: Optional[str] = None,
+    agendar: bool = False,
+    idioma: str = "en",
 ) -> bool:
     """
-    Busca o último vídeo gerado, posta no TikTok e limpa os arquivos gerados APÓS upload sem erro.
-    NÃO abre navegador extra de confirmação.
-    Retorna True se o fluxo de upload terminou sem exceção; False caso contrário.
+    Posta o último vídeo gerado (ou 'video_final' se informado) e,
+    após sucesso, faz a faxina (imagens/, audios/, cache temp, videos/prompts/ e o mp4 postado).
     """
-    idioma_norm = _normalizar_idioma(idioma)
-    logger.info("postar_no_tiktok_e_renomear: idioma_in=%s | idioma_norm=%s", idioma, idioma_norm)
+    lang = normalize_lang(idioma)
+    logger.info("postar_no_tiktok_e_renomear: idioma_in=%s | idioma_norm=%s", idioma, lang)
 
     video_path = video_final if video_final else obter_ultimo_video()
     if not video_path:
         return False
-
     try:
         if os.path.getsize(video_path) <= 0:
-            logger.error("❌ Vídeo está com 0 bytes localmente: %s", video_path)
+            logger.error("❌ Vídeo está com 0 bytes: %s", video_path)
             return False
     except Exception:
         pass
 
-    # Seleciona cookies por idioma (env-first)
-    cookies_map = {
-        "en":    os.getenv("COOKIES_US_FILENAME", "cookies_us.txt"),
-        "pt-br": os.getenv("COOKIES_BR_FILENAME", "cookies_br.txt"),
-        "ar":    os.getenv("COOKIES_EG_FILENAME", "cookies_eg.txt"),
-        "ru":    os.getenv("COOKIES_RU_FILENAME", "cookies_ru.txt"),
-    }
-    COOKIES_PATH = cookies_map.get(idioma_norm, os.getenv("COOKIES_US_FILENAME", "cookies_us.txt"))
+    # Cookies por país (resolvidos para COOKIES_DIR)
+    COOKIES_PATH = cookies_path_for(lang)
     logger.info("🍪 Cookies utilizados: %s", COOKIES_PATH)
-
     if not os.path.exists(COOKIES_PATH):
-        logger.error(f"❌ Arquivo de cookies não encontrado: {COOKIES_PATH}")
+        logger.error("❌ Arquivo de cookies não encontrado: %s", COOKIES_PATH)
         return False
 
     try:
-        # Descrição base
+        # Descrição base por idioma
         if descricao_personalizada:
             base_desc = descricao_personalizada
         else:
-            if idioma_norm == "pt-br":
+            if lang == "pt-br":
                 base_desc = "Conteúdo motivacional do dia!"
-            elif idioma_norm == "ar":
+            elif lang == "ar":
                 base_desc = "رسالة اليوم ✨"
-            elif idioma_norm == "ru":
+            elif lang == "ru":
                 base_desc = "Вдохновляющее послание дня!"
             else:
                 base_desc = "Motivational content of the day!"
 
-        # Limpa markdown, se habilitado
+        # Limpa markdown e dedup hashtags
         if STRIP_MARKDOWN_IN_DESC:
-            cleaned = _strip_markdown(base_desc)
-            if cleaned != base_desc:
-                logger.debug("🧹 Limpando markdown da descrição: '%s' -> '%s'", base_desc, cleaned)
-            base_desc = cleaned
-
-        # Dedup de hashtags, mantendo só as que já vieram
+            base_desc = _strip_markdown(base_desc)
         description = _dedupe_hashtags_in_desc(base_desc)
 
-        # >>> grava no cache por idioma (para o Gemini não repetir depois)
+        # grava no cache por idioma (para evitar repetição pelo LLM no futuro)
         if cache:
-            cache.add("used_phrases", description, lang=idioma_norm)
+            try:
+                cache.add("used_phrases", description, lang=lang)
+            except Exception:
+                pass
 
         schedule = None
         if agendar:
             schedule = datetime.now() + timedelta(minutes=20)
             logger.info("📅 Agendando post para: %s", schedule.strftime("%H:%M:%S"))
 
-        # Headless do TikTok (vem do main.py; default ON)
-        headless_env = os.getenv("TIKTOK_HEADLESS", "1").strip().lower()
-        tt_headless = headless_env not in ("0", "false", "no", "off")
+        tt_headless = tiktok_headless_default()
         logger.info("🌐 TikTok headless: %s", "ON" if tt_headless else "OFF")
 
         logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
         logger.info("📝 Descrição final: %s", description)
-        time.sleep(1.2)
+        time.sleep(1.0)
 
         upload_video(
             filename=video_path,
@@ -288,13 +231,10 @@ def postar_no_tiktok_e_renomear(
             duet=True,
             headless=tt_headless,
             schedule=schedule,
-            idioma=idioma_norm
+            idioma=lang,
         )
 
-        ok = True
-
-        # --- PÓS-POST: limpeza completa e conservadora ---
-        # Remove arquivos auxiliares passados como parâmetros (se existirem)
+        # PÓS-POST: limpeza
         if imagem_base and os.path.exists(imagem_base):
             _safe_remove(imagem_base)
         if imagem_final and os.path.exists(imagem_final):
@@ -302,13 +242,10 @@ def postar_no_tiktok_e_renomear(
         if video_final and os.path.exists(video_final):
             _safe_remove(video_final)
 
-        # Faxina intermediária robusta (imagens/, audios/, cache temporários)
         _cleanup_mid_artifacts()
-
-        # Apaga prompts (videos/prompts) e o próprio vídeo postado
         _cleanup_prompts_and_video(video_path)
 
-        return ok
+        return True
 
     except (NoSuchElementException, TimeoutException) as e:
         logger.warning("⚠️ Erro intermediário durante upload: %s", e)
@@ -325,6 +262,3 @@ def postar_no_tiktok_e_renomear(
     except Exception as e:
         logger.error("❌ Erro geral ao postar: %s", e)
         return False
-    finally:
-        logger.info("⏳ Aguardando 5 segundos antes de finalizar...")
-        time.sleep(5)
