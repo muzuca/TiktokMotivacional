@@ -41,6 +41,21 @@ from utils.frase import (
     gerar_slug,
     gerar_hashtags_virais,
 )
+
+# (Opcional) longas — se existirem, usamos; se não, caímos no fallback
+try:
+    from utils.frase import gerar_frase_motivacional_longa
+    _HAVE_LONGO_MOTIV = True
+except Exception:
+    _HAVE_LONGO_MOTIV = False
+
+try:
+    from utils.frase import gerar_prompt_tarot, gerar_frase_tarot_curta, gerar_frase_tarot_longa
+    _HAVE_TAROT_FUNCS = True
+except Exception:
+    # ainda permitimos tarot curto pelo import acima, se falhar, desativamos total
+    _HAVE_TAROT_FUNCS = False
+
 from utils.imagem import escrever_frase_na_imagem, gerar_imagem_com_frase
 try:
     from utils.imagem import gerar_imagem_dalle
@@ -51,12 +66,12 @@ except Exception:
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
-# ==== Tarot (se existir) ====
+# ==== TTS (para medir duração) ====
 try:
-    from utils.frase import gerar_prompt_tarot, gerar_frase_tarot_curta
-    _HAVE_TAROT_FUNCS = True
+    from utils.audio import gerar_narracao_tts, _duracao_arquivo as _duracao_audio_segundos
+    _HAVE_AUDIO = True
 except Exception:
-    _HAVE_TAROT_FUNCS = False
+    _HAVE_AUDIO = False
 
 # ==== Veo3 (menus internos) ====
 try:
@@ -82,7 +97,15 @@ MOTION_OPTIONS = {
     "5": ("pan_ud",        "Pan up→down"),
     "0": ("random",        "Aleatório (entre movimentos)"),
 }
+
+# DEFAULT_SLIDES_COUNT fica aqui por compat (não perguntamos mais)
 DEFAULT_SLIDES_COUNT = int(os.getenv("SLIDES_COUNT", "4"))
+
+# Dinâmica de slides (parametrizável no .env)
+SLIDE_SECONDS_PER_IMAGE = float(os.getenv("SLIDE_SECONDS_PER_IMAGE", "3.0"))
+SLIDES_MIN = int(os.getenv("SLIDES_MIN", "3"))
+SLIDES_MAX = int(os.getenv("SLIDES_MAX", "10"))
+
 IMAGENS_DIR = "imagens"
 VIDEOS_DIR = "videos"
 AUDIOS_DIR = "audios"
@@ -247,21 +270,6 @@ def _selecionar_motion(env_default: str) -> Optional[str]:
         if op in MOTION_OPTIONS: return MOTION_OPTIONS[op][0]
         print("Opção inválida!")
 
-def _selecionar_qtd_fotos(padrao: int) -> Optional[int]:
-    while True:
-        print("\nQuantidade de fotos no vídeo (inclui a capa).")
-        print(f"Enter = usar .env (SLIDES_COUNT={padrao}) | b = voltar")
-        raw = input("Digite 1..10: ").strip().lower()
-        if raw in _BACK_TOKENS: return None
-        if raw == "":
-            return max(1, min(10, padrao))
-        try:
-            n = int(raw)
-            if 1 <= n <= 10: return n
-        except Exception:
-            pass
-        print("Valor inválido!")
-
 def _perguntar_headless(label: str, default_on: bool) -> Optional[bool]:
     padrao = 'Sim' if default_on else 'Não'
     print(f"\nExecutar {label} em modo headless?")
@@ -318,14 +326,14 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
            ask_tiktok_headless: bool = True):
     """
     Pipeline clássico (motivacional/cartomante).
-    Agora pergunta o headless do TikTok no INÍCIO (quando ask_tiktok_headless=True),
-    para ficar claro no menu 1 (postar agora).
+    Agora pergunta o headless do TikTok no INÍCIO (quando ask_tiktok_headless=True).
+    E **define os slides dinamicamente** pela duração do TTS (gerado antes das imagens).
     """
     os.makedirs(IMAGENS_DIR, exist_ok=True)
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     os.makedirs(AUDIOS_DIR, exist_ok=True)
 
-    # >>> NOVO: pergunta de headless do TikTok no início (apenas 1x por execução)
+    # >>> pergunta de headless do TikTok no início (apenas 1x por execução)
     global _TT_HEADLESS_ASKED
     if ask_tiktok_headless and not _TT_HEADLESS_ASKED:
         default_tt_headless = os.getenv('TIKTOK_HEADLESS', '1').strip() != '0'
@@ -336,11 +344,11 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         os.environ['TIKTOK_HEADLESS'] = '1' if ans_tt else '0'
         logger.info(' → TikTok headless: %s', 'ON' if ans_tt else 'OFF')
         _TT_HEADLESS_ASKED = True
-    # <<< NOVO
+    # <<<
 
     logger.info("Gerando conteúdos (%s | modo=%s | imagens=%s)...", idioma, modo_conteudo, image_engine)
 
-    # 1) Frase/tema e hashtags
+    # 1) Frase/tema curto e hashtags
     if modo_conteudo == "tarot" and _HAVE_TAROT_FUNCS:
         tema_imagem = gerar_prompt_tarot(idioma)
         frase = gerar_frase_tarot_curta(idioma)
@@ -355,7 +363,48 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         logger.warning("Falha ao gerar hashtags (seguirei sem): %s", e)
         desc_tiktok = frase
 
-    # 2) Imagens
+    # 2) Narração longa + TTS (antes das imagens) para medir duração real
+    texto_longo = None
+    if _HAVE_TAROT_FUNCS and modo_conteudo == "tarot":
+        try:
+            texto_longo = gerar_frase_tarot_longa(idioma)
+        except Exception:
+            texto_longo = None
+
+    if texto_longo is None:
+        if _HAVE_LONGO_MOTIV:
+            try:
+                texto_longo = gerar_frase_motivacional_longa(idioma)
+            except Exception:
+                texto_longo = None
+
+    # Fallback: se não houver função longa, cria um texto razoável (~100-120 palavras)
+    if not texto_longo:
+        base = (frase or "Your time to grow is now.")
+        texto_longo = (" ".join([base] * 20)).strip()
+
+    dur_voz = 0.0
+    if _HAVE_AUDIO:
+        try:
+            voice_path = gerar_narracao_tts(texto_longo, idioma=idioma, engine=tts_engine)
+            dur_voz = _duracao_audio_segundos(voice_path) or 0.0
+            logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz)
+        except Exception as e:
+            logger.warning("Não consegui gerar/medir TTS antes das imagens (%s). Vou usar SLIDES_COUNT padrão.", e)
+
+    # 3) Slides dinâmicos pelo tempo do TTS
+    if dur_voz > 0 and SLIDE_SECONDS_PER_IMAGE > 0:
+        slides_auto = int(round(dur_voz / SLIDE_SECONDS_PER_IMAGE))
+    else:
+        slides_auto = DEFAULT_SLIDES_COUNT
+    slides_auto = max(SLIDES_MIN, min(SLIDES_MAX, slides_auto))
+    logger.info("🧮 Slides (dinâmico): duração TTS=%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
+                dur_voz, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX)
+
+    # usamos SEMPRE o dinâmico; o parâmetro slides_count fica só por compatibilidade
+    slides_count = slides_auto
+
+    # 4) Imagens
     slug_frase = gerar_slug(frase)
     video_final = os.path.join(VIDEOS_DIR, f"{slug_frase}.mp4")
 
@@ -405,7 +454,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     if not generated_image_paths:
         raise RuntimeError("Nenhuma imagem foi gerada. Abortando o vídeo.")
 
-    # 3) Escrever frase nas imagens
+    # 5) Escrever frase nas imagens
     slides_para_video = []
     template_img = _map_video_style_to_image_template(video_style)
     logger.info(f"✍️  Escrevendo a frase '{frase[:30]}...' em {len(generated_image_paths)} imagens.")
@@ -421,7 +470,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         )
         slides_para_video.append(out_path)
 
-    # 4) Gerar vídeo
+    # 6) Gerar vídeo
     logger.info("🖼️ Slides prontos (%d). Gerando vídeo…", len(slides_para_video))
     gerar_video(
         imagem_path=slides_para_video[0],
@@ -436,7 +485,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         content_mode=modo_conteudo
     )
 
-    # 5) Postar
+    # 7) Postar
     ok = postar_no_tiktok_e_renomear(
         descricao_personalizada=desc_tiktok,
         video_final=video_final,
@@ -491,7 +540,7 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
             # rotina sem perguntar headless a cada ciclo
             args_tuple = (
                 modo_conteudo, idioma, tts_engine, legendas,
-                video_style, motion, slides_count, image_engine, False
+                video_style, motion, 0, image_engine, False  # slides_count=0 (ignoramos; dinâmico)
             )
             ok = _executar_com_timeout(args_tuple)
 
@@ -550,10 +599,7 @@ def _menu_principal():
         if motion is None:
             continue
 
-        slides_count = _selecionar_qtd_fotos(DEFAULT_SLIDES_COUNT)
-        if slides_count is None:
-            continue
-
+        # ❌ NÃO perguntamos mais a quantidade de fotos (dinâmico pelo TTS)
         image_engine = _selecionar_gerador_imagens(os.getenv("IMAGE_MODE", "pexels"))
         if image_engine is None:
             continue
@@ -567,7 +613,7 @@ def _menu_principal():
                 legendas=legendas,
                 video_style=video_style,
                 motion=motion,
-                slides_count=slides_count,
+                slides_count=0,           # ignorado (dinâmico)
                 image_engine=image_engine
             )
         else:
@@ -578,7 +624,7 @@ def _menu_principal():
                 legendas=legendas,
                 video_style=video_style,
                 motion=motion,
-                slides_count=slides_count,
+                slides_count=0,           # ignorado (dinâmico)
                 image_engine=image_engine,
                 ask_tiktok_headless=True
             )

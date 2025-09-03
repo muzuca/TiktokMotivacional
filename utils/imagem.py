@@ -5,6 +5,8 @@ import json
 import random
 import logging
 from typing import List, Optional, Tuple, Iterable
+from typing import Optional 
+
 
 import requests
 try:
@@ -538,16 +540,78 @@ def _render_minimal_center(img, frase, *, idioma=None):
         y += th + int(big.size*0.06)
     return img.convert("RGB")
 
-def escrever_frase_na_imagem(imagem_path, frase, saida_path, *, idioma="pt-br", template="auto"):
+def escrever_frase_na_imagem(
+    imagem_path,
+    *args,
+    idioma: str = "pt-br",
+    template: str = "auto",
+    frase: str | None = None,
+    saida_path: str | None = None,
+    slide_index: int | None = None,      # aceitos mas não usados aqui (compat)
+    total_slides: int | None = None,     # aceitos mas não usados aqui (compat)
+    **_ignored,
+):
+    """
+    Função robusta e retrocompatível.
+
+    Aceita:
+      - escrever_frase_na_imagem(img, frase, saida_path, ...)
+      - escrever_frase_na_imagem(img, saida_path, frase, ...)
+      - escrever_frase_na_imagem(img, frase=..., saida_path=..., ...)
+      - kwargs extras como slide_index/total_slides (ignorados aqui).
+    """
+    import os
+    from PIL import Image
+
+    # ---------- Resolver parâmetros vindos por *args ----------
+    a1 = args[0] if len(args) >= 1 else None
+    a2 = args[1] if len(args) >= 2 else None
+
+    def _looks_like_path(s: object) -> bool:
+        if not isinstance(s, str):
+            return False
+        ext = os.path.splitext(s)[1].lower()
+        return ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+    # Se vieram apenas posicionais, deduzir ordem automaticamente
+    if frase is None or saida_path is None:
+        if a1 is not None and a2 is not None:
+            # Tentar detectar qual argumento é o caminho de saída
+            if _looks_like_path(a1) and not _looks_like_path(a2):
+                # ordem: (imagem, saida_path, frase)
+                saida_path = a1 if saida_path is None else saida_path
+                frase = a2 if frase is None else frase
+            elif _looks_like_path(a2) and not _looks_like_path(a1):
+                # ordem: (imagem, frase, saida_path)
+                frase = a1 if frase is None else frase
+                saida_path = a2 if saida_path is None else saida_path
+            else:
+                # Não deu pra distinguir? assuma (frase, saida_path)
+                frase = a1 if frase is None else frase
+                saida_path = a2 if saida_path is None else saida_path
+        elif a1 is not None:
+            # 1 arg só: se parece caminho, é saida; senão, é frase
+            if _looks_like_path(a1) and saida_path is None:
+                saida_path = a1
+            elif frase is None:
+                frase = a1
+
+    # Validação final
+    if not frase or not saida_path:
+        raise TypeError("escrever_frase_na_imagem requer 'frase' e 'saida_path' (posicionais ou kwargs).")
+
+    # ---------- Corpo original ----------
     img = Image.open(imagem_path)
     if template == "auto":
         template = random.choice(["classic_serif", "modern_block", "minimal_center"])
+
     if template == "classic_serif":
         out = _render_classic_serif(img, frase, idioma=idioma)
     elif template == "minimal_center":
         out = _render_minimal_center(img, frase, idioma=idioma)
     else:
         out = _render_modern_block(img, frase, idioma=idioma)
+
     os.makedirs(os.path.dirname(saida_path) or ".", exist_ok=True)
     out.save(saida_path, quality=92)
     logger.info("🖼️ Frase renderizada em: %s", saida_path)

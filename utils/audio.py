@@ -456,6 +456,26 @@ def gerar_narracao_tts(texto: str, idioma: str = "en", engine: str = "gemini") -
         logger.info("Fallback: tentando Gemini…")
         return gerar_narracao_tts_gemini(texto, idioma=idioma, max_retries=MAX_RETRIES_DEFAULT)
 
+# ============= Helpers públicos de duração/geração (para main.py) =============
+def duracao_arquivo(path: str) -> float:
+    """Duração em segundos do arquivo de áudio (usa moviepy). Retorna 0.0 se falhar."""
+    try:
+        return _duracao_arquivo(path)
+    except Exception:
+        return 0.0
+
+def gerar_narracao_tts_com_duracao(texto: str, idioma: str = "en", tts_engine: str = "gemini"):
+    """
+    Gera o TTS com o engine solicitado e retorna (path, duracao_em_segundos).
+    Mantém a sua pipeline (proxy, retries). Útil para calcular slides dinamicamente.
+    """
+    path = gerar_narracao_tts(texto, idioma=idioma, engine=tts_engine)
+    if not path or not os.path.exists(path):
+        raise RuntimeError("Falha ao gerar TTS para cálculo dinâmico de slides.")
+    dur = _duracao_arquivo(path)
+    logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur)
+    return path, float(dur or 0.0)
+
 # ------------- util opcional: limpar TTS ------------
 def limpar_tts_antigos(max_age_hours: int = 6):
     """Remove arquivos em audios/tts/ mais antigos que N horas."""
