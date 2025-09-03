@@ -65,6 +65,10 @@ def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name, str(default)).strip().lower()
     return v in ("1", "true", "yes", "on")
 
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
 # Parâmetros de Vídeo e Áudio
 BG_MIX_VOLUME      = _env_float("BG_MIX_VOLUME", 0.07)
 DEFAULT_TRANSITION = os.getenv("TRANSITION", "fade").lower()
@@ -97,12 +101,18 @@ IMAGE_TEXT_SCALE_MINIMAL   = _env_float("IMAGE_TEXT_SCALE_MINIMAL", 0.95)
 ARABIC_FONT_IMAGE_REG      = os.getenv("ARABIC_FONT_IMAGE_REG",  "NotoNaskhArabic-Regular.ttf")
 ARABIC_FONT_IMAGE_BOLD     = os.getenv("ARABIC_FONT_IMAGE_BOLD", "NotoNaskhArabic-Bold.ttf")
 
-# Parâmetros de Legendas
+# ============ Legendas (fonts) ============
 SUB_FONT_SCALE_1 = _env_float("SUB_FONT_SCALE_1", 0.050)
 SUB_FONT_SCALE_2 = _env_float("SUB_FONT_SCALE_2", 0.056)
 SUB_FONT_SCALE_3 = _env_float("SUB_FONT_SCALE_3", 0.044)
 REQUIRE_FONTFILE = _env_bool("REQUIRE_FONTFILE", False)
+
+# Árabe: fonte fixa (sem fallback) — se não estiver presente, erro explícito.
 ARABIC_FONT = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
+ARABIC_FONT_STRICT = _env_bool("ARABIC_FONT_STRICT", True)
+
+# Russo: usa por padrão a fonte disponibilizada por você
+CYRILLIC_FONT = _env_str("CYRILLIC_FONT", "bebas-neue-cyrillic.ttf")
 
 # ================== Helpers ==================
 def _ffmpeg_or_die() -> str:
@@ -119,9 +129,14 @@ def _ffmpeg_has_filter(filter_name: str) -> bool:
         return False
 
 def _idioma_norm(idioma: str) -> str:
+    """
+    Normaliza o idioma para: 'pt', 'ar', 'ru' ou 'en' (default).
+    Isso é usado para TTS, escolha de fonte e geração de legendas.
+    """
     s = (idioma or "en").lower()
     if s.startswith("pt"): return "pt"
     if s.startswith("ar"): return "ar"
+    if s.startswith("ru"): return "ru"
     return "en"
 
 def _text_contains_arabic(s: str) -> bool:
@@ -362,9 +377,47 @@ def _style_fontsize_from_H(H: int, style_id: str) -> Tuple[int, int, int]:
     return fs, borderw, margin
 
 def _get_subtitle_font_path(lang_norm: str) -> Optional[str]:
+    """
+    Retorna o caminho da fonte das legendas para cada idioma.
+    - AR: fonte fixa (ARABIC_FONT). Se não existir e ARABIC_FONT_STRICT=1 (padrão), lança erro;
+          caso contrário, tenta NotoNaskhArabic.
+    - RU: prioriza 'bebas-neue-cyrillic.ttf' (ou CYRILLIC_FONT do .env).
+    - PT/EN: BebasNeue-Regular.ttf.
+    """
+    # Árabe (sempre a mesma)
     if lang_norm == "ar":
         p = os.path.join(FONTS_DIR, ARABIC_FONT)
-        return p if os.path.isfile(p) else _first_existing_font("NotoNaskhArabic-Regular.ttf", "NotoNaskhArabic-Bold.ttf")
+        if os.path.isfile(p):
+            return p
+        if ARABIC_FONT_STRICT or REQUIRE_FONTFILE:
+            raise FileNotFoundError(
+                f"Fonte árabe obrigatória não encontrada: {p}. "
+                f"Defina ARABIC_FONT corretamente e coloque o arquivo em '{FONTS_DIR}'."
+            )
+        logger.warning("AR: fonte %s não encontrada — usando fallback NotoNaskhArabic.", ARABIC_FONT)
+        return _first_existing_font("NotoNaskhArabic-Regular.ttf", "NotoNaskhArabic-Bold.ttf")
+
+    # Russo (Bebas Neue compatível com cirílico)
+    if lang_norm == "ru":
+        # ordem de preferência
+        candidates = [
+            CYRILLIC_FONT,
+            "bebas-neue-cyrillic.ttf",   # sua fonte
+            "BebasNeue-Regular.ttf",     # métrica similar
+            "Inter-Bold.ttf",
+            "Montserrat-Bold.ttf",
+            "NotoSans-Regular.ttf",
+            "Arial.ttf",
+        ]
+        for n in candidates:
+            p = os.path.join(FONTS_DIR, n)
+            if os.path.isfile(p):
+                if n != CYRILLIC_FONT:
+                    logger.warning("RU: fonte preferida '%s' não encontrada — usando '%s'.", CYRILLIC_FONT, n)
+                return p
+        return None
+
+    # Demais (pt/en…)
     return _first_existing_font("BebasNeue-Regular.ttf", "Inter-Bold.ttf", "Montserrat-Bold.ttf")
 
 def _write_textfile_for_drawtext(content: str, idx: int) -> str:
@@ -459,13 +512,14 @@ def gerar_video(
         style_norm = _normalize_style(video_style)
 
         long_text = gerar_frase_tarot_longa(idioma) if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG else gerar_frase_motivacional_longa(idioma)
+
+        # TTS no idioma normalizado (suporta 'ru')
         voice_audio_path = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
         dur_voz = _duracao_audio_segundos(voice_audio_path)
         logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz or 0.0)
 
         if voice_audio_path:
             staged_tts = _stage_to_dir(voice_audio_path, os.path.join(AUDIO_DIR, "tts"), "tts")
-            # se o TTS foi gerado dentro de uma pasta temporária, também removeremos o original
             if os.path.basename(os.path.dirname(voice_audio_path)).lower() in ("audios_tts", "tts"):
                 extra_to_cleanup.append(voice_audio_path)
             voice_audio_path = staged_tts
@@ -473,10 +527,10 @@ def gerar_video(
         background_audio_path = obter_caminho_audio(idioma=lang_norm)
         has_voice, has_bg = bool(voice_audio_path), bool(background_audio_path)
 
-        # marcar para limpeza opcional
         if CLEANUP_BG_AUDIO and background_audio_path and os.path.isfile(background_audio_path):
             bg_audio_to_cleanup = background_audio_path
 
+        # Legendas: passam 'lang_norm' (agora pode ser 'ru') e escolhem fonte por idioma
         segments = make_segments_for_audio(long_text, voice_audio_path, idioma=lang_norm) if legendas and has_voice else []
         if segments:
             logger.info("📝 %d segmentos de legenda gerados.", len(segments))
@@ -532,7 +586,6 @@ def gerar_video(
         if legendas and segments:
             font_path_subs = _get_subtitle_font_path(lang_norm)
             logger.info(f"🔤 Fonte das Legendas: {os.path.basename(font_path_subs) if font_path_subs else 'Padrão'}")
-            # >>> Alinhamento RTL quando árabe
             subs_chain = _build_subs_drawtext_chain(
                 H, style_norm, segments, font_path_subs,
                 rtl=(lang_norm == "ar")
