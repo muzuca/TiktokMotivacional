@@ -1164,18 +1164,41 @@ def _auth_ensure(driver, project_url: str, cookies_file: str, *, headless: bool)
 def generate_single_via_flow(
     prompt_text: str,
     out_path: str,
-    project_url: str,
+    project_url: str | None = None,
     idioma: str = "en",
     headless: bool = True,
     timeout_sec: int = 480,
+    *,
+    # ---- compat extras (não obrigatórios) ----
+    flow_url: str | None = None,
+    cookies_file: str | None = None,   # cookies do FLOW (override)
+    download_dir: str | None = None,   # override do diretório de download
+    persona: str | None = None,
+    **_
 ) -> str:
-    lang = normalize_lang(idioma)
-    cookies_file = cookies_path_for(lang)
-    flow_cookie = flow_cookies_file()
-    logger.info("🌍 Idioma=%s | TikTok cookies=%s | Flow cookies=%s",
-                lang, cookies_file, flow_cookie)
+    """
+    Gera 1 vídeo no Google Flow (Veo3) a partir de um prompt.
+    Compatível com chamadas que passam flow_url, cookies_file, download_dir, persona, etc.
+    """
+    # === resolução de URL do projeto (Flow) ===
+    project_url = project_url or flow_url or os.getenv("FLOW_URL") or ""
+    if not project_url:
+        raise RuntimeError("FLOW_URL (project_url/flow_url) não definido. Configure no .env ou passe como argumento.")
 
-    download_dir = os.path.abspath(os.path.dirname(out_path) or ".")
+    # === normalização de idioma / logs ===
+    lang = normalize_lang(idioma)
+
+    # ATENÇÃO: este é o caminho de cookies do TIKTOK (apenas para log/consistência de saída)
+    tiktok_cookies_file = cookies_path_for(lang)
+
+    # Cookies do FLOW: usa o parâmetro se vier; senão, padrão do projeto
+    flow_cookie = cookies_file if cookies_file else flow_cookies_file()
+
+    logger.info("🌍 Idioma=%s | TikTok cookies=%s | Flow cookies=%s",
+                lang, tiktok_cookies_file, flow_cookie)
+
+    # === diretório de download (padrão: pasta do out_path) ===
+    download_dir = os.path.abspath(download_dir or (os.path.dirname(out_path) or "."))
     os.makedirs(download_dir, exist_ok=True)
     _begin_debug_run()
 
@@ -1274,21 +1297,35 @@ def generate_single_via_flow(
 def generate_many_via_flow(
     prompts: List[str],
     out_paths: List[str],
-    project_url: str,
+    project_url: str | None = None,
     idioma: str = "en",
     headless: bool = True,
     timeout_sec: int = 480,
+    *,
+    # ---- compat extras (não obrigatórios) ----
+    flow_url: str | None = None,
+    cookies_file: str | None = None,   # cookies do FLOW (override)
+    download_dir: str | None = None,   # override do diretório de download
+    persona: str | None = None,
+    **_
 ) -> List[str]:
+    # === resolução de URL do projeto (Flow) ===
+    project_url = project_url or flow_url or os.getenv("FLOW_URL") or ""
+    if not project_url:
+        raise RuntimeError("FLOW_URL (project_url/flow_url) não definido. Configure no .env ou passe como argumento.")
+
     lang = normalize_lang(idioma)
-    cookies_file = cookies_path_for(lang)
-    flow_cookie = flow_cookies_file()
+    # Caminho de cookies do TikTok (apenas para log)
+    tiktok_cookies_file = cookies_path_for(lang)
+    # Cookies do Flow
+    flow_cookie = cookies_file if cookies_file else flow_cookies_file()
     logger.info("🌍 Idioma=%s | TikTok cookies=%s | Flow cookies=%s",
-                lang, cookies_file, flow_cookie)
+                lang, tiktok_cookies_file, flow_cookie)
 
     if len(prompts) != len(out_paths):
         raise ValueError("prompts e out_paths precisam ter o mesmo tamanho.")
 
-    download_dir = os.path.abspath(os.path.dirname(out_paths[0]) or ".")
+    download_dir = os.path.abspath(download_dir or (os.path.dirname(out_paths[0]) or "."))
     os.makedirs(download_dir, exist_ok=True)
     _begin_debug_run()
 
