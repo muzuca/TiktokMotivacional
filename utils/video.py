@@ -481,8 +481,22 @@ def gerar_video(
     motion="none",
     slides_paths=None,
     transition=None,
-    content_mode="motivacional"
+    content_mode="motivacional",
+    # --- novos parâmetros para evitar chamadas duplicadas ---
+    long_text: Optional[str] = None,
+    tts_path: Optional[str] = None,
+    background_audio_path: Optional[str] = None,
+    segments_override: Optional[List[Tuple[float, float, str]]] = None,
 ):
+    """
+    Agora aceita:
+      - long_text: narração já gerada externamente (reusa, não chama gerar_frase_*).
+      - tts_path: caminho de um TTS já gerado (reusa, não chama gerar_narracao_tts).
+      - background_audio_path: se já tiver escolhido/baixado bg antes.
+      - segments_override: se já tiver segmentos prontos de legenda.
+
+    Se não forem passados, o comportamento anterior é mantido.
+    """
     staged_images: List[str] = []
     staged_tts: Optional[str] = None
     staged_title_overlay: Optional[str] = None
@@ -511,27 +525,60 @@ def gerar_video(
             lang_norm = "ar"
         style_norm = _normalize_style(video_style)
 
-        long_text = gerar_frase_tarot_longa(idioma) if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG else gerar_frase_motivacional_longa(idioma)
+        # --- NARRAÇÃO LONGA ---
+        if long_text and isinstance(long_text, str) and long_text.strip():
+            logger.info("📝 Usando narração fornecida externamente (%d chars).", len(long_text))
+        else:
+            # comportamento antigo (gera internamente)
+            if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG:
+                long_text = gerar_frase_tarot_longa(idioma)
+            else:
+                long_text = gerar_frase_motivacional_longa(idioma)
+            logger.info("📝 Narração gerada internamente (frase longa).")
 
-        # TTS no idioma normalizado (suporta 'ru')
-        voice_audio_path = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
+        # --- TTS ---
+        if tts_path and os.path.isfile(tts_path):
+            voice_audio_path = tts_path
+            logger.info("🎧 Usando TTS existente: %s", voice_audio_path)
+        else:
+            voice_audio_path = gerar_narracao_tts(long_text, idioma=lang_norm, engine=tts_engine)
+            logger.info("🎧 TTS gerado internamente via %s.", tts_engine)
+
         dur_voz = _duracao_audio_segundos(voice_audio_path)
         logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz or 0.0)
 
         if voice_audio_path:
             staged_tts = _stage_to_dir(voice_audio_path, os.path.join(AUDIO_DIR, "tts"), "tts")
+            # se veio de fora, não apagar a fonte; só apaga se for de um temp interno
             if os.path.basename(os.path.dirname(voice_audio_path)).lower() in ("audios_tts", "tts"):
                 extra_to_cleanup.append(voice_audio_path)
             voice_audio_path = staged_tts
 
-        background_audio_path = obter_caminho_audio(idioma=lang_norm)
-        has_voice, has_bg = bool(voice_audio_path), bool(background_audio_path)
+        # --- BG MUSIC ---
+        if background_audio_path and os.path.isfile(background_audio_path):
+            bg_path = background_audio_path
+            logger.info("🎵 Usando BG pré-definido: %s", os.path.basename(bg_path))
+        else:
+            bg_path = obter_caminho_audio(idioma=lang_norm)
 
-        if CLEANUP_BG_AUDIO and background_audio_path and os.path.isfile(background_audio_path):
-            bg_audio_to_cleanup = background_audio_path
+        has_voice, has_bg = bool(voice_audio_path), bool(bg_path)
 
-        # Legendas: passam 'lang_norm' (agora pode ser 'ru') e escolhem fonte por idioma
-        segments = make_segments_for_audio(long_text, voice_audio_path, idioma=lang_norm) if legendas and has_voice else []
+        if CLEANUP_BG_AUDIO and bg_path and os.path.isfile(bg_path):
+            bg_audio_to_cleanup = bg_path
+
+        # --- LEGENDAS ---
+        if segments_override is not None:
+            segments = segments_override
+        else:
+            if legendas and has_voice:
+                if not long_text:
+                    logger.warning("Legendas ativadas, mas sem 'long_text' — pulando geração de legendas.")
+                    segments = []
+                else:
+                    segments = make_segments_for_audio(long_text, voice_audio_path, idioma=lang_norm)
+            else:
+                segments = []
+
         if segments:
             logger.info("📝 %d segmentos de legenda gerados.", len(segments))
 
@@ -559,7 +606,7 @@ def gerar_video(
         if has_voice:
             cmd_base += ["-i", voice_audio_path]
         if has_bg:
-            cmd_base += ["-i", background_audio_path]
+            cmd_base += ["-i", bg_path]
 
         parts: List[str] = []
         for i in range(n_slides):
