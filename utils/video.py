@@ -10,13 +10,8 @@ from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
-# Importa apenas o necessário do frase.py
-from .frase import gerar_frase_motivacional_longa, _split_for_emphasis, quebrar_em_duas_linhas
-try:
-    from .frase import gerar_frase_tarot_longa
-    _HAVE_TAROT_LONG = True
-except Exception:
-    _HAVE_TAROT_LONG = False
+# Usado apenas para montar o overlay do título (não gera texto longo aqui!)
+from .frase import _split_for_emphasis
 
 from .audio import obter_caminho_audio, gerar_narracao_tts
 from .subtitles import make_segments_for_audio
@@ -399,11 +394,10 @@ def _get_subtitle_font_path(lang_norm: str) -> Optional[str]:
 
     # Russo (Bebas Neue compatível com cirílico)
     if lang_norm == "ru":
-        # ordem de preferência
         candidates = [
             CYRILLIC_FONT,
-            "bebas-neue-cyrillic.ttf",   # sua fonte
-            "BebasNeue-Regular.ttf",     # métrica similar
+            "bebas-neue-cyrillic.ttf",
+            "BebasNeue-Regular.ttf",
             "Inter-Bold.ttf",
             "Montserrat-Bold.ttf",
             "NotoSans-Regular.ttf",
@@ -444,7 +438,6 @@ def _build_subs_drawtext_chain(
     if not font_opt and REQUIRE_FONTFILE:
         raise RuntimeError("Fonte de legendas não encontrada.")
 
-    # X expr de acordo com a direção do texto
     if rtl:
         x_expr = f"w-(text_w+{margin})"
     else:
@@ -452,7 +445,6 @@ def _build_subs_drawtext_chain(
 
     y_expr = f"h-(text_h+{margin})"
 
-    # Observação: não colocamos text_shaping=1 para evitar falha em builds sem harfbuzz/fribidi
     blocks = []
     for idx, (ini, fim, txt) in enumerate(segments, start=1):
         tf = _write_textfile_for_drawtext(txt, idx)
@@ -482,30 +474,30 @@ def gerar_video(
     slides_paths=None,
     transition=None,
     content_mode="motivacional",
-    # --- novos parâmetros para evitar chamadas duplicadas ---
+    # ---- novos parâmetros para evitar chamadas duplicadas ----
     long_text: Optional[str] = None,
     tts_path: Optional[str] = None,
     background_audio_path: Optional[str] = None,
     segments_override: Optional[List[Tuple[float, float, str]]] = None,
 ):
     """
-    Agora aceita:
-      - long_text: narração já gerada externamente (reusa, não chama gerar_frase_*).
-      - tts_path: caminho de um TTS já gerado (reusa, não chama gerar_narracao_tts).
-      - background_audio_path: se já tiver escolhido/baixado bg antes.
-      - segments_override: se já tiver segmentos prontos de legenda.
+    Gera o vídeo final a partir de slides + narração.
+    IMPORTANTE: Este módulo NÃO gera mais a frase longa internamente.
+      - É OBRIGATÓRIO informar `long_text` (a narração pronta) para evitar chamadas duplicadas ao Gemini.
+      - Se quiser reutilizar um TTS já gerado, passe `tts_path`.
+      - Se já tiver segmentos de legendas prontos, passe em `segments_override`.
 
-    Se não forem passados, o comportamento anterior é mantido.
+    Parâmetros principais:
+      - imagem_path / slides_paths: imagens base.
+      - frase_principal: título para o overlay (legenda tipográfica sobre o vídeo).
+      - idioma: usado para TTS/legendas (normaliza para en/pt/ar/ru).
     """
     staged_images: List[str] = []
     staged_tts: Optional[str] = None
     staged_title_overlay: Optional[str] = None
     extra_to_cleanup: List[str] = []
 
-    # também vamos manter referência dos SLIDES ORIGINAIS para apagar depois
     original_slides_used: List[str] = []
-
-    # manter referência ao BG music para limpeza opcional
     bg_audio_to_cleanup: Optional[str] = None
 
     try:
@@ -516,7 +508,7 @@ def gerar_video(
         slides_validos = [p for p in (slides_paths or [imagem_path]) if p and os.path.isfile(p)]
         if not slides_validos:
             raise FileNotFoundError("Nenhuma imagem de slide válida foi fornecida.")
-        original_slides_used = list(slides_validos)  # guardamos os originais
+        original_slides_used = list(slides_validos)
 
         n_slides = len(slides_validos)
 
@@ -525,18 +517,15 @@ def gerar_video(
             lang_norm = "ar"
         style_norm = _normalize_style(video_style)
 
-        # --- NARRAÇÃO LONGA ---
-        if long_text and isinstance(long_text, str) and long_text.strip():
-            logger.info("📝 Usando narração fornecida externamente (%d chars).", len(long_text))
-        else:
-            # comportamento antigo (gera internamente)
-            if (content_mode or "").lower() == "tarot" and _HAVE_TAROT_LONG:
-                long_text = gerar_frase_tarot_longa(idioma)
-            else:
-                long_text = gerar_frase_motivacional_longa(idioma)
-            logger.info("📝 Narração gerada internamente (frase longa).")
+        # ---- NARRAÇÃO (obrigatória, vinda de fora) ----
+        if not (isinstance(long_text, str) and long_text.strip()):
+            raise ValueError(
+                "long_text não fornecido a gerar_video(). "
+                "A narração longa deve ser gerada antes (ex.: em main.py) e passada aqui para evitar chamadas duplicadas ao Gemini."
+            )
+        logger.info("📝 Usando narração fornecida externamente (%d chars).", len(long_text))
 
-        # --- TTS ---
+        # ---- TTS ----
         if tts_path and os.path.isfile(tts_path):
             voice_audio_path = tts_path
             logger.info("🎧 Usando TTS existente: %s", voice_audio_path)
@@ -549,12 +538,11 @@ def gerar_video(
 
         if voice_audio_path:
             staged_tts = _stage_to_dir(voice_audio_path, os.path.join(AUDIO_DIR, "tts"), "tts")
-            # se veio de fora, não apagar a fonte; só apaga se for de um temp interno
             if os.path.basename(os.path.dirname(voice_audio_path)).lower() in ("audios_tts", "tts"):
                 extra_to_cleanup.append(voice_audio_path)
             voice_audio_path = staged_tts
 
-        # --- BG MUSIC ---
+        # ---- BG MUSIC ----
         if background_audio_path and os.path.isfile(background_audio_path):
             bg_path = background_audio_path
             logger.info("🎵 Usando BG pré-definido: %s", os.path.basename(bg_path))
@@ -566,16 +554,12 @@ def gerar_video(
         if CLEANUP_BG_AUDIO and bg_path and os.path.isfile(bg_path):
             bg_audio_to_cleanup = bg_path
 
-        # --- LEGENDAS ---
+        # ---- LEGENDAS ----
         if segments_override is not None:
             segments = segments_override
         else:
             if legendas and has_voice:
-                if not long_text:
-                    logger.warning("Legendas ativadas, mas sem 'long_text' — pulando geração de legendas.")
-                    segments = []
-                else:
-                    segments = make_segments_for_audio(long_text, voice_audio_path, idioma=lang_norm)
+                segments = make_segments_for_audio(long_text, voice_audio_path, idioma=lang_norm)
             else:
                 segments = []
 
