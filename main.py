@@ -1,17 +1,19 @@
 # main.py
 # CLI principal: conteúdos Motivacional/Tarot e integração com Veo3.
-# Inclui modo "Postar agora" e "Postar automaticamente".
-# Pergunta de headless para ChatGPT/DALL·E e TikTok (Veo3 pergunta dentro do próprio módulo).
+# Modo "Postar agora" e "Postar automaticamente".
+# Correções: evitar dupla geração de narração longa/TTS (gera 1x no video.py),
+# calcular slides por estimativa de leitura (WPM) e passar long_text ao gerar_video.
 
 import os
 import sys
 import time
 import logging
 import random
+import re
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import multiprocessing
-from typing import Optional
+from typing import Optional, Union
 
 # === Ajusta CWD quando empacotado ===
 if getattr(sys, 'frozen', False):
@@ -53,7 +55,6 @@ try:
     from utils.frase import gerar_prompt_tarot, gerar_frase_tarot_curta, gerar_frase_tarot_longa
     _HAVE_TAROT_FUNCS = True
 except Exception:
-    # ainda permitimos tarot curto pelo import acima, se falhar, desativamos total
     _HAVE_TAROT_FUNCS = False
 
 from utils.imagem import escrever_frase_na_imagem, gerar_imagem_com_frase
@@ -66,12 +67,13 @@ except Exception:
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
-# ==== TTS (para medir duração) ====
-try:
-    from utils.audio import gerar_narracao_tts, _duracao_arquivo as _duracao_audio_segundos
-    _HAVE_AUDIO = True
-except Exception:
-    _HAVE_AUDIO = False
+# (IMPORTANTE) Removido TTS prévio para não duplicar geração no video.py
+# try:
+#     from utils.audio import gerar_narracao_tts, _duracao_arquivo as _duracao_audio_segundos
+#     _HAVE_AUDIO = True
+# except Exception:
+#     _HAVE_AUDIO = False
+_HAVE_AUDIO = False  # garantimos que não use TTS aqui
 
 # ==== Veo3 (menus internos) ====
 try:
@@ -98,7 +100,7 @@ MOTION_OPTIONS = {
     "0": ("random",        "Aleatório (entre movimentos)"),
 }
 
-# DEFAULT_SLIDES_COUNT fica aqui por compat (não perguntamos mais)
+# DEFAULT_SLIDES_COUNT fica aqui por compat (fallback)
 DEFAULT_SLIDES_COUNT = int(os.getenv("SLIDES_COUNT", "4"))
 
 # Dinâmica de slides (parametrizável no .env)
@@ -112,11 +114,9 @@ AUDIOS_DIR = "audios"
 MAX_RETRIES = 3
 
 _BACK_TOKENS = {"b", "voltar", "back"}
-# pergunta de headless do TikTok apenas 1x por execução do modo "postar agora"
 _TT_HEADLESS_ASKED = False
 
-
-# ====== Helpers de env/menus ======
+# ====== Helpers ======
 def _int_env(name, default):
     try:
         v = os.getenv(name)
@@ -290,7 +290,7 @@ def _selecionar_gerador_imagens(padrao: str) -> Optional[str]:
         print("2. DALL-E / ChatGPT (Geradas por IA)")
         print(f"Enter = usar .env (IMAGE_MODE={padrao}) | b = voltar")
         raw = input("Digite 1 ou 2: ").strip().lower()
-        if raw in _BACK_TOKENS: 
+        if raw in _BACK_TOKENS:
             return None
         if raw == "":
             print(f" → Usando padrão: {padrao}")
@@ -320,14 +320,33 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     if s in ("modern", "2"):  return "modern_block"
     return "minimal_center"
 
+# === Estimativa de duração (WPM por idioma) ===
+_WPM = {
+    "en": 155.0,
+    "pt-br": 150.0,
+    "pt": 150.0,
+    "ar-eg": 130.0,
+    "ar": 130.0,
+    "ru": 140.0,
+}
+def _estimativa_duracao_segundos(texto: str, idioma: str) -> float:
+    if not texto:
+        return 0.0
+    # conta por tokens separados por espaço (funciona ok p/ a maioria dos alfabetos)
+    words = len(texto.split())
+    wpm = _WPM.get(idioma.lower(), 150.0)
+    secs = (words / wpm) * 60.0
+    return max(5.0, secs)  # mínimo de segurança
+
 # ====== Rotina “uma vez” ======
 def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
            video_style: str, motion: str, slides_count: int, image_engine: str,
            ask_tiktok_headless: bool = True):
     """
     Pipeline clássico (motivacional/cartomante).
-    Agora pergunta o headless do TikTok no INÍCIO (quando ask_tiktok_headless=True).
-    E **define os slides dinamicamente** pela duração do TTS (gerado antes das imagens).
+    Agora NÃO gera TTS antes para medir duração (evita duplicar chamadas).
+    Em vez disso, usa estimativa por WPM para definir o número de slides.
+    Passa a narração longa para o gerar_video() (quando suportado).
     """
     os.makedirs(IMAGENS_DIR, exist_ok=True)
     os.makedirs(VIDEOS_DIR, exist_ok=True)
@@ -363,45 +382,35 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         logger.warning("Falha ao gerar hashtags (seguirei sem): %s", e)
         desc_tiktok = frase
 
-    # 2) Narração longa + TTS (antes das imagens) para medir duração real
-    texto_longo = None
+    # 2) Narração longa (gera APENAS uma vez aqui; TTS fica no video.py)
+    long_text = None
     if _HAVE_TAROT_FUNCS and modo_conteudo == "tarot":
         try:
-            texto_longo = gerar_frase_tarot_longa(idioma)
+            long_text = gerar_frase_tarot_longa(idioma)
         except Exception:
-            texto_longo = None
-
-    if texto_longo is None:
-        if _HAVE_LONGO_MOTIV:
-            try:
-                texto_longo = gerar_frase_motivacional_longa(idioma)
-            except Exception:
-                texto_longo = None
-
-    # Fallback: se não houver função longa, cria um texto razoável (~100-120 palavras)
-    if not texto_longo:
-        base = (frase or "Your time to grow is now.")
-        texto_longo = (" ".join([base] * 20)).strip()
-
-    dur_voz = 0.0
-    if _HAVE_AUDIO:
+            long_text = None
+    if long_text is None and _HAVE_LONGO_MOTIV:
         try:
-            voice_path = gerar_narracao_tts(texto_longo, idioma=idioma, engine=tts_engine)
-            dur_voz = _duracao_audio_segundos(voice_path) or 0.0
-            logger.info("🎙️ Duração da voz (ffprobe): %.2fs", dur_voz)
-        except Exception as e:
-            logger.warning("Não consegui gerar/medir TTS antes das imagens (%s). Vou usar SLIDES_COUNT padrão.", e)
+            long_text = gerar_frase_motivacional_longa(idioma)
+        except Exception:
+            long_text = None
+    if not long_text:
+        base = (frase or "Your time to grow is now.")
+        # fallback ~100 palavras
+        long_text = (" ".join([base] * 20)).strip()
 
-    # 3) Slides dinâmicos pelo tempo do TTS
-    if dur_voz > 0 and SLIDE_SECONDS_PER_IMAGE > 0:
-        slides_auto = int(round(dur_voz / SLIDE_SECONDS_PER_IMAGE))
+    logger.info("📝 Narração gerada internamente (frase longa).")
+
+    # 3) Slides por estimativa (NÃO chama TTS aqui)
+    dur_est = _estimativa_duracao_segundos(long_text, idioma=idioma)
+    if SLIDE_SECONDS_PER_IMAGE > 0:
+        slides_auto = int(round(dur_est / SLIDE_SECONDS_PER_IMAGE))
     else:
         slides_auto = DEFAULT_SLIDES_COUNT
     slides_auto = max(SLIDES_MIN, min(SLIDES_MAX, slides_auto))
-    logger.info("🧮 Slides (dinâmico): duração TTS=%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
-                dur_voz, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX)
+    logger.info("🧮 Slides (estimado): duração≈%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
+                dur_est, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX)
 
-    # usamos SEMPRE o dinâmico; o parâmetro slides_count fica só por compatibilidade
     slides_count = slides_auto
 
     # 4) Imagens
@@ -470,20 +479,37 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         )
         slides_para_video.append(out_path)
 
-    # 6) Gerar vídeo
+    # 6) Gerar vídeo (passa long_text; fallback se assinatura não aceitar)
     logger.info("🖼️ Slides prontos (%d). Gerando vídeo…", len(slides_para_video))
-    gerar_video(
-        imagem_path=slides_para_video[0],
-        saida_path=video_final,
-        preset="fullhd",
-        idioma=idioma,
-        tts_engine=tts_engine,
-        legendas=legendas,
-        video_style=video_style,
-        motion=motion,
-        slides_paths=slides_para_video,
-        content_mode=modo_conteudo
-    )
+    try:
+        gerar_video(
+            imagem_path=slides_para_video[0],
+            saida_path=video_final,
+            preset="fullhd",
+            idioma=idioma,
+            tts_engine=tts_engine,
+            legendas=legendas,
+            video_style=video_style,
+            motion=motion,
+            slides_paths=slides_para_video,
+            content_mode=modo_conteudo,
+            long_text=long_text  # ← evita nova geração dentro do video.py
+        )
+    except TypeError:
+        # compatibilidade com versões antigas de utils/video.py que não aceitam long_text
+        logger.warning("video.py não aceita parâmetro 'long_text'. Ele irá gerar a narração internamente.")
+        gerar_video(
+            imagem_path=slides_para_video[0],
+            saida_path=video_final,
+            preset="fullhd",
+            idioma=idioma,
+            tts_engine=tts_engine,
+            legendas=legendas,
+            video_style=video_style,
+            motion=motion,
+            slides_paths=slides_para_video,
+            content_mode=modo_conteudo
+        )
 
     # 7) Postar
     ok = postar_no_tiktok_e_renomear(
@@ -507,7 +533,14 @@ def _run_rotina_once(args_tuple):
         logging.exception("Falha na execução única: %s", e)
         return False
 
-def _executar_com_timeout(args_tuple):
+def _executar_com_timeout(args_tuple) -> Union[bool, None]:
+    """
+    Executa a rotina em um processo isolado com timeout.
+    Retornos:
+      - True  -> finalizou sem exceção
+      - False -> houve exceção na rotina
+      - None  -> TIMEOUT (estourou o tempo configurado)
+    """
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
         fut = ex.submit(_run_rotina_once, args_tuple)
@@ -515,7 +548,7 @@ def _executar_com_timeout(args_tuple):
             return bool(fut.result(timeout=int(ITERATION_TIMEOUT_MIN * 60)))
         except TimeoutError:
             logging.error("⏱️ Iteração excedeu %.1f min — abortando.", ITERATION_TIMEOUT_MIN)
-            return False
+            return None
 
 # ====== Modo automático (pipeline clássico) ======
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str,
@@ -537,16 +570,24 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
             inicio = datetime.now()
             logger.info("🟢 Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
 
-            # rotina sem perguntar headless a cada ciclo
             args_tuple = (
                 modo_conteudo, idioma, tts_engine, legendas,
-                video_style, motion, 0, image_engine, False  # slides_count=0 (ignoramos; dinâmico)
+                video_style, motion, 0, image_engine, False
             )
             ok = _executar_com_timeout(args_tuple)
 
             proxima = inicio + timedelta(hours=cada_horas)
             rem = max(0.0, (proxima - datetime.now()).total_seconds())
-            logger.info("✅ Execução %s. Próxima em ~%d min.", "ok" if ok else "com falha", int(rem/60))
+            rem_horas = rem / 3600.0
+
+            if ok is True:
+                logger.info("✅ Execução OK.")
+            elif ok is False:
+                logger.warning("❌ Execução falhou.")
+            else:
+                logger.warning("⏱️ Execução excedeu %.1f min (timeout).", ITERATION_TIMEOUT_MIN)
+
+            logger.info("Próxima execução em %.2f horas...", rem_horas)
             time.sleep(rem)
     except KeyboardInterrupt:
         logger.info("🟥 Encerrado pelo usuário.")
@@ -556,17 +597,15 @@ def _menu_principal():
     while True:
         modo = _menu_modo_execucao()
 
-        # idioma
         idioma = _selecionar_idioma()
         if idioma is None:
             continue
 
-        # conteúdo por idioma
         conteudo = _submenu_conteudo_por_idioma(idioma)
         if conteudo is None:
             continue
 
-        # Veo3 tem fluxo interno (inclusive headless do Flow)
+        # Veo3 tem fluxo próprio
         if conteudo[0] == "veo3":
             if modo == "2":
                 horas = _ler_intervalo_horas()
@@ -577,7 +616,6 @@ def _menu_principal():
                 veo3_executar_interativo(persona=conteudo[1], idioma=idioma)
             continue
 
-        # pipeline clássico (motivacional / tarot)
         if modo == "2":
             horas = _ler_intervalo_horas()
             if horas is None:
@@ -599,7 +637,6 @@ def _menu_principal():
         if motion is None:
             continue
 
-        # ❌ NÃO perguntamos mais a quantidade de fotos (dinâmico pelo TTS)
         image_engine = _selecionar_gerador_imagens(os.getenv("IMAGE_MODE", "pexels"))
         if image_engine is None:
             continue
@@ -613,7 +650,7 @@ def _menu_principal():
                 legendas=legendas,
                 video_style=video_style,
                 motion=motion,
-                slides_count=0,           # ignorado (dinâmico)
+                slides_count=0,
                 image_engine=image_engine
             )
         else:
@@ -624,16 +661,14 @@ def _menu_principal():
                 legendas=legendas,
                 video_style=video_style,
                 motion=motion,
-                slides_count=0,           # ignorado (dinâmico)
+                slides_count=0,
                 image_engine=image_engine,
                 ask_tiktok_headless=True
             )
 
 if __name__ == "__main__":
-    # Necessário em apps congelados (PyInstaller) no Windows
     try:
         multiprocessing.freeze_support()
     except Exception:
         pass
-
     _menu_principal()
