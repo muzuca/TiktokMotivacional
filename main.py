@@ -630,4 +630,10 @@ def _menu_principal():
             )
 
 if __name__ == "__main__":
+    # Necessário em apps congelados (PyInstaller) no Windows
+    try:
+        multiprocessing.freeze_support()
+    except Exception:
+        pass
+
     _menu_principal()
