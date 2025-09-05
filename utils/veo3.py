@@ -4,11 +4,11 @@
 # - Normaliza cada cena para 9:16 (1080x1920) via scale+pad (SEM zoom)
 # - Junta cenas (concat) + BGM opcional (com Audio Ducking); aplica PÓS-ZOOM opcional no final
 # - Menus com "b/voltar": testar, gerar+postar, reutilizar, **exportar (sem postar)** e auto-config do modo automático
-# - (NOVO) Resume inteligente: só gera cenas faltantes/sem áudio
-# - (NOVO) Menu 5: Regerar faltantes a partir de prompts salvos e postar
+# - Resume inteligente: só gera cenas faltantes/sem áudio
+# - Limpeza pós-postagem remove os arquivos de cena (cN.mp4) p/ não reutilizar no automático
 from __future__ import annotations
 
-import os, re, json, time, shutil, random, logging, subprocess
+import os, re, json, time, shutil, random, logging, subprocess, glob
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -54,6 +54,7 @@ BG_MIX_DB = float(os.getenv("BG_MIX_DB", "-20.0"))
 VEO3_MODEL  = os.getenv("VEO3_MODEL", "veo-3.0-generate-preview").strip()
 TEXT_MODEL  = os.getenv("VEO3_TEXT_MODEL", "gemini-2.0-flash-001").strip()
 
+# Limites do diálogo
 D_MIN = int(os.getenv("VEO3_DIALOGUE_MIN_WORDS", "18"))
 D_MAX = int(os.getenv("VEO3_DIALOGUE_MAX_WORDS", "22"))
 HASHTAGS_TOP_N = 3
@@ -65,8 +66,11 @@ NEGATIVE_PROMPT = (
 
 USE_BACKEND = os.getenv("VEO3_BACKEND", "flow").strip().lower()
 FLOW_PROJECT_URL  = os.getenv("FLOW_PROJECT_URL", "").strip()
-FLOW_COOKIES_FILE = os.getenv("FLOW_COOKIES_FILE", "veo3.txt").strip()
+FLOW_COOKIES_FILE = os.getenv("FLOW_COOKIES_FILE", "cache/cookies/flow/veo3.txt").strip()
 VEO3_HEADLESS     = os.getenv("VEO3_CHROME_HEADLESS", "1").strip() != "0"  # default do .env
+
+# ==== NOVO: número de tentativas para chamadas ao Gemini ====
+GEMINI_MAX_RETRIES = max(1, int(os.getenv("GEMINI_MAX_RETRIES", "3")))
 
 # Retry automático em caso de falha (modo automático)
 def _auto_retry_minutes() -> int:
@@ -182,18 +186,53 @@ def _get_client() -> "genai.Client":
         raise RuntimeError("Instale: pip install -U google-genai")
     return genai.Client()
 
+# ------------------------ Helpers p/ Gemini com retry ------------------------
+def _gemini_generate_json(contents: str, stage_label: str, required_keys: Optional[List[str]] = None) -> Optional[dict]:
+    """
+    Chama o Gemini pedindo JSON (response_mime_type=application/json) com retry.
+    Em cada falha de formato, imprime o texto bruto recebido.
+    """
+    client = _get_client()
+    cfg = types.GenerateContentConfig(response_mime_type="application/json")
+
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            resp = client.models.generate_content(model=TEXT_MODEL, contents=contents, config=cfg)
+            raw = (resp.text or "").strip()
+
+            # Log/print do bruto sempre que der problema
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception as je:
+                logger.error("%s: JSON inválido (tentativa %d/%d): %s", stage_label, attempt, GEMINI_MAX_RETRIES, je)
+                print("\n================= RAW JSON (", stage_label, f") tentativa {attempt}/{GEMINI_MAX_RETRIES} =================", sep="")
+                print(raw)
+                print("====================================================================================\n")
+                continue
+
+            if required_keys:
+                if not all(k in data for k in required_keys):
+                    logger.error("%s: JSON sem chaves necessárias (tentativa %d/%d).", stage_label, attempt, GEMINI_MAX_RETRIES)
+                    print("\n================= RAW JSON (", stage_label, f") tentativa {attempt}/{GEMINI_MAX_RETRIES} =================", sep="")
+                    print(json.dumps(data, indent=2, ensure_ascii=False))
+                    print("====================================================================================\n")
+                    continue
+
+            # Sucesso
+            return data
+
+        except Exception as e:
+            logger.error("%s: falha na chamada (tentativa %d/%d): %s", stage_label, attempt, GEMINI_MAX_RETRIES, e)
+
+    # Depois de todas as tentativas, sem sucesso
+    logger.error("%s: esgotadas %d tentativas sem JSON válido.", stage_label, GEMINI_MAX_RETRIES)
+    return None
+
 # ------------------------ Gemini (estágio 1) ------------------------
 def _ask_gemini_viral_analysis(tema: str, persona: str, idioma: str) -> Dict[str, str]:
     logger.info("🧠 Estágio 1: Analisando tendências e definindo direção de cena para o tema '%s'...", tema)
-    client = _get_client()
     data_hoje = datetime.now().strftime("%Y-%m-%d")
-    # ✅ idioma dinâmico (inclui RU)
-    target_lang_map = {
-        "pt": "Brazilian Portuguese",
-        "ar": "Arabic",
-        "en": "English",
-        "ru": "Russian",
-    }
+    target_lang_map = {"pt": "Brazilian Portuguese", "ar": "Arabic", "en": "English", "ru": "Russian"}
     target_lang_name = target_lang_map.get(idioma.lower()[:2], "English")
 
     try:
@@ -202,26 +241,26 @@ def _ask_gemini_viral_analysis(tema: str, persona: str, idioma: str) -> Dict[str
             data_hoje=data_hoje, tema=tema, persona=persona, target_lang_name=target_lang_name
         )
 
-        # LOG p/ debug
         print("\n================ COMANDO ENVIADO AO GEMINI (ANÁLISE) ================\n")
         print(cmd)
         print("\n====================================================================\n")
 
-        cfg = types.GenerateContentConfig(response_mime_type="application/json")
-        resp = client.models.generate_content(model=TEXT_MODEL, contents=cmd, config=cfg)
-        analysis = json.loads(resp.text or "{}")
-        required_keys = [
+        required = [
             "viral_angle", "keywords", "tone_of_voice", "visual_style",
             "cinematography_suggestions", "character_action", "hook_style", "cta_style"
         ]
-        if all(key in analysis for key in required_keys):
+        analysis = _gemini_generate_json(cmd, "Estágio 1 / Direção de Cena", required_keys=required)
+
+        if analysis:
             logger.info("✅ Direção de cena definida com sucesso.")
             print("\n================ MANUAL DE DIREÇÃO (Estágio 1) ================\n")
             print(json.dumps(analysis, indent=2, ensure_ascii=False))
             print("\n==============================================================\n")
             return analysis
-        else:
-            raise ValueError("A resposta JSON do diretor não contém as chaves necessárias.")
+
+        # Fallback final
+        raise ValueError("A resposta JSON do diretor não contém as chaves necessárias.")
+
     except Exception as e:
         logger.error("Falha no Estágio 1 (Direção de Cena): %s. Usando um fallback genérico.", e)
         return {
@@ -262,7 +301,6 @@ def _build_gemini_command_full(
 ) -> str:
     config = _load_persona_config(persona)
     role_persona = config["dossier"]
-    # ✅ idioma dinâmico (inclui RU)
     target_lang_map = {
         "pt": "Brazilian Portuguese (pt-BR)",
         "ar": "Egyptian Arabic",
@@ -336,7 +374,7 @@ def _regenerate_short_dialogue(client: "genai.Client", original_dialogue: str, m
             f"Responda APENAS com a frase reescrita, terminando com um ponto final.\n\n"
             f"Frase original: \"{original_dialogue}\""
         )
-        resp = client.models.generate_content(model=TEXT_MODEL, contents=prompt)
+        resp = _get_client().models.generate_content(model=TEXT_MODEL, contents=prompt)
         new_dialogue = (resp.text or "").strip()
         if new_dialogue and len(new_dialogue.split()) <= max_words:
             logger.info(f"✅ Diálogo reescrito com sucesso: \"{new_dialogue}\"")
@@ -354,6 +392,7 @@ def _strip_persona_name(dialogue: str, persona: str) -> str:
     names = {
         "yasmina": ["Yasmina", "ياسمينا", "YASMina"],
         "luisa": ["Luísa", "Luisa"],
+        "alina": ["Alina", "Алина"],
     }
     alts = names.get((persona or "").lower(), [])
     if not alts:
@@ -365,44 +404,78 @@ def _strip_persona_name(dialogue: str, persona: str) -> str:
 def _ask_gemini_scene_prompts(
     persona: str, idioma: str, tema: str, n: int, variation_mode: str, viral_context: Dict[str, str]
 ) -> List[str]:
-    client = _get_client()
     cmd = _build_gemini_command_full(persona, idioma, tema, n, variation_mode, viral_context)
     logger.info("🎬 Estágio 2: Gerando prompts de cena com base no manual de direção...")
     print("\n================ COMANDO ENVIADO AO GEMINI (CENAS) ================\n")
     print(cmd)
     print("\n===================================================================\n")
+
+    client = _get_client()
     cfg = types.GenerateContentConfig(response_mime_type="application/json")
-    resp = client.models.generate_content(model=TEXT_MODEL, contents=cmd, config=cfg)
-    prompts = _parse_prompts_from_gemini_json(resp.text or "", n)
 
-    dialogue_pattern = re.compile(
-        r'(Dialogue:.*?spoken in .*?\n)(.*?)(?=\n\n|\nBackground sounds:)', 
-        re.DOTALL
-    )
+    last_raw = ""
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            resp = client.models.generate_content(model=TEXT_MODEL, contents=cmd, config=cfg)
+            raw = (resp.text or "").strip()
+            last_raw = raw
 
-    def replacer(match: re.Match) -> str:
-        header = match.group(1)
-        original_dialogue = match.group(2).strip()
-        original_dialogue = _strip_persona_name(original_dialogue, persona)
-        word_count = len(original_dialogue.split())
+            # Mostrar SEMPRE o JSON bruto quando a tentativa falhar (abaixo)
+            try:
+                prompts = _parse_prompts_from_gemini_json(raw, n)
+            except Exception as je:
+                logger.error("Estágio 2: JSON inválido (tentativa %d/%d): %s", attempt, GEMINI_MAX_RETRIES, je)
+                print("\n=============== RESPOSTA BRUTA DO GEMINI (CENAS) ===============\n")
+                print(raw)
+                print("\n=================================================================\n")
+                continue
 
-        if D_MIN <= word_count <= D_MAX:
-            return f"{header}{original_dialogue}"
+            if not prompts:
+                logger.error("Estágio 2: JSON sem cenas (tentativa %d/%d).", attempt, GEMINI_MAX_RETRIES)
+                print("\n=============== RESPOSTA BRUTA DO GEMINI (CENAS) ===============\n")
+                print(raw)
+                print("\n=================================================================\n")
+                continue
 
-        if word_count > D_MAX:
-            logger.warning(f"Diálogo excedeu {D_MAX} palavras (tinha {word_count}). Tentando regenerar...")
-            new_dialogue = _regenerate_short_dialogue(client, original_dialogue, D_MAX)
-            if not new_dialogue:
-                words = original_dialogue.split()[:D_MAX]
-                new_dialogue = ' '.join(words)
-                if not new_dialogue.endswith('.'):
-                    new_dialogue = re.sub(r'[,;:]\s*$', '', new_dialogue).strip() + '.'
-            return f"{header}{_strip_persona_name(new_dialogue, persona)}"
+            # Valida/ajusta os diálogos dentro do bloco
+            dialogue_pattern = re.compile(
+                r'(Dialogue:.*?spoken in .*?\n)(.*?)(?=\n\n|\nBackground sounds:)',
+                re.DOTALL
+            )
 
-        return f"{header}{original_dialogue}"
+            def replacer(match: re.Match) -> str:
+                header = match.group(1)
+                original_dialogue = match.group(2).strip()
+                original_dialogue = _strip_persona_name(original_dialogue, persona)
+                word_count = len(original_dialogue.split())
 
-    validated_prompts = [dialogue_pattern.sub(replacer, p_text) for p_text in prompts]
-    return validated_prompts
+                if D_MIN <= word_count <= D_MAX:
+                    return f"{header}{original_dialogue}"
+
+                if word_count > D_MAX:
+                    logger.warning(f"Diálogo excedeu {D_MAX} palavras (tinha {word_count}). Tentando regenerar...")
+                    new_dialogue = _regenerate_short_dialogue(client, original_dialogue, D_MAX)
+                    if not new_dialogue:
+                        words = original_dialogue.split()[:D_MAX]
+                        new_dialogue = ' '.join(words)
+                        if not new_dialogue.endswith('.'):
+                            new_dialogue = re.sub(r'[,;:]\s*$', '', new_dialogue).strip() + '.'
+                    return f"{header}{_strip_persona_name(new_dialogue, persona)}"
+
+                return f"{header}{original_dialogue}"
+
+            validated_prompts = [dialogue_pattern.sub(replacer, p_text) for p_text in prompts]
+            return validated_prompts
+
+        except Exception as e:
+            logger.error("Estágio 2: falha na chamada (tentativa %d/%d): %s", attempt, GEMINI_MAX_RETRIES, e)
+
+    # Se chegou aqui, esgotou tentativas — imprime último bruto pra análise
+    if last_raw:
+        print("\n=============== RESPOSTA BRUTA DO GEMINI (CENAS) — ÚLTIMA TENTATIVA ===============\n")
+        print(last_raw)
+        print("\n====================================================================================\n")
+    return []
 
 # ------------------------ FFmpeg helpers ------------------------
 def _stitch_and_bgm_ffmpeg(mp4s: List[str], out_path: str, bgm_path: str = "", bgm_db: float = BG_MIX_DB) -> str:
@@ -492,6 +565,38 @@ def _post_zoom_ffmpeg(src_path: str, dst_path: str, zoom: float) -> str:
     subprocess.run(cmd, check=True)
     return dst_path
 
+# ------------------------ Limpeza pós-postagem ------------------------
+_VID_RE = re.compile(r"^veo3_(?:test_)?(?P<slug>.+?)(?:_c(?P<idx>\d+)|_final.*)?\.mp4$", re.IGNORECASE)
+
+def _cleanup_core_videos_for_slug(slug: str) -> None:
+    """Remove os arquivos de cena (cN.mp4) e o final 'sem zoom', mantendo
+    somente o arquivo postado (que normalmente já é removido pelo uploader)."""
+    try:
+        # cenas
+        pattern = os.path.join(VIDEOS_DIR, f"veo3_{slug}_c*.mp4")
+        removed = 0
+        for p in glob.glob(pattern):
+            try:
+                os.remove(p)
+                logger.info("🗑️ Arquivo removido (cena): %s", p)
+                removed += 1
+            except Exception as e:
+                logger.warning("Não consegui remover %s: %s", p, e)
+
+        # final "sem zoom" (se existir)
+        p_final = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
+        if os.path.isfile(p_final):
+            try:
+                os.remove(p_final)
+                logger.info("🗑️ Arquivo removido (final): %s", p_final)
+            except Exception as e:
+                logger.warning("Não consegui remover %s: %s", p_final, e)
+
+        if removed == 0:
+            logger.info("🧹 Limpeza: não havia cenas cN.mp4 para remover.")
+    except Exception as e:
+        logger.warning("Falha na limpeza pós-postagem: %s", e)
+
 # ------------------------ TikTok headless (pergunta 1x) ------------------------
 _TT_HEADLESS_CONFIRMED = False
 
@@ -556,7 +661,7 @@ def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
             pass
     return out[:k]
 
-def _postar_video(final_video: str, idioma: str) -> bool:
+def _postar_video(final_video: str, idioma: str, *, cleanup_slug: bool = True) -> bool:
     # pergunta headless do TikTok (uma única vez por execução)
     if not _ensure_tiktok_headless_prompt():
         return False
@@ -587,13 +692,19 @@ def _postar_video(final_video: str, idioma: str) -> bool:
 
     if ok:
         print("✅ Postado com sucesso.")
+        if cleanup_slug:
+            # deduz o slug a partir do arquivo final
+            base = os.path.basename(final_video)
+            m = _VID_RE.match(base)
+            if m:
+                _cleanup_core_videos_for_slug(m.group("slug"))
+            else:
+                logger.debug("Não consegui deduzir slug para limpeza a partir de: %s", base)
     else:
         print("⚠️ Upload não confirmado. Verifique os logs.")
     return bool(ok)
 
 # ------------------------ Utilidades de arquivo ------------------------
-_VID_RE = re.compile(r"^veo3_(?:test_)?(?P<slug>.+?)(?:_c(?P<idx>\d+)|_final.*)?\.mp4$", re.IGNORECASE)
-
 def _listar_slugs() -> Dict[str, Dict[str, List[str]]]:
     items: Dict[str, Dict[str, List[str]]] = {}
     try:
@@ -630,6 +741,11 @@ def _is_ok_video(path: str) -> bool:
         return _has_audio_stream(path)
     except Exception:
         return False
+
+def _save_text(path: str, text: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 def _load_saved_prompts(slug: str) -> List[str]:
     prompts = []
@@ -792,18 +908,13 @@ def _perguntar_headless_flow(default_on: bool) -> Optional[bool]:
     print("\nExecutar o Flow (Veo3) em modo headless?")
     print(f"Enter = {padrao}  |  1. Sim  |  2. Não  |  b. Voltar")
     op = input("Escolha: ").strip().lower()
-    if op in _BACK_TOKENS: 
+    if op in _BACK_TOKENS:
         return None
     if op in {"1", "s", "sim"}:
         return True
     if op in {"2", "n", "nao", "não"}:
         return False
     return default_on
-
-def _save_text(path: str, text: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
 
 def _preview_and_confirm_prompts(slug: str, prompts: List[str]) -> Optional[bool]:
     print("\n================= PRÉVIA DE PROMPTS (todas as cenas) =================")
@@ -829,17 +940,6 @@ def _submenu_acao() -> Optional[str]:
     if op in _BACK_TOKENS:
         return None
     return op if op in {"1", "2", "3", "4", "5"} else "1"
-
-def _load_saved_prompts(slug: str) -> List[str]:
-    prompts = []
-    for i in range(1, 9):
-        p = os.path.join(PROMPTS_DIR, f"veo3_{slug}_c{i}.prompt.txt")
-        if os.path.isfile(p):
-            with open(p, "r", encoding="utf-8") as f:
-                prompts.append(f.read())
-        else:
-            break
-    return prompts
 
 def _regenerar_cenas_faltantes(slug: str, idioma: str, persona: str) -> List[str]:
     prompts = _load_saved_prompts(slug)
@@ -909,7 +1009,7 @@ def executar_interativo(persona: str, idioma: str) -> None:
                     final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
                 except Exception as e:
                     logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
-            _postar_video(final_video, idioma)
+            _postar_video(final_video, idioma, cleanup_slug=True)
             return
 
         try:
@@ -964,7 +1064,7 @@ def executar_interativo(persona: str, idioma: str) -> None:
             print(f"✅ Exportado (sem postar): {final_video}")
             return
 
-        _postar_video(final_video, idioma)
+        _postar_video(final_video, idioma, cleanup_slug=True)
         return
 
 # ------------------------ Batch (Flow/API) ------------------------
@@ -1051,7 +1151,7 @@ def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
         print("Cancelado.")
         return
 
-    # 2) (NOVO) Pergunta headless do Flow no modo automático também
+    # 2) Pergunta headless do Flow no modo automático
     global VEO3_HEADLESS
     if USE_BACKEND == "flow":
         ans = _perguntar_headless_flow(VEO3_HEADLESS)
@@ -1123,7 +1223,7 @@ def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
                     except Exception as e:
                         logger.warning("Falha no pós-zoom auto (%.2f): %s", POST_ZOOM, e)
 
-                success = _postar_video(final_video, idioma)
+                success = _postar_video(final_video, idioma, cleanup_slug=True)
 
             except Exception as e:
                 logger.exception("Falha no ciclo Veo3: %s", e)
