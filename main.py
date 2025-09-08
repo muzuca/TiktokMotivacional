@@ -3,13 +3,13 @@
 # Modo "Postar agora" e "Postar automaticamente".
 # Correções: evitar dupla geração de narração longa/TTS (gera 1x no video.py),
 # calcular slides por estimativa de leitura (WPM) e passar long_text ao gerar_video.
+# NOVO: recarrega o .env ao voltar para o menu e antes de cada iteração no modo automático.
 
 import os
 import sys
 import time
 import logging
 import random
-import re
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import multiprocessing
@@ -26,6 +26,13 @@ if getattr(sys, 'frozen', False):
 from dotenv import load_dotenv, find_dotenv
 ENV_PATH = find_dotenv(usecwd=True)
 load_dotenv(ENV_PATH, override=True)
+
+# Guardar mtime do .env para hot-reload
+_ENV_PATH = ENV_PATH
+try:
+    _ENV_MTIME = os.path.getmtime(_ENV_PATH) if _ENV_PATH else None
+except OSError:
+    _ENV_MTIME = None
 
 # ==== LOG ====
 LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -68,11 +75,6 @@ from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
 # (IMPORTANTE) Removido TTS prévio para não duplicar geração no video.py
-# try:
-#     from utils.audio import gerar_narracao_tts, _duracao_arquivo as _duracao_audio_segundos
-#     _HAVE_AUDIO = True
-# except Exception:
-#     _HAVE_AUDIO = False
 _HAVE_AUDIO = False  # garantimos que não use TTS aqui
 
 # ==== Veo3 (menus internos) ====
@@ -101,12 +103,19 @@ MOTION_OPTIONS = {
 }
 
 # DEFAULT_SLIDES_COUNT fica aqui por compat (fallback)
-DEFAULT_SLIDES_COUNT = int(os.getenv("SLIDES_COUNT", "4"))
+def _int_env(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(v) if v is not None and str(v).strip() != "" else default
+    except Exception:
+        return default
+
+DEFAULT_SLIDES_COUNT = _int_env("SLIDES_COUNT", 4)
 
 # Dinâmica de slides (parametrizável no .env)
 SLIDE_SECONDS_PER_IMAGE = float(os.getenv("SLIDE_SECONDS_PER_IMAGE", "3.0"))
-SLIDES_MIN = int(os.getenv("SLIDES_MIN", "3"))
-SLIDES_MAX = int(os.getenv("SLIDES_MAX", "10"))
+SLIDES_MIN = _int_env("SLIDES_MIN", 3)
+SLIDES_MAX = _int_env("SLIDES_MAX", 10)
 
 IMAGENS_DIR = "imagens"
 VIDEOS_DIR = "videos"
@@ -116,14 +125,70 @@ MAX_RETRIES = 3
 _BACK_TOKENS = {"b", "voltar", "back"}
 _TT_HEADLESS_ASKED = False
 
-# ====== Helpers ======
-def _int_env(name, default):
-    try:
-        v = os.getenv(name)
-        return int(v) if v is not None and str(v).strip() != "" else default
-    except Exception:
-        return default
+# === Estimativa de duração (WPM por idioma) ===
+_WPM = {
+    "en": 155.0,
+    "pt-br": 150.0,
+    "pt": 150.0,
+    "ar-eg": 130.0,
+    "ar": 130.0,
+    "ru": 140.0,
+}
+def _estimativa_duracao_segundos(texto: str, idioma: str) -> float:
+    if not texto:
+        return 0.0
+    words = len(texto.split())
+    wpm = _WPM.get(idioma.lower(), 150.0)
+    secs = (words / wpm) * 60.0
+    return max(5.0, secs)  # mínimo de segurança
 
+# ====== Hot-reload do .env ======
+def _reload_env_settings():
+    """Reaplica valores do .env às variáveis deste módulo e ao nível de log."""
+    global DEFAULT_SLIDES_COUNT, SLIDE_SECONDS_PER_IMAGE, SLIDES_MIN, SLIDES_MAX, ITERATION_TIMEOUT_MIN
+
+    DEFAULT_SLIDES_COUNT = _int_env("SLIDES_COUNT", DEFAULT_SLIDES_COUNT)
+    SLIDE_SECONDS_PER_IMAGE = float(os.getenv("SLIDE_SECONDS_PER_IMAGE", str(SLIDE_SECONDS_PER_IMAGE)))
+    SLIDES_MIN = _int_env("SLIDES_MIN", SLIDES_MIN)
+    SLIDES_MAX = _int_env("SLIDES_MAX", SLIDES_MAX)
+
+    # timeout do modo automático
+    try:
+        ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", str(ITERATION_TIMEOUT_MIN)))
+    except NameError:
+        # primeira carga ainda não definiu, então leia com default
+        ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))
+
+    # nível de log
+    new_level_name = os.getenv("LOG_LEVEL")
+    if new_level_name:
+        new_level = getattr(logging, new_level_name.upper(), None)
+        if isinstance(new_level, int) and logger.level != new_level:
+            logger.setLevel(new_level)
+
+def _reload_env_if_changed(force: bool = False) -> bool:
+    """Se o .env foi modificado desde a última leitura, recarrega e atualiza configs."""
+    global _ENV_MTIME
+    if not _ENV_PATH:
+        return False
+    try:
+        mtime = os.path.getmtime(_ENV_PATH)
+    except OSError:
+        mtime = None
+
+    changed = force or (
+        (_ENV_MTIME is None and mtime is not None) or
+        (mtime is not None and _ENV_MTIME is not None and mtime > _ENV_MTIME)
+    )
+    if changed:
+        load_dotenv(_ENV_PATH, override=True)
+        _ENV_MTIME = mtime
+        _reload_env_settings()
+        logger.info("♻️ .env recarregado.")
+        return True
+    return False
+
+# ====== Helpers/UI ======
 def _menu_modo_execucao() -> str:
     while True:
         print("\nO que você deseja fazer?")
@@ -320,24 +385,6 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     if s in ("modern", "2"):  return "modern_block"
     return "minimal_center"
 
-# === Estimativa de duração (WPM por idioma) ===
-_WPM = {
-    "en": 155.0,
-    "pt-br": 150.0,
-    "pt": 150.0,
-    "ar-eg": 130.0,
-    "ar": 130.0,
-    "ru": 140.0,
-}
-def _estimativa_duracao_segundos(texto: str, idioma: str) -> float:
-    if not texto:
-        return 0.0
-    # conta por tokens separados por espaço (funciona ok p/ a maioria dos alfabetos)
-    words = len(texto.split())
-    wpm = _WPM.get(idioma.lower(), 150.0)
-    secs = (words / wpm) * 60.0
-    return max(5.0, secs)  # mínimo de segurança
-
 # ====== Rotina “uma vez” ======
 def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
            video_style: str, motion: str, slides_count: int, image_engine: str,
@@ -408,9 +455,10 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     else:
         slides_auto = DEFAULT_SLIDES_COUNT
     slides_auto = max(SLIDES_MIN, min(SLIDES_MAX, slides_auto))
-    logger.info("🧮 Slides (estimado): duração≈%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
-                dur_est, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX)
-
+    logger.info(
+        "🧮 Slides (estimado): duração≈%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
+        dur_est, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX
+    )
     slides_count = slides_auto
 
     # 4) Imagens
@@ -438,7 +486,8 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
                         break
                 except Exception as e:
                     logger.error(f"Falha na tentativa {attempt+1} (imagem {i+1}): {e}")
-                    if attempt < MAX_RETRIES - 1: time.sleep(5)
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(5)
             if not success:
                 logger.error(f"❌ Não consegui gerar a imagem {i+1} após {MAX_RETRIES} tentativas.")
     else:
@@ -456,7 +505,8 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
                         break
                 except Exception as e:
                     logger.error(f"Falha na tentativa {attempt+1} (imagem {i+1}): {e}")
-                    if attempt < MAX_RETRIES - 1: time.sleep(5)
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(5)
             if not success:
                 logger.error(f"❌ Não consegui gerar a imagem {i+1} após {MAX_RETRIES} tentativas.")
 
@@ -567,6 +617,11 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
 
     try:
         while True:
+            # Recarrega .env a cada nova iteração do modo automático
+            _reload_env_if_changed()
+
+            # Se mudarem o timeout no .env, refletimos já
+            # (ITERATION_TIMEOUT_MIN é atualizado dentro de _reload_env_settings)
             inicio = datetime.now()
             logger.info("🟢 Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
 
@@ -594,8 +649,14 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
 
 # ====== Menus de alto nível ======
 def _menu_principal():
+    # sempre que o usuário retorna ao menu principal, verificamos mudanças no .env
+    _reload_env_if_changed(force=False)
+
     while True:
         modo = _menu_modo_execucao()
+
+        # recarrega .env novamente no início do loop do menu
+        _reload_env_if_changed(force=False)
 
         idioma = _selecionar_idioma()
         if idioma is None:
@@ -614,6 +675,8 @@ def _menu_principal():
                 veo3_postar_em_intervalo(persona=conteudo[1], idioma=idioma, cada_horas=horas)
             else:
                 veo3_executar_interativo(persona=conteudo[1], idioma=idioma)
+            # ao sair do fluxo do veo3 e voltar ao menu, verificar .env de novo
+            _reload_env_if_changed(force=False)
             continue
 
         if modo == "2":
@@ -653,6 +716,8 @@ def _menu_principal():
                 slides_count=0,
                 image_engine=image_engine
             )
+            # ao voltar do modo automático (Ctrl+C), checar .env novamente
+            _reload_env_if_changed(force=False)
         else:
             rotina(
                 modo_conteudo=conteudo[0],
@@ -665,10 +730,14 @@ def _menu_principal():
                 image_engine=image_engine,
                 ask_tiktok_headless=True
             )
+            # ao concluir a rotina e retornar ao menu, checar .env
+            _reload_env_if_changed(force=False)
 
 if __name__ == "__main__":
     try:
         multiprocessing.freeze_support()
     except Exception:
         pass
+    # primeira verificação de .env antes do menu
+    _reload_env_if_changed(force=False)
     _menu_principal()
