@@ -5,8 +5,7 @@ import json
 import random
 import logging
 from typing import List, Optional, Tuple, Iterable
-from typing import Optional 
-
+from typing import Optional
 
 import requests
 try:
@@ -51,22 +50,23 @@ logger = logging.getLogger(__name__)
 IMAGE_EMPHASIS_ONLY_MARKUP = os.getenv("IMAGE_EMPHASIS_ONLY_MARKUP", "True").lower() in ("true", "1", "yes")
 IMAGE_FORCE_EMPHASIS = os.getenv("IMAGE_FORCE_EMPHASIS", "False").lower() in ("true", "1", "yes")
 IMAGE_EMPHASIS_LAST_WORDS = int(os.getenv("IMAGE_EMPHASIS_LAST_WORDS", "1"))
-_PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca","coragem","propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
+_PUNCH_WORDS = {"vocę","voce","vida","fé","fe","deus","foco","força","forca","coragem","propósito","proposito","sucesso","sonho","agora","hoje","mais","nunca","sempre"}
 
 def _idioma_norm(idioma: Optional[str]) -> str:
     s = (idioma or "pt").lower()
     if s.startswith("ar"): return "ar"
     if s.startswith("pt"): return "pt"
+    if s.startswith("ru"): return "ru"
     return "en"
 
 def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
     segs = re.findall(r"\*\*(.+?)\*\*", s, flags=re.S)
     clean = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
-    words: List[str] = [tok.strip().lower() for seg in segs for tok in re.split(r"[^\wÀ-ÖØ-öø-ÿ]+", seg) if tok.strip()]
+    words: List[str] = [tok.strip().lower() for seg in segs for tok in re.split(r"[^\wÄ-Öò-öø-ÿ]+", seg) if tok.strip()]
     return clean, words
 
 def _pick_highlights(line: str) -> List[str]:
-    words = [re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", w).lower() for w in line.split()]
+    words = [re.sub(r"[^\wÄ-Öò-öø-ÿ]", "", w).lower() for w in line.split()]
     for w in words:
         if w in _PUNCH_WORDS:
             return [w]
@@ -78,7 +78,7 @@ def _pick_highlights(line: str) -> List[str]:
 def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
     s = clean.strip()
-    parts = [p.strip() for p in re.split(r"(?:\.\.\.|[.!?:;—–-])", s) if p and p.strip()]
+    parts = [p.strip() for p in re.split(r"(?:\.\.\.|[.!?:;\u2012\u2013-])", s) if p and p.strip()]
     if len(parts) >= 2:
         intro, punch = parts[0], " ".join(parts[1:]).strip()
     else:
@@ -88,11 +88,11 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
             intro, punch = " ".join(ws[:cut]), " ".join(ws[cut:])
         else:
             intro, punch = "", s
-    
+
     if explicit_words:
         hl = explicit_words
     elif IMAGE_FORCE_EMPHASIS:
-        toks = [re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", w).lower() for w in punch.split() if w.strip()]
+        toks = [re.sub(r"[^\wÄ-Öò-öø-ÿ]", "", w).lower() for w in punch.split() if w.strip()]
         hl = toks[-IMAGE_EMPHASIS_LAST_WORDS:] if toks else _pick_highlights(punch)
     elif not IMAGE_EMPHASIS_ONLY_MARKUP:
         hl = _pick_highlights(punch)
@@ -214,7 +214,7 @@ def _make_session(region: Optional[str] = None) -> requests.Session:
     else:
         s.mount("https://", HTTPAdapter())
         s.mount("http://", HTTPAdapter())
-    
+
     prefix = ""
     if (region or "").upper() == "EG": prefix = "PROXY_EG"
     elif (region or "").upper() == "US": prefix = "PROXY_US"
@@ -227,8 +227,8 @@ def _make_session(region: Optional[str] = None) -> requests.Session:
             if IMAGE_LOG_PROXY:
                 logger.info("🌐 Proxy %s habilitado", (region or "DEFAULT"))
         else:
-            logger.debug("🌐 Proxy desabilitado (configuração %s ausente)", region or "DEFAULT")
-    
+            logger.debug("🚫 Proxy desabilitado (configuração %s ausente)", region or "DEFAULT")
+
     s.headers.update({"User-Agent": USER_AGENT})
     return s
 
@@ -244,16 +244,20 @@ def _get_media_session(idioma: Optional[str]) -> requests.Session:
     return _get_session(region_candidato if usar_proxy else None)
 
 # -----------------------------------------------------------------------------#
-# Fontes
+# Fontes: Suporte completo para árabe e cirílico (RU)
 # -----------------------------------------------------------------------------#
 ARABIC_FONT_IMAGE_REG  = os.getenv("ARABIC_FONT_IMAGE_REG",  "NotoNaskhArabic-Regular.ttf")
 ARABIC_FONT_IMAGE_BOLD = os.getenv("ARABIC_FONT_IMAGE_BOLD", "NotoNaskhArabic-Bold.ttf")
+CYRILLIC_FONT_IMAGE    = os.getenv("CYRILLIC_FONT_IMAGE",    "bebas-neue-cyrillic.ttf")
 _FONT_CACHE: dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
 _logged_fonts: set[Tuple[str, int]] = set()
 
 def _font_for_lang(base_font: str, idioma: Optional[str], bold: bool = False) -> str:
-    if _idioma_norm(idioma) == "ar":
+    norm = _idioma_norm(idioma)
+    if norm == "ar":
         return ARABIC_FONT_IMAGE_BOLD if bold else ARABIC_FONT_IMAGE_REG
+    if norm == "ru":
+        return CYRILLIC_FONT_IMAGE
     return base_font
 
 def _find_first_existing(paths: List[str]) -> Optional[str]:
@@ -342,7 +346,7 @@ def _draw_line_colored(
         it = reversed(tokens)
 
     for raw in it:
-        key = re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", raw).lower()
+        key = re.sub(r"[^\wÄ-Öò-öø-ÿ]", "", raw).lower()
         color = hl_fill if key in highlight_set else fill
         token_w = draw.textbbox((0, 0), raw, font=font)[2]
         draw_x = cur_x if not rtl else (cur_x - token_w)
@@ -392,11 +396,11 @@ def _ensure_1080x1920(img: Image.Image) -> Image.Image:
 # -----------------------------------------------------------------------------#
 def gerar_imagem_dalle(prompt: str, arquivo_saida: str, *, idioma: Optional[str] = None):
     if not _HAVE_CHATGPT_AUTOMATION:
-        raise ImportError("'gerar_imagem_chatgpt' não importada.")
+        raise ImportError("'gerar_imagem_chatgpt' năo importada.")
     cookies_filename = os.getenv("COOKIES_CHATGPT_FILENAME", "cookies_chatgpt.txt")
     if not gerar_imagem_chatgpt(prompt=prompt, cookies_path=cookies_filename, arquivo_saida=arquivo_saida):
-        raise RuntimeError("Automação do ChatGPT falhou ao gerar imagem.")
-    logger.info("✅ Imagem DALL-E/ChatGPT gerada via automação.")
+        raise RuntimeError("Automaçăo do ChatGPT falhou ao gerar imagem.")
+    logger.info("🎨 Imagem DALL-E/ChatGPT gerada via automaçăo.")
     # cache de prompts/imagens
     if cache: 
         cache.add("used_pexels_prompts", prompt, lang=_norm_lang_cache(idioma))
@@ -435,13 +439,13 @@ def gerar_imagem_com_frase(prompt: str, arquivo_saida: str, *, idioma: Optional[
             src = choice.get("src", {})
             url = src.get("large2x") or src.get("large") or src.get("portrait")
             raw_resp = session.get(url, timeout=20); raw_resp.raise_for_status()
-            with open(arquivo_saida, "wb") as f: 
+            with open(arquivo_saida, "wb") as f:
                 f.write(raw_resp.content)
 
             img = _ensure_1080x1920(Image.open(arquivo_saida))
             img.save(arquivo_saida, quality=92)
 
-            logger.info("✅ Imagem salva: %s", arquivo_saida)
+            logger.info("🖼️ Imagem salva: %s", arquivo_saida)
             # cache
             if cache:
                 cache.add("used_pexels_prompts", prompt, lang=idioma_norm)
