@@ -18,13 +18,11 @@ from .countries import (
     normalize_lang, cookies_path_for, tiktok_headless_default,
 )
 
-# (opcional) cache_store para registrar frases já usadas por idioma
 try:
     from cache_store import cache
 except Exception:  # pragma: no cover
     cache = None
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -37,7 +35,6 @@ PASTA_IMAGENS = "imagens"
 PASTA_AUDIOS  = "audios"
 PASTA_CACHE   = os.getenv("CACHE_DIR", "cache")
 
-# Controla remoção de markdown na descrição
 _STRIP_FLAG = os.getenv("STRIP_MARKDOWN_IN_DESC", "1").strip().lower()
 STRIP_MARKDOWN_IN_DESC = _STRIP_FLAG not in ("0", "false", "no", "off")
 
@@ -87,18 +84,14 @@ def _cleanup_cache_drawtext(cache_dir: str) -> None:
 def _cleanup_mid_artifacts() -> None:
     """Limpa imagens/, audios/ (inclui tts/) e temporários do cache."""
     try:
-        # imagens/*
         if os.path.isdir(PASTA_IMAGENS):
             for f in os.listdir(PASTA_IMAGENS):
                 _safe_remove(os.path.join(PASTA_IMAGENS, f))
-
-        # audios/* e audios/tts/*
         if os.path.isdir(PASTA_AUDIOS):
             for root, dirs, files in os.walk(PASTA_AUDIOS, topdown=False):
                 for name in files:
                     if any(name.lower().endswith(ext) for ext in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")):
                         _safe_remove(os.path.join(root, name))
-                # remove pastas vazias
                 for d in dirs:
                     try:
                         full = os.path.join(root, d)
@@ -106,8 +99,6 @@ def _cleanup_mid_artifacts() -> None:
                             _safe_remove(full)
                     except Exception:
                         pass
-
-        # cache temporários
         _cleanup_cache_drawtext(PASTA_CACHE)
     except Exception as e:
         logger.debug("Falha na limpeza intermediária: %s", e)
@@ -144,12 +135,12 @@ def obter_ultimo_video(pasta=PASTA_VIDEOS) -> Optional[str]:
     try:
         arquivos = [os.path.join(pasta, f) for f in os.listdir(pasta) if f.endswith(".mp4")]
         if not arquivos:
-            raise FileNotFoundError(f"❌ Nenhum vídeo novo encontrado em {pasta}.")
+            raise FileNotFoundError(f"⚠️ Nenhum vídeo novo encontrado em {pasta}.")
         ultimo_video = max(arquivos, key=os.path.getmtime)
-        logger.info("📹 Último vídeo encontrado: %s", ultimo_video)
+        logger.info("📼 Último vídeo encontrado: %s", ultimo_video)
         return ultimo_video
     except Exception as e:
-        logger.error("❌ Erro ao buscar último vídeo: %s", str(e))
+        logger.error("⚠️ Erro ao buscar último vídeo: %s", str(e))
         return None
 
 def postar_no_tiktok_e_renomear(
@@ -159,10 +150,12 @@ def postar_no_tiktok_e_renomear(
     video_final: Optional[str] = None,
     agendar: bool = False,
     idioma: str = "en",
+    max_upload_attempts: int = 3,  # NOVO: padrão 3 tentativas de upload
 ) -> bool:
     """
     Posta o último vídeo gerado (ou 'video_final' se informado) e,
     após sucesso, faz a faxina (imagens/, audios/, cache temp, videos/prompts/ e o mp4 postado).
+    Agora, se o upload/post falhar, NÃO apaga vídeo nem recursos — só faxina no sucesso!
     """
     lang = normalize_lang(idioma)
     logger.info("postar_no_tiktok_e_renomear: idioma_in=%s | idioma_norm=%s", idioma, lang)
@@ -172,69 +165,100 @@ def postar_no_tiktok_e_renomear(
         return False
     try:
         if os.path.getsize(video_path) <= 0:
-            logger.error("❌ Vídeo está com 0 bytes: %s", video_path)
+            logger.error("⚠️ Vídeo está com 0 bytes: %s", video_path)
             return False
     except Exception:
         pass
 
-    # Cookies por país (resolvidos para COOKIES_DIR)
     COOKIES_PATH = cookies_path_for(lang)
     logger.info("🍪 Cookies utilizados: %s", COOKIES_PATH)
     if not os.path.exists(COOKIES_PATH):
-        logger.error("❌ Arquivo de cookies não encontrado: %s", COOKIES_PATH)
+        logger.error("⚠️ Arquivo de cookies não encontrado: %s", COOKIES_PATH)
         return False
 
-    try:
-        # Descrição base por idioma
-        if descricao_personalizada:
-            base_desc = descricao_personalizada
+    # Descrição base por idioma
+    if descricao_personalizada:
+        base_desc = descricao_personalizada
+    else:
+        if lang == "pt-br":
+            base_desc = "Conteúdo motivacional do dia!"
+        elif lang == "ar":
+            base_desc = "سيطر على تفكيرك، تسيطر على حياتك."
+        elif lang == "ru":
+            base_desc = "Контент для мотивации на день!"
         else:
-            if lang == "pt-br":
-                base_desc = "Conteúdo motivacional do dia!"
-            elif lang == "ar":
-                base_desc = "رسالة اليوم ✨"
-            elif lang == "ru":
-                base_desc = "Вдохновляющее послание дня!"
+            base_desc = "Motivational content of the day!"
+
+    if STRIP_MARKDOWN_IN_DESC:
+        base_desc = _strip_markdown(base_desc)
+    description = _dedupe_hashtags_in_desc(base_desc)
+
+    if cache:
+        try:
+            cache.add("used_phrases", description, lang=lang)
+        except Exception:
+            pass
+
+    schedule = None
+    if agendar:
+        schedule = datetime.now() + timedelta(minutes=20)
+        logger.info("⏰ Agendando post para: %s", schedule.strftime("%H:%M:%S"))
+
+    tt_headless = tiktok_headless_default()
+    logger.info("🌐 TikTok headless: %s", "ON" if tt_headless else "OFF")
+
+    logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
+    logger.info("📝 Descrição final: %s", description)
+    time.sleep(1.0)
+
+    # ====== NOVO FLUXO DE RETRY PROTEÇÃO ==========
+    upload_ok = False
+    last_upload_error = None
+
+    for tentativa in range(1, max_upload_attempts + 1):
+        try:
+            upload_video(
+                filename=video_path,
+                description=description,
+                cookies=COOKIES_PATH,
+                comment=True,
+                stitch=True,
+                duet=True,
+                headless=tt_headless,
+                schedule=schedule,
+                idioma=lang,
+            )
+            upload_ok = True
+            logger.info(f"✅ Upload/postagem bem-sucedida na tentativa {tentativa}.")
+            break
+        except (NoSuchElementException, TimeoutException) as e:
+            logger.warning(f"⚠️ Erro Selenium durante upload (tentativa {tentativa}): {e}")
+            last_upload_error = e
+        except SocketError as e:
+            if getattr(e, "errno", None) == 10054:
+                logger.warning("⚠️ Conexão resetada (10054). Pode ter concluído, mas não confirmamos. Mantendo arquivos.")
             else:
-                base_desc = "Motivational content of the day!"
+                logger.error(f"⚠️ Erro socket inesperado durante upload (tentativa {tentativa}): {e}")
+            last_upload_error = e
+        except WebDriverException as e:
+            logger.error(f"⚠️ Erro WebDriver durante upload (tentativa {tentativa}): {e}")
+            last_upload_error = e
+        except Exception as e:
+            logger.error(f"⚠️ Erro geral ao postar (tentativa {tentativa}): {e}")
+            last_upload_error = e
 
-        # Limpa markdown e dedup hashtags
-        if STRIP_MARKDOWN_IN_DESC:
-            base_desc = _strip_markdown(base_desc)
-        description = _dedupe_hashtags_in_desc(base_desc)
+        if tentativa < max_upload_attempts:
+            logger.info(f"↩️ Tentando novamente upload/post em 30s... (tentativa {tentativa+1}/{max_upload_attempts})")
+            time.sleep(30)
+        else:
+            logger.error(
+                f"🔥 Todas as tentativas ({max_upload_attempts}) de upload falharam para: {video_path}.\n"
+                f"Último erro: {last_upload_error}\n"
+                "O arquivo NÃO será apagado para não perder créditos do Flow! Resolva manualmente antes de tentar gerar novamente."
+            )
 
-        # grava no cache por idioma (para evitar repetição pelo LLM no futuro)
-        if cache:
-            try:
-                cache.add("used_phrases", description, lang=lang)
-            except Exception:
-                pass
-
-        schedule = None
-        if agendar:
-            schedule = datetime.now() + timedelta(minutes=20)
-            logger.info("📅 Agendando post para: %s", schedule.strftime("%H:%M:%S"))
-
-        tt_headless = tiktok_headless_default()
-        logger.info("🌐 TikTok headless: %s", "ON" if tt_headless else "OFF")
-
-        logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
-        logger.info("📝 Descrição final: %s", description)
-        time.sleep(1.0)
-
-        upload_video(
-            filename=video_path,
-            description=description,
-            cookies=COOKIES_PATH,
-            comment=True,
-            stitch=True,
-            duet=True,
-            headless=tt_headless,
-            schedule=schedule,
-            idioma=lang,
-        )
-
-        # PÓS-POST: limpeza
+    if upload_ok:
+        # Pós-POST: limpeza (só no sucesso)
         if imagem_base and os.path.exists(imagem_base):
             _safe_remove(imagem_base)
         if imagem_final and os.path.exists(imagem_final):
@@ -244,21 +268,7 @@ def postar_no_tiktok_e_renomear(
 
         _cleanup_mid_artifacts()
         _cleanup_prompts_and_video(video_path)
-
         return True
-
-    except (NoSuchElementException, TimeoutException) as e:
-        logger.warning("⚠️ Erro intermediário durante upload: %s", e)
-        return False
-    except SocketError as e:
-        if getattr(e, "errno", None) == 10054:
-            logger.warning("⚠️ Conexão resetada (10054). Pode ter concluído, mas não confirmamos. Mantendo arquivos locais.")
-            return False
-        logger.error("❌ Erro de socket inesperado: %s", e)
-        return False
-    except WebDriverException as e:
-        logger.error("❌ Erro no WebDriver durante upload: %s", e)
-        return False
-    except Exception as e:
-        logger.error("❌ Erro geral ao postar: %s", e)
+    else:
+        # Não apaga nada, loga o fracasso.
         return False
