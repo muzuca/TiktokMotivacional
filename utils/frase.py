@@ -55,7 +55,7 @@ CACHE_DIR = "cache"
 RESOURCES_DIR = "utils/resources"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Nomes legados (mistos) — mantidos para migração automática
+# Nomes legados (mistos) – mantidos para migração automática
 PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_phrases.json")
 LONG_PHRASES_CACHE_FILE = os.path.join(CACHE_DIR, "used_long_phrases.json")
 PEXELS_PROMPTS_CACHE_FILE = os.path.join(CACHE_DIR, "used_pexels_prompts.json")
@@ -67,7 +67,7 @@ _FALLBACK_PHRASES_CACHE: Optional[Dict] = None
 def _idioma_norm(idioma: Optional[str]) -> str:
     """
     Normaliza 'idioma' para um dos códigos suportados:
-      'en' | 'pt' | 'ar' | 'ru'
+      'en' | 'pt' | 'ar' | 'ru' | 'id'
     Usa countries.normalize_lang se disponível; caso contrário, faz heurística simples.
     """
     s = (idioma or "pt").strip()
@@ -82,6 +82,7 @@ def _idioma_norm(idioma: Optional[str]) -> str:
     if s.startswith("pt"): return "pt"
     if s.startswith("ru"): return "ru"
     if s.startswith("en"): return "en"
+    if s.startswith("id"): return "id"
     return "en"
 
 def _cache_file(base_name: str, lang: str) -> str:
@@ -100,12 +101,12 @@ def _guess_lang(s: str) -> str:
     # cirílico (russo e línguas relacionadas)
     if re.search(r"[\u0400-\u04FF]", t):
         return "ru"
+    # indonésio → na ausência de marcador forte, será detectado pelo novo campo
     # português (acentos e palavras comuns)
-    if re.search(r"[áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ]", t) or any(
+    if re.search(r"[ãáâêéíóôõúç]", t) or any(
         w in t.lower() for w in (" você", " voce", " que ", " de ", " é ", " pra ", " para ")
     ):
         return "pt"
-    # default
     return "en"
 
 def _read_legacy_list(path: str) -> List[str]:
@@ -139,7 +140,7 @@ def _migrate_legacy_once() -> None:
     # Frases curtas
     legacy = _read_legacy_list(PHRASES_CACHE_FILE)
     if legacy:
-        buckets = {"en": [], "pt": [], "ar": [], "ru": []}
+        buckets = {"en": [], "pt": [], "ar": [], "ru": [], "id": []}
         for line in legacy:
             buckets[_guess_lang(line)].append(line)
         for lang, items in buckets.items():
@@ -147,7 +148,7 @@ def _migrate_legacy_once() -> None:
                 _merge_save_list(_cache_file("used_phrases", lang), items)
         try:
             os.replace(PHRASES_CACHE_FILE, PHRASES_CACHE_FILE + ".legacy")
-            logger.info("🗂️ Migrei used_phrases.json -> *_<lang>.json (%s)",
+            logger.info("Migrei used_phrases.json -> *_<lang>.json (%s)",
                         ", ".join(f"{k}:{len(v)}" for k, v in buckets.items()))
         except Exception:
             pass
@@ -155,7 +156,7 @@ def _migrate_legacy_once() -> None:
     # Frases longas
     legacy = _read_legacy_list(LONG_PHRASES_CACHE_FILE)
     if legacy:
-        buckets = {"en": [], "pt": [], "ar": [], "ru": []}
+        buckets = {"en": [], "pt": [], "ar": [], "ru": [], "id": []}
         for line in legacy:
             buckets[_guess_lang(line)].append(line)
         for lang, items in buckets.items():
@@ -163,7 +164,7 @@ def _migrate_legacy_once() -> None:
                 _merge_save_list(_cache_file("used_long_phrases", lang), items)
         try:
             os.replace(LONG_PHRASES_CACHE_FILE, LONG_PHRASES_CACHE_FILE + ".legacy")
-            logger.info("🗂️ Migrei used_long_phrases.json -> *_<lang>.json (%s)",
+            logger.info("Migrei used_long_phrases.json -> *_<lang>.json (%s)",
                         ", ".join(f"{k}:{len(v)}" for k, v in buckets.items()))
         except Exception:
             pass
@@ -171,7 +172,7 @@ def _migrate_legacy_once() -> None:
     # Prompts do Pexels
     legacy = _read_legacy_list(PEXELS_PROMPTS_CACHE_FILE)
     if legacy:
-        buckets = {"en": [], "pt": [], "ar": [], "ru": []}
+        buckets = {"en": [], "pt": [], "ar": [], "ru": [], "id": []}
         for line in legacy:
             buckets[_guess_lang(line)].append(line)
         for lang, items in buckets.items():
@@ -179,14 +180,13 @@ def _migrate_legacy_once() -> None:
                 _merge_save_list(_cache_file("used_pexels_prompts", lang), items)
         try:
             os.replace(PEXELS_PROMPTS_CACHE_FILE, PEXELS_PROMPTS_CACHE_FILE + ".legacy")
-            logger.info("🗂️ Migrei used_pexels_prompts.json -> *_<lang>.json (%s)",
+            logger.info("Migrei used_pexels_prompts.json -> *_<lang>.json (%s)",
                         ", ".join(f"{k}:{len(v)}" for k, v in buckets.items()))
         except Exception:
             pass
 
 # roda migração no import (barato e idempotente)
 _migrate_legacy_once()
-# ---------------------------------------------------------------------------- #
 
 def load_used_phrases(cache_file: str) -> List[str]:
     """Carrega uma lista de frases de um arquivo JSON."""
@@ -210,15 +210,16 @@ def save_used_phrases(used_phrases: List[str], cache_file: str) -> None:
 # -----------------------------------------------------------------------------#
 # Helpers de Texto
 # -----------------------------------------------------------------------------#
-_PT_SW = {"a","o","os","as","um","uma","de","da","do","das","dos","em","no","na","nos","nas","e","ou","pra","para","por","que","se","com","sem","ao","à","às","aos","é","ser","ter"}
+_PT_SW = {"a","o","os","as","um","uma","de","da","do","das","dos","em","no","na","nos","nas","e","ou","pra","para","por","que","se","com","sem","ao","é","s","aos","é","ser","ter"}
 _EN_SW = {"a","an","the","and","or","of","in","on","to","for","with","that","is","it","you","your"}
 
-# ADICIONA 'ru' ao mapa de nomes (texto que vai para os prompts)
+# ADICIONA 'ru' e 'id' ao mapa de nomes (texto que vai para os prompts)
 LANG_NAME_MAP = {
     "pt": "português do Brasil",
     "en": "inglês",
     "ar": "árabe egípcio",
     "ru": "russo",
+    "id": "indonésio",
 }
 
 IMAGE_EMPHASIS_ONLY_MARKUP = os.getenv("IMAGE_EMPHASIS_ONLY_MARKUP", "True").lower() in ("true", "1", "yes")
@@ -229,11 +230,11 @@ _PUNCH_WORDS = {"você","voce","vida","fé","fe","deus","foco","força","forca",
 def _parse_highlights_from_markdown(s: str) -> Tuple[str, List[str]]:
     segs = re.findall(r"\*\*(.+?)\*\*", s, flags=re.S)
     clean = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
-    words: List[str] = [tok.strip().lower() for seg in segs for tok in re.split(r"[^\wÀ-ÖØ-öø-ÿ]+", seg) if tok.strip()]
+    words: List[str] = [tok.strip().lower() for seg in segs for tok in re.split(r"[^\wÁ-ú-]", seg) if tok.strip()]
     return clean, words
 
 def _pick_highlights(line: str) -> List[str]:
-    words = [re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", w).lower() for w in line.split()]
+    words = [re.sub(r"[^\wÁ-ú-]", "", w).lower() for w in line.split()]
     for w in words:
         if w in _PUNCH_WORDS:
             return [w]
@@ -245,7 +246,7 @@ def _pick_highlights(line: str) -> List[str]:
 def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
     clean, explicit_words = _parse_highlights_from_markdown(frase.strip())
     s = clean.strip()
-    parts = [p.strip() for p in re.split(r"(?:\.\.\.|[.!?:;—–-])", s) if p and p.strip()]
+    parts = [p.strip() for p in re.split(r"(?:\.\.\.|[.!?:;–-])", s) if p and p.strip()]
     if len(parts) >= 2:
         intro, punch = parts[0], " ".join(parts[1:]).strip()
     else:
@@ -259,7 +260,7 @@ def _split_for_emphasis(frase: str) -> Tuple[str, str, List[str]]:
     if explicit_words:
         hl = explicit_words
     elif IMAGE_FORCE_EMPHASIS:
-        toks = [re.sub(r"[^\wÀ-ÖØ-öø-ÿ]", "", w).lower() for w in punch.split() if w.strip()]
+        toks = [re.sub(r"[^\wÁ-ú-]", "", w).lower() for w in punch.split() if w.strip()]
         hl = toks[-IMAGE_EMPHASIS_LAST_WORDS:] if toks else _pick_highlights(punch)
     elif not IMAGE_EMPHASIS_ONLY_MARKUP:
         hl = _pick_highlights(punch)
@@ -302,20 +303,20 @@ def _get_fallback_phrase(theme: str, lang: str) -> str:
             _FALLBACK_PHRASES_CACHE = {}
     
     phrases = _FALLBACK_PHRASES_CACHE.get(theme, {}).get(lang, [])
-    # fallback neutro caso não haja ru
+    # fallback neutro caso não haja ru/id
     return random.choice(phrases) if phrases else "Acredite nos seus sonhos."
 
 def _clean_line(s: str) -> str:
     if not s: return ""
     line = s.strip()
-    line = re.sub(r'^\s*(?:\d+[\).\s-]+|[-*•]\s+)', '', line).strip(' "\'')
+    line = re.sub(r'^\s*(?:\d+[\).\s-]+|[-*–]\s+)', '', line).strip(' "\'')
     return re.sub(r'\s+', ' ', line)
 
 def _strip_emph(s: str) -> str:
     return re.sub(r'\*\*([^*]+)\*\*', r'\1', s)
 
 def _count_words_no_markup(s: str) -> int:
-    return len(re.findall(r"\b[\w’'-]+\b", _strip_emph(s), flags=re.UNICODE))
+    return len(re.findall(r"\b[\wÁ-ú'-]+\b", _strip_emph(s), flags=re.UNICODE))
 
 def _ask_gemini(prompt: str, response_type: type = list, temperature: float = 1.0, tries: int = 3):
     log_func = logger.info if LOG_GEMINI_PROMPTS else logger.debug
@@ -374,7 +375,7 @@ def _ensure_single_emphasis(text: str, lang: str, prefer_last_n: int = 2) -> str
     return "".join(tokens)
 
 def gerar_slug(frase: str) -> str:
-    frase_limpa = re.sub(r'[\*\.:\?!,"\'`´’]', '', frase.lower())
+    frase_limpa = re.sub(r'[\*\.:\?!,"\'`¬Ҙ]', '', frase.lower())
     return "_".join(frase_limpa.split()[:6])[:40]
 
 # -------------------------- CONTEXTO DINÂMICO (SEU) -------------------------- #
@@ -393,7 +394,7 @@ def _gerar_contexto_dinamico(content_mode: str, lang: str) -> str:
                 f"TEMA: {context_data['tema_especifico']}\n"
                 f"METÁFORA: {context_data['metafora_visual']}"
             )
-            logger.info("✅ Contexto dinâmico gerado com sucesso.")
+            logger.info("Contexto dinâmico gerado com sucesso.")
             return context_str
         logger.warning("Resposta do gerador de contexto não continha as chaves esperadas.")
     except Exception as e:
@@ -426,7 +427,8 @@ def gerar_hashtags_virais(conteudo: str, idioma: str = "auto", n: int = 3) -> Li
                 "pt": ["#motivacao", "#inspiracao", "#mindset"],
                 "ar": ["#تحفيز", "#الهام", "#عقلية"],
                 "en": ["#motivation", "#inspiration", "#mindset"],
-                "ru": ["#мотивация", "#вдохновение", "#саморазвитие"],
+                "ru": ["#мотивация", "#вдохновение", "#мышление"],
+                "id": ["#motivasi", "#inspirasi", "#polaPikir"]
             }
             tags.extend(f for f in fallbacks.get(lang, []) if f not in tags and len(tags) < n)
         return tags[:n]
@@ -438,7 +440,7 @@ def _sanitize_hashtag(tag: str, lang: str) -> str:
     t = tag.strip().lstrip("#")
     t = re.sub(r"\s+", "", t)
     # Para pt/en removemos acentos e restringimos a [A-Za-z0-9_]
-    if lang in ("pt", "en"):
+    if lang in ("pt", "en", "id"):
         t = unicodedata.normalize("NFD", t).encode("ascii", "ignore").decode("ascii")
         t = re.sub(r"[^A-Za-z0-9_]", "", t)
     # Para árabe/ru mantemos caracteres nativos
@@ -457,8 +459,6 @@ def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "
         historico_prompts = _get_history_for_prompt(cache_file, limit=20) if pexels_mode else ""
         
         template = _load_prompt_template(template_name)
-        # Nota: templates de Pexels costumam fixar inglês; se quiser termos em russo,
-        # adicione {target_lang_name} ao YAML e formate aqui também.
         prompt_text = template.format(
             quantidade=quantidade,
             tema=tema,
@@ -475,9 +475,9 @@ def gerar_prompts_de_imagem_variados(tema: str, quantidade: int, idioma: str = "
             
             if pexels_mode:
                 save_used_phrases(used_prompts + final_prompts, cache_file)
-                logger.info("🗂️ Cache Pexels (%s) atualizado com %d novos termos.", os.path.basename(cache_file), len(final_prompts))
+                logger.info("Cache Pexels (%s) atualizado com %d novos termos.", os.path.basename(cache_file), len(final_prompts))
             
-            logger.info(f"✅ {len(final_prompts)} prompts de imagem ({'Pexels' if pexels_mode else 'IA'}) gerados.")
+            logger.info(f"{len(final_prompts)} prompts de imagem ({'Pexels' if pexels_mode else 'IA'}) gerados.")
             return final_prompts
     except Exception as e:
         logger.warning("Falha ao gerar prompts de imagem: %s", e)
@@ -494,7 +494,7 @@ def gerar_frase_motivacional(idioma: str = "en") -> str:
     used_phrases = load_used_phrases(cache_file)
     used_set = {p.strip() for p in used_phrases}
 
-    logger.info("🗂️ Cache de frases curtas em uso: %s", os.path.basename(cache_file))
+    logger.info("Cache de frases curtas em uso: %s", os.path.basename(cache_file))
 
     for _ in range(3):
         phrases = _ask_gemini(prompt_text, response_type=list, temperature=1.2, tries=2)
@@ -521,7 +521,7 @@ def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[
     if valid:
         chosen = random.choice(valid)
         used_phrases.append(chosen); save_used_phrases(used_phrases, cache_file)
-        logger.info("✅ Frase longa inédita (ideal: %d palavras) selecionada.", _count_words_no_markup(chosen))
+        logger.info("Frase longa inédita (ideal: %d palavras) selecionada.", _count_words_no_markup(chosen))
         return chosen
 
     logger.warning("Nenhuma frase no intervalo ideal (%d-%d). Verificando em intervalo flexível...", ideal_min, ideal_max)
@@ -530,7 +530,7 @@ def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[
     if valid_flex:
         chosen = max(valid_flex, key=_count_words_no_markup)
         used_phrases.append(chosen); save_used_phrases(used_phrases, cache_file)
-        logger.info("✅ Frase longa inédita (flex: %d palavras) selecionada.", _count_words_no_markup(chosen))
+        logger.info("Frase longa inédita (flex: %d palavras) selecionada.", _count_words_no_markup(chosen))
         return chosen
 
     return None
@@ -538,7 +538,7 @@ def _gerar_e_validar_frase_longa(prompt_text: str, cache_file: str) -> Optional[
 def gerar_frase_motivacional_longa(idioma: str = "en") -> str:
     lang = _idioma_norm(idioma)
     cache_long = _cache_file("used_long_phrases", lang)
-    logger.info("🗂️ Cache de frases longas em uso: %s", os.path.basename(cache_long))
+    logger.info("Cache de frases longas em uso: %s", os.path.basename(cache_long))
 
     for creative_attempt in range(1, 4):
         logger.info(f"Ciclo Criativo [{creative_attempt}/3]: Gerando novo contexto...")
@@ -569,7 +569,7 @@ def gerar_frase_tarot_curta(idioma: str = "en") -> str:
     used = load_used_phrases(cache_file)
     used_set = {p.strip() for p in used}
 
-    logger.info("🗂️ Cache de tarot curto em uso: %s", os.path.basename(cache_file))
+    logger.info("Cache de tarot curto em uso: %s", os.path.basename(cache_file))
 
     for _ in range(3):
         phrases = _ask_gemini(prompt_text, response_type=list, temperature=1.2)
@@ -583,7 +583,7 @@ def gerar_frase_tarot_curta(idioma: str = "en") -> str:
 def gerar_frase_tarot_longa(idioma: str = "en") -> str:
     lang = _idioma_norm(idioma)
     cache_long = _cache_file("used_long_phrases", lang)
-    logger.info("🗂️ Cache de tarot longo em uso: %s", os.path.basename(cache_long))
+    logger.info("Cache de tarot longo em uso: %s", os.path.basename(cache_long))
 
     for creative_attempt in range(1, 4):
         logger.info(f"Ciclo Criativo [{creative_attempt}/3]: Gerando novo contexto...")

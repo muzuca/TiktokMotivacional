@@ -145,6 +145,12 @@ def _resolve_proxy_env(region: Optional[str]) -> Tuple[str, str, Optional[str], 
         user = _env_first("PROXY_RU_USER", "PROXY_USER_RU", "PROXY_USER") or None
         pw   = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
         return host, port, user, pw, "RU"
+    elif reg == "ID":
+        host = _env_first("PROXY_ID_HOST", "PROXY_HOST_ID", "PROXY_HOST")
+        port = _env_first("PROXY_ID_PORT", "PROXY_PORT_ID", "PROXY_PORT")
+        user = _env_first("PROXY_ID_USER", "PROXY_USER_ID", "PROXY_USER") or None
+        pw   = _env_first("PROXY_ID_PASS", "PROXY_PASS_ID", "PROXY_PASS") or None
+        return host, port, user, pw, "ID"
     else:
         host = _env_first("PROXY_HOST")
         port = _env_first("PROXY_PORT")

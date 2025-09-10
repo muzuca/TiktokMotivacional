@@ -48,13 +48,14 @@ from utils.frase import (
     gerar_hashtags_virais,
 )
 
-# (Opcional) longas — se existirem, usamos; se não, caímos no fallback
+# Importa funções longas motivacionais, se houver
 try:
     from utils.frase import gerar_frase_motivacional_longa
     _HAVE_LONGO_MOTIV = True
 except Exception:
     _HAVE_LONGO_MOTIV = False
 
+# Importa funções de tarot, se houver
 try:
     from utils.frase import gerar_prompt_tarot, gerar_frase_tarot_curta, gerar_frase_tarot_longa
     _HAVE_TAROT_FUNCS = True
@@ -71,9 +72,7 @@ except Exception:
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
-# REMOVE: não há necessidade de setup_browser_para_egito nem de try/exceto associado
-
-_HAVE_AUDIO = False  # garantimos que não use TTS aqui
+_HAVE_AUDIO = False  # garantimos que não usa TTS aqui
 
 # ==== Veo3 (menus internos) ====
 try:
@@ -86,7 +85,7 @@ except Exception:
 # ====== Constantes/UI ======
 STYLE_OPTIONS = {
     "1": ("classic", "Clássico legível (Montserrat/Inter, branco + stroke)"),
-    "2": ("modern",  "Modernão (Bebas/Alta, caps, discreto)"),
+    "2": ("modern",  "Moderno (Bebas/Alta, caps, discreto)"),
     "3": ("serif",   "Elegante (Playfair/Cinzel, leve dourado)"),
     "4": ("mono",    "Monoespaçada minimalista"),
     "5": ("clean",   "Clean sem stroke (peso médio)"),
@@ -95,8 +94,8 @@ MOTION_OPTIONS = {
     "1": ("none",          "Sem movimento"),
     "2": ("kenburns_in",   "Zoom in (Ken Burns)"),
     "3": ("kenburns_out",  "Zoom out (Ken Burns)"),
-    "4": ("pan_lr",        "Pan left→right"),
-    "5": ("pan_ud",        "Pan up→down"),
+    "4": ("pan_lr",        "Pan left–right"),
+    "5": ("pan_ud",        "Pan up–down"),
     "0": ("random",        "Aleatório (entre movimentos)"),
 }
 
@@ -127,7 +126,9 @@ _WPM = {
     "ar-eg": 130.0,
     "ar": 130.0,
     "ru": 140.0,
+    "id": 155.0,  # Indonésia
 }
+
 def _estimativa_duracao_segundos(texto: str, idioma: str) -> float:
     if not texto:
         return 0.0
@@ -137,7 +138,7 @@ def _estimativa_duracao_segundos(texto: str, idioma: str) -> float:
     return max(5.0, secs)  # mínimo de segurança
 
 def _reload_env_settings():
-    """Reaplica valores do .env às variáveis deste módulo e ao nível de log."""
+    """Reaplica valores do .env para variáveis deste módulo e para o nível de log."""
     global DEFAULT_SLIDES_COUNT, SLIDE_SECONDS_PER_IMAGE, SLIDES_MIN, SLIDES_MAX, ITERATION_TIMEOUT_MIN
 
     DEFAULT_SLIDES_COUNT = _int_env("SLIDES_COUNT", DEFAULT_SLIDES_COUNT)
@@ -171,7 +172,7 @@ def _reload_env_if_changed(force: bool = False) -> bool:
         load_dotenv(_ENV_PATH, override=True)
         _ENV_MTIME = mtime
         _reload_env_settings()
-        logger.info("🔄 .env recarregado.")
+        logger.info(".env recarregado.")
         return True
     return False
 
@@ -190,11 +191,12 @@ def _menu_modo_execucao() -> str:
 
 def _selecionar_idioma() -> Optional[str]:
     while True:
-        print("\nEscolha o país para referência da língua das mensagens:")
+        print("\nEscolha o país para referência do idioma das mensagens:")
         print("1. EUA (Inglês) *padrão")
         print("2. Brasil (pt-br)")
         print("3. Árabe (egípcio)")
         print("4. Rússia (Russo)")
+        print("5. Indonésia (Indonésio)")
         print("b. Voltar")
         op = input("Digite a opção: ").strip().lower()
         if op in _BACK_TOKENS:
@@ -207,6 +209,8 @@ def _selecionar_idioma() -> Optional[str]:
             return "ar-eg"
         if op == "4":
             return "ru"
+        if op == "5":
+            return "id"
         print("Opção inválida!")
 
 def _submenu_conteudo_por_idioma(idioma: str):
@@ -244,6 +248,18 @@ def _submenu_conteudo_por_idioma(idioma: str):
         op = input("Digite a opção: ").strip().lower()
         if op in _BACK_TOKENS: return None
         if op == "3" and _HAVE_VEO3: return ("veo3", "alina")
+        return ("tarot", None) if op == "2" else ("motivacional", None)
+
+    if idioma == "id":
+        print("\nSelecione o conteúdo (Indonésia):")
+        print("1. Motivacional")
+        print("2. Cartomante")
+        if _HAVE_VEO3:
+            print("3. Veo3 (Ayu)")
+        print("b. Voltar")
+        op = input("Digite a opção: ").strip().lower()
+        if op in _BACK_TOKENS: return None
+        if op == "3" and _HAVE_VEO3: return ("veo3", "ayu")
         return ("tarot", None) if op == "2" else ("motivacional", None)
 
     print("\nSelecione o conteúdo (EUA):")
@@ -345,21 +361,21 @@ def _selecionar_gerador_imagens(padrao: str) -> Optional[str]:
         if raw in _BACK_TOKENS:
             return None
         if raw == "":
-            print(f" → Usando padrão: {padrao}")
+            print(f" ⇒ Usando padrão: {padrao}")
             return padrao
         if raw == "1":
-            print(" → Selecionado: Pexels")
+            print(" ⇒ Selecionado: Pexels")
             return "pexels"
         if raw == "2":
             if not _HAVE_DALLE_FUNC:
-                print("   ⚠️ AVISO: 'gerar_imagem_dalle' não está implementado. Esta opção não funcionará.")
-            print(" → Selecionado: DALL-E / ChatGPT")
+                print("   AVISO: 'gerar_imagem_dalle' não está implementado. Esta opção não funcionará.")
+            print(" ⇒ Selecionado: DALL-E / ChatGPT")
             default_chatgpt_headless = os.getenv('CHATGPT_HEADLESS', '0').strip() != '0'
-            ans = _perguntar_headless('o ChatGPT/DALL·E (imagens)', default_chatgpt_headless)
+            ans = _perguntar_headless('o ChatGPT/DALL-E (imagens)', default_chatgpt_headless)
             if ans is None:
                 return None
             os.environ['CHATGPT_HEADLESS'] = '1' if ans else '0'
-            print(f" → ChatGPT/DALL·E headless: {'ON' if ans else 'OFF'}")
+            print(f" ⇒ ChatGPT/DALL-E headless: {'ON' if ans else 'OFF'}")
             return "dalle"
         print("Valor inválido!")
 
@@ -387,7 +403,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         # Força modo não-headless para o Egito para a configuração correta da stack de proxy etc.
         if idioma == 'ar-eg':
             ans_tt = False
-            logger.info(' → TikTok headless: OFF (forçado para o modo VN do Egito)')
+            logger.info(' ⇒ TikTok headless: OFF (forçado para o modo VN do Egito)')
         else:
             default_tt_headless = os.getenv('TIKTOK_HEADLESS', '1').strip() != '0'
             ans_tt = _perguntar_headless('o TikTok (upload)', default_tt_headless)
@@ -395,7 +411,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
                 logger.info('Operação cancelada antes de iniciar a geração.')
                 return
         os.environ['TIKTOK_HEADLESS'] = '1' if ans_tt else '0'
-        logger.info(' → TikTok headless: %s', 'ON' if ans_tt else 'OFF')
+        logger.info(' ⇒ TikTok headless: %s', 'ON' if ans_tt else 'OFF')
         _TT_HEADLESS_ASKED = True
 
     logger.info("Gerando conteúdos (%s | modo=%s | imagens=%s)...", idioma, modo_conteudo, image_engine)
@@ -422,7 +438,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     if not long_text:
         base = (frase or "Your time to grow is now.")
         long_text = (" ".join([base] * 20)).strip()
-    logger.info("🎤 Narração gerada internamente (frase longa).")
+    logger.info(" ⇒ Narração gerada internamente (frase longa).")
     dur_est = _estimativa_duracao_segundos(long_text, idioma=idioma)
     if SLIDE_SECONDS_PER_IMAGE > 0:
         slides_auto = int(round(dur_est / SLIDE_SECONDS_PER_IMAGE))
@@ -430,7 +446,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         slides_auto = DEFAULT_SLIDES_COUNT
     slides_auto = max(SLIDES_MIN, min(SLIDES_MAX, slides_auto))
     logger.info(
-        "🖼️ Slides (estimado): duração≈%.2fs | %.1fs/slide → %d slides (min=%d, max=%d)",
+        " ⇒ Slides (estimado): duração=%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
         dur_est, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX
     )
     slides_count = slides_auto
@@ -452,25 +468,25 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
                     gerar_imagem_com_frase(prompt=img_prompt, arquivo_saida=imagem_path, idioma=idioma)
                     if os.path.exists(imagem_path) and os.path.getsize(imagem_path) > 1024:
                         generated_image_paths.append(imagem_path); success = True
-                        logger.info(f"✅ Imagem {i+1} gerada: {imagem_path}")
+                        logger.info(f"✓ Imagem {i+1} gerada: {imagem_path}")
                         break
                 except Exception as e:
                     logger.error(f"Falha na tentativa {attempt+1} (imagem {i+1}): {e}")
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(5)
             if not success:
-                logger.error(f"❌ Não consegui gerar a imagem {i+1} após {MAX_RETRIES} tentativas.")
+                logger.error(f"✗ Não consegui gerar a imagem {i+1} após {MAX_RETRIES} tentativas.")
     if not generated_image_paths:
         raise RuntimeError("Nenhuma imagem foi gerada. Abortando o vídeo.")
     slides_para_video = []
     template_img = _map_video_style_to_image_template(video_style)
-    logger.info(f"🖋️  Escrevendo a frase '{frase[:30]}...' em {len(generated_image_paths)} imagens.")
+    logger.info(f" ⇒ Escrevendo a frase '{frase[:30]}...' em {len(generated_image_paths)} imagens.")
     for img_path in generated_image_paths:
         nome_base = os.path.splitext(os.path.basename(img_path))[0]
         out_path = os.path.join(IMAGENS_DIR, f"{nome_base}_com_texto.png")
         escrever_frase_na_imagem(imagem_path=img_path, frase=frase, saida_path=out_path, template=template_img, idioma=idioma)
         slides_para_video.append(out_path)
-    logger.info("🎬 Slides prontos (%d). Gerando vídeo…", len(slides_para_video))
+    logger.info(" ⇒ Slides prontos (%d). Gerando vídeo…", len(slides_para_video))
     try:
         gerar_video(imagem_path=slides_para_video[0], saida_path=video_final, preset="fullhd", idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_paths=slides_para_video, content_mode=modo_conteudo, long_text=long_text)
     except TypeError:
@@ -478,9 +494,9 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         gerar_video(imagem_path=slides_para_video[0], saida_path=video_final, preset="fullhd", idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_paths=slides_para_video, content_mode=modo_conteudo)
     ok = postar_no_tiktok_e_renomear(descricao_personalizada=desc_tiktok, video_final=video_final, idioma=idioma)
     if ok:
-        logger.info("✅ Processo concluído com sucesso!")
+        logger.info("✓ Processo concluído com sucesso!")
     else:
-        logger.error("❌ Falha na postagem. Verifique os logs!")
+        logger.error("✗ Falha na postagem. Verifique os logs!")
 
 ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))
 
@@ -499,7 +515,7 @@ def _executar_com_timeout(args_tuple) -> Union[bool, None]:
         try:
             return bool(fut.result(timeout=int(ITERATION_TIMEOUT_MIN * 60)))
         except TimeoutError:
-            logging.error("⌛ Iteração excedeu %.1f min — abortando.", ITERATION_TIMEOUT_MIN)
+            logging.error("✗ Iteração excedeu %.1f min — abortando.", ITERATION_TIMEOUT_MIN)
             return None
 
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str,
@@ -512,24 +528,24 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
         logger.info('Cancelado.')
         return
     os.environ['TIKTOK_HEADLESS'] = '1' if ans_tt else '0'
-    logger.info(' → TikTok headless: %s', 'ON' if ans_tt else 'OFF')
+    logger.info(' ⇒ TikTok headless: %s', 'ON' if ans_tt else 'OFF')
     try:
         while True:
             _reload_env_if_changed()
             inicio = datetime.now()
-            logger.info("🕐 Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
+            logger.info("⏳ Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
             args_tuple = (modo_conteudo, idioma, tts_engine, legendas, video_style, motion, 0, image_engine, False)
             ok = _executar_com_timeout(args_tuple)
             proxima = inicio + timedelta(hours=cada_horas)
             rem = max(0.0, (proxima - datetime.now()).total_seconds())
             rem_horas = rem / 3600.0
-            if ok is True: logger.info("✅ Execução OK.")
-            elif ok is False: logger.warning("❌ Execução falhou.")
-            else: logger.warning("⌛ Execução excedeu %.1f min (timeout).", ITERATION_TIMEOUT_MIN)
+            if ok is True: logger.info("✓ Execução OK.")
+            elif ok is False: logger.warning("✗ Execução falhou.")
+            else: logger.warning("✗ Execução excedeu %.1f min (timeout).", ITERATION_TIMEOUT_MIN)
             logger.info("Próxima execução em %.2f horas...", rem_horas)
             time.sleep(rem)
     except KeyboardInterrupt:
-        logger.info("👋 Encerrado pelo usuário.")
+        logger.info("⏹️ Encerrado pelo usuário.")
 
 def _menu_principal():
     _reload_env_if_changed(force=False)
@@ -539,8 +555,6 @@ def _menu_principal():
         idioma = _selecionar_idioma()
         if idioma is None:
             continue
-
-        # [Removido] --- NENHUMA referência ao setup_browser_para_egito aqui.
 
         conteudo = _submenu_conteudo_por_idioma(idioma)
         if conteudo is None:

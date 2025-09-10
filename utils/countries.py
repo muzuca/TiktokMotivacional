@@ -20,10 +20,10 @@ os.makedirs(CHROME_DISK_CACHE_DIR, exist_ok=True)
 
 @dataclass(frozen=True)
 class CountryConfig:
-    code: str          # "US", "BR", "EG", "RU", etc.
-    lang_key: str      # "en", "pt-br", "ar", "ru"
-    lang_tag: str      # "en-US", "pt-BR", "ar-EG", "ru-RU"
-    region: str        # "US", "BR", "EG", "RU"
+    code: str          # "US", "BR", "EG", "RU", "ID", etc.
+    lang_key: str      # "en", "pt-br", "ar", "ru", "id"
+    lang_tag: str      # "en-US", "pt-BR", "ar-EG", "ru-RU", "id-ID"
+    region: str        # "US", "BR", "EG", "RU", "ID"
     cookies_env: str   # nome da env p/ nome do arquivo de cookies
     cookies_default: str  # default do filename
     proxy_env_key: Optional[str] = None  # se usar um proxy específico por país
@@ -32,28 +32,33 @@ class CountryConfig:
 _COUNTRIES: Dict[str, CountryConfig] = {
     "en": CountryConfig(
         code="US", lang_key="en", lang_tag="en-US", region="US",
-        cookies_env="COOKIES_US_FILENAME", cookies_default="cookies_us.txt",
+        cookies_env="COOKIES_US_FILENAME", cookies_default="tiktok/us.txt",
         proxy_env_key="UPSTREAM_PROXY_US"
     ),
     "pt-br": CountryConfig(
         code="BR", lang_key="pt-br", lang_tag="pt-BR", region="BR",
-        cookies_env="COOKIES_BR_FILENAME", cookies_default="cookies_br.txt",
+        cookies_env="COOKIES_BR_FILENAME", cookies_default="tiktok/br.txt",
         proxy_env_key="UPSTREAM_PROXY_BR"
     ),
     "ar": CountryConfig(
         code="EG", lang_key="ar", lang_tag="ar-EG", region="EG",
-        cookies_env="COOKIES_EG_FILENAME", cookies_default="cookies_eg.txt",
+        cookies_env="COOKIES_EG_FILENAME", cookies_default="tiktok/eg.txt",
         proxy_env_key="UPSTREAM_PROXY_EG"
     ),
     "ru": CountryConfig(
         code="RU", lang_key="ru", lang_tag="ru-RU", region="RU",
-        cookies_env="COOKIES_RU_FILENAME", cookies_default="cookies_ru.txt",
+        cookies_env="COOKIES_RU_FILENAME", cookies_default="tiktok/ru.txt",
         proxy_env_key="UPSTREAM_PROXY_RU"
+    ),
+    "id": CountryConfig(  # <<<<<--- Indonésia ADICIONADO
+        code="ID", lang_key="id", lang_tag="id-ID", region="ID",
+        cookies_env="COOKIES_ID_FILENAME", cookies_default="tiktok/id.txt",
+        proxy_env_key="UPSTREAM_PROXY_ID"
     ),
 }
 
 def normalize_lang(value: Optional[str]) -> str:
-    """Normaliza a entrada para 'en', 'pt-br', 'ar' ou 'ru'."""
+    """Normaliza a entrada para 'en', 'pt-br', 'ar', 'ru' ou 'id'."""
     s = (value or "").strip().lower()
     if s in ("1", "en", "en-us", "us", "usa", "eua", "ingles", "inglês", "english"):
         return "en"
@@ -63,6 +68,8 @@ def normalize_lang(value: Optional[str]) -> str:
         return "ar"
     if s in ("4", "ru", "ru-ru", "russia", "rússia", "russo"):
         return "ru"
+    if s in ("5", "id", "id-id", "indonesia", "indonésia", "indo", "bahasa"):
+        return "id"
     # fallback: en
     return "en"
 
@@ -80,7 +87,6 @@ def cookies_path_for(lang_key: str) -> str:
     """Caminho absoluto do arquivo de cookies, dentro de COOKIES_DIR."""
     filename = cookies_filename_for(lang_key)
     if os.path.isabs(filename):
-        # Se o usuário colocou um caminho absoluto no .env, respeitamos.
         return filename
     return os.path.join(COOKIES_DIR, filename)
 

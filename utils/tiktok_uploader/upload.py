@@ -65,6 +65,8 @@ def _norm_lang(s: Optional[str]) -> str:
         return "pt"
     if s.startswith("ru"):
         return "ru"
+    if s.startswith("id"):
+        return "id" 
     return "en"
 
 # Região padrão por idioma (permite expansão fácil)
@@ -73,6 +75,7 @@ LANG_TO_REGION = {
     "en": "US",
     "pt": "BR",
     "ru": "RU",
+    "id": "ID",
 }
 
 # Tag de idioma (Accept-Language / navigator.language)
@@ -81,6 +84,7 @@ LANG_TO_TAG = {
     "en": "en-US",
     "pt": "pt-BR",
     "ru": "ru-RU",
+    "id": "id-ID",
 }
 
 # Locale/Timezone por região
@@ -89,12 +93,13 @@ REGION_TO_TIME = {
     "US": {"tz": "America/New_York",   "locale": "en-US"},
     "BR": {"tz": "America/Sao_Paulo",  "locale": "pt-BR"},
     "RU": {"tz": "Europe/Moscow",      "locale": "ru-RU"},
+    "ID": {"tz": "Asia/Jakarta",       "locale": "id-ID"},
 }
 
 # Proxy habilitado por padrão?
 def _want_proxy_default(idioma: Optional[str]) -> bool:
     # Mantém comportamento atual: proxy em EN/AR e adiciona RU; BR sem proxy.
-    return _norm_lang(idioma) in ("en", "ar", "ru")
+    return _norm_lang(idioma) in ("en", "ar", "ru", "id")
 
 # Resolve região por idioma
 def _region_default(idioma: Optional[str]) -> Optional[str]:
@@ -133,6 +138,12 @@ def _resolve_proxy_env(region: Optional[str]):
         user = _env_first("PROXY_RU_USER", "PROXY_USER_RU", "PROXY_USER") or None
         pw   = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
         return host, port, user, pw
+    if reg == "ID":
+        host = _env_first("PROXY_ID_HOST", "PROXY_HOST_ID", "PROXY_HOST")
+        port = _env_first("PROXY_ID_PORT", "PROXY_PORT_ID", "PROXY_PORT")
+        user = _env_first("PROXY_ID_USER", "PROXY_USER_ID", "PROXY_USER") or None
+        pw   = _env_first("PROXY_ID_PASS", "PROXY_PASS_ID", "PROXY_PASS") or None
+        return host, port, user, pw
     # BR ou genérico
     host = _env_first("PROXY_BR_HOST", "PROXY_HOST_BR", "PROXY_HOST")
     port = _env_first("PROXY_BR_PORT", "PROXY_PORT_BR", "PROXY_PORT")
@@ -150,6 +161,8 @@ def _accept_header_from_tag(tag: Optional[str]) -> str:
         return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
     if tl.startswith("ru"):
         return "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("id"):
+        return "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"    
     return "en-US,en;q=0.9"
 
 # Preferimos o get_browser (com Selenium-Wire) do módulo browsers.

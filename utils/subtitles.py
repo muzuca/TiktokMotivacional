@@ -108,6 +108,7 @@ def _norm_lang(idioma: str) -> str:
     if i.startswith("pt"): return "pt"
     if i.startswith("ar"): return "ar"
     if i.startswith("ru"): return "ru"   # <-- adicionado
+    if i.startswith("id"): return "id"   # <-- adicionado
     return "en"
 
 def _strip_invisibles(s: str) -> str:
@@ -180,6 +181,8 @@ def _align_words(audio_path: str, idioma: str) -> List[Tuple[float, float, str]]
         vad_filter=vad,
         word_timestamps=True,
     )
+
+    print(f">>> [DEBUG] idioma recebido para alignment: {idioma} | lang normalizado={lang}")
 
     words = []
     for seg in segments:
