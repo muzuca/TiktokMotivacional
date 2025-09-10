@@ -1,7 +1,6 @@
 # main.py
 # CLI principal: conteúdos Motivacional/Tarot e integração com Veo3.
 # Modo "Postar agora" e "Postar automaticamente".
-# NOVO: Lógica para configuração inicial de VPN para o Egito.
 
 import os
 import sys
@@ -72,14 +71,8 @@ except Exception:
 from utils.video import gerar_video
 from utils.tiktok import postar_no_tiktok_e_renomear
 
-# NOVO: Importa a função de setup do navegador do Egito
-try:
-    from utils.tiktok_uploader.browsers import setup_browser_para_egito
-    _HAVE_VPN_SETUP = True
-except ImportError:
-    _HAVE_VPN_SETUP = False
-    
-# (IMPORTANTE) Removido TTS prévio para não duplicar geração no video.py
+# REMOVE: não há necessidade de setup_browser_para_egito nem de try/exceto associado
+
 _HAVE_AUDIO = False  # garantimos que não use TTS aqui
 
 # ==== Veo3 (menus internos) ====
@@ -107,7 +100,6 @@ MOTION_OPTIONS = {
     "0": ("random",        "Aleatório (entre movimentos)"),
 }
 
-# DEFAULT_SLIDES_COUNT fica aqui por compat (fallback)
 def _int_env(name: str, default: int) -> int:
     try:
         v = os.getenv(name)
@@ -116,8 +108,6 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 DEFAULT_SLIDES_COUNT = _int_env("SLIDES_COUNT", 4)
-
-# Dinâmica de slides (parametrizável no .env)
 SLIDE_SECONDS_PER_IMAGE = float(os.getenv("SLIDE_SECONDS_PER_IMAGE", "3.0"))
 SLIDES_MIN = _int_env("SLIDES_MIN", 3)
 SLIDES_MAX = _int_env("SLIDES_MAX", 10)
@@ -130,7 +120,6 @@ MAX_RETRIES = 3
 _BACK_TOKENS = {"b", "voltar", "back"}
 _TT_HEADLESS_ASKED = False
 
-# === Estimativa de duração (WPM por idioma) ===
 _WPM = {
     "en": 155.0,
     "pt-br": 150.0,
@@ -147,7 +136,6 @@ def _estimativa_duracao_segundos(texto: str, idioma: str) -> float:
     secs = (words / wpm) * 60.0
     return max(5.0, secs)  # mínimo de segurança
 
-# ====== Hot-reload do .env ======
 def _reload_env_settings():
     """Reaplica valores do .env às variáveis deste módulo e ao nível de log."""
     global DEFAULT_SLIDES_COUNT, SLIDE_SECONDS_PER_IMAGE, SLIDES_MIN, SLIDES_MAX, ITERATION_TIMEOUT_MIN
@@ -156,15 +144,10 @@ def _reload_env_settings():
     SLIDE_SECONDS_PER_IMAGE = float(os.getenv("SLIDE_SECONDS_PER_IMAGE", str(SLIDE_SECONDS_PER_IMAGE)))
     SLIDES_MIN = _int_env("SLIDES_MIN", SLIDES_MIN)
     SLIDES_MAX = _int_env("SLIDES_MAX", SLIDES_MAX)
-
-    # timeout do modo automático
     try:
         ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", str(ITERATION_TIMEOUT_MIN)))
     except NameError:
-        # primeira carga ainda não definiu, então leia com default
         ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))
-
-    # nível de log
     new_level_name = os.getenv("LOG_LEVEL")
     if new_level_name:
         new_level = getattr(logging, new_level_name.upper(), None)
@@ -172,7 +155,6 @@ def _reload_env_settings():
             logger.setLevel(new_level)
 
 def _reload_env_if_changed(force: bool = False) -> bool:
-    """Se o .env foi modificado desde a última leitura, recarrega e atualiza configs."""
     global _ENV_MTIME
     if not _ENV_PATH:
         return False
@@ -189,7 +171,7 @@ def _reload_env_if_changed(force: bool = False) -> bool:
         load_dotenv(_ENV_PATH, override=True)
         _ENV_MTIME = mtime
         _reload_env_settings()
-        logger.info("♻️ .env recarregado.")
+        logger.info("🔄 .env recarregado.")
         return True
     return False
 
@@ -370,7 +352,7 @@ def _selecionar_gerador_imagens(padrao: str) -> Optional[str]:
             return "pexels"
         if raw == "2":
             if not _HAVE_DALLE_FUNC:
-                print("   ❌ AVISO: 'gerar_imagem_dalle' não está implementado. Esta opção não funcionará.")
+                print("   ⚠️ AVISO: 'gerar_imagem_dalle' não está implementado. Esta opção não funcionará.")
             print(" → Selecionado: DALL-E / ChatGPT")
             default_chatgpt_headless = os.getenv('CHATGPT_HEADLESS', '0').strip() != '0'
             ans = _perguntar_headless('o ChatGPT/DALL·E (imagens)', default_chatgpt_headless)
@@ -390,7 +372,6 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     if s in ("modern", "2"):  return "modern_block"
     return "minimal_center"
 
-# ====== Rotina “uma vez” ======
 def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
            video_style: str, motion: str, slides_count: int, image_engine: str,
            ask_tiktok_headless: bool = True):
@@ -401,13 +382,12 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     os.makedirs(AUDIOS_DIR, exist_ok=True)
 
-    # >>> pergunta de headless do TikTok no início (apenas 1x por execução)
     global _TT_HEADLESS_ASKED
     if ask_tiktok_headless and not _TT_HEADLESS_ASKED:
-        # NOVO: Força modo não-headless para o Egito para a configuração da VPN
+        # Força modo não-headless para o Egito para a configuração correta da stack de proxy etc.
         if idioma == 'ar-eg':
             ans_tt = False
-            logger.info(' → TikTok headless: OFF (forçado para o modo VPN do Egito)')
+            logger.info(' → TikTok headless: OFF (forçado para o modo VN do Egito)')
         else:
             default_tt_headless = os.getenv('TIKTOK_HEADLESS', '1').strip() != '0'
             ans_tt = _perguntar_headless('o TikTok (upload)', default_tt_headless)
@@ -417,11 +397,9 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         os.environ['TIKTOK_HEADLESS'] = '1' if ans_tt else '0'
         logger.info(' → TikTok headless: %s', 'ON' if ans_tt else 'OFF')
         _TT_HEADLESS_ASKED = True
-    # <<<
 
     logger.info("Gerando conteúdos (%s | modo=%s | imagens=%s)...", idioma, modo_conteudo, image_engine)
 
-    # ... (O resto da função rotina permanece exatamente igual ao seu original)
     if modo_conteudo == "tarot" and _HAVE_TAROT_FUNCS:
         tema_imagem = gerar_prompt_tarot(idioma)
         frase = gerar_frase_tarot_curta(idioma)
@@ -444,7 +422,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     if not long_text:
         base = (frase or "Your time to grow is now.")
         long_text = (" ".join([base] * 20)).strip()
-    logger.info("📝 Narração gerada internamente (frase longa).")
+    logger.info("🎤 Narração gerada internamente (frase longa).")
     dur_est = _estimativa_duracao_segundos(long_text, idioma=idioma)
     if SLIDE_SECONDS_PER_IMAGE > 0:
         slides_auto = int(round(dur_est / SLIDE_SECONDS_PER_IMAGE))
@@ -452,7 +430,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         slides_auto = DEFAULT_SLIDES_COUNT
     slides_auto = max(SLIDES_MIN, min(SLIDES_MAX, slides_auto))
     logger.info(
-        "🧮 Slides (estimado): duração≈%.2fs | %.1fs/slide ⇒ %d slides (min=%d, max=%d)",
+        "🖼️ Slides (estimado): duração≈%.2fs | %.1fs/slide → %d slides (min=%d, max=%d)",
         dur_est, SLIDE_SECONDS_PER_IMAGE, slides_auto, SLIDES_MIN, SLIDES_MAX
     )
     slides_count = slides_auto
@@ -462,8 +440,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     prompts_de_imagem = gerar_prompts_de_imagem_variados(tema_imagem, slides_count, idioma)
     generated_image_paths = []
     if image_engine == 'dalle':
-        # ... (lógica do dalle inalterada)
-        pass
+        pass  # ... lógica do dalle permanece igual ...
     else:
         for i, img_prompt in enumerate(prompts_de_imagem):
             imagem_path = os.path.join(IMAGENS_DIR, f"{slug_frase}_slide_{i+1:02d}.png")
@@ -487,13 +464,13 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
         raise RuntimeError("Nenhuma imagem foi gerada. Abortando o vídeo.")
     slides_para_video = []
     template_img = _map_video_style_to_image_template(video_style)
-    logger.info(f"✍️  Escrevendo a frase '{frase[:30]}...' em {len(generated_image_paths)} imagens.")
+    logger.info(f"🖋️  Escrevendo a frase '{frase[:30]}...' em {len(generated_image_paths)} imagens.")
     for img_path in generated_image_paths:
         nome_base = os.path.splitext(os.path.basename(img_path))[0]
         out_path = os.path.join(IMAGENS_DIR, f"{nome_base}_com_texto.png")
         escrever_frase_na_imagem(imagem_path=img_path, frase=frase, saida_path=out_path, template=template_img, idioma=idioma)
         slides_para_video.append(out_path)
-    logger.info("🖼️ Slides prontos (%d). Gerando vídeo…", len(slides_para_video))
+    logger.info("🎬 Slides prontos (%d). Gerando vídeo…", len(slides_para_video))
     try:
         gerar_video(imagem_path=slides_para_video[0], saida_path=video_final, preset="fullhd", idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_paths=slides_para_video, content_mode=modo_conteudo, long_text=long_text)
     except TypeError:
@@ -505,12 +482,9 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool,
     else:
         logger.error("❌ Falha na postagem. Verifique os logs!")
 
-
-# ====== Execução com timeout (para modo automático) ======
 ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))
 
 def _run_rotina_once(args_tuple):
-    # ... (código inalterado)
     try:
         rotina(*args_tuple)
         return True
@@ -519,22 +493,19 @@ def _run_rotina_once(args_tuple):
         return False
 
 def _executar_com_timeout(args_tuple) -> Union[bool, None]:
-    # ... (código inalterado)
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
         fut = ex.submit(_run_rotina_once, args_tuple)
         try:
             return bool(fut.result(timeout=int(ITERATION_TIMEOUT_MIN * 60)))
         except TimeoutError:
-            logging.error("⏱️ Iteração excedeu %.1f min — abortando.", ITERATION_TIMEOUT_MIN)
+            logging.error("⌛ Iteração excedeu %.1f min — abortando.", ITERATION_TIMEOUT_MIN)
             return None
 
-# ====== Modo automático (pipeline clássico) ======
 def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_engine: str,
                         legendas: bool, video_style: str, motion: str, slides_count: int,
                         image_engine: str):
-    # ... (código inalterado)
-    logger.info(f"⏱️ Modo automático base: {cada_horas:.2f} h (Ctrl+C para parar).")
+    logger.info(f"⌛ Modo automático base: {cada_horas:.2f} h (Ctrl+C para parar).")
     default_tt_headless = os.getenv('TIKTOK_HEADLESS', '1').strip() != '0'
     ans_tt = _perguntar_headless('o TikTok (upload)', default_tt_headless)
     if ans_tt is None:
@@ -546,7 +517,7 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
         while True:
             _reload_env_if_changed()
             inicio = datetime.now()
-            logger.info("🟢 Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
+            logger.info("🕐 Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
             args_tuple = (modo_conteudo, idioma, tts_engine, legendas, video_style, motion, 0, image_engine, False)
             ok = _executar_com_timeout(args_tuple)
             proxima = inicio + timedelta(hours=cada_horas)
@@ -554,13 +525,12 @@ def postar_em_intervalo(cada_horas: float, modo_conteudo: str, idioma: str, tts_
             rem_horas = rem / 3600.0
             if ok is True: logger.info("✅ Execução OK.")
             elif ok is False: logger.warning("❌ Execução falhou.")
-            else: logger.warning("⏱️ Execução excedeu %.1f min (timeout).", ITERATION_TIMEOUT_MIN)
+            else: logger.warning("⌛ Execução excedeu %.1f min (timeout).", ITERATION_TIMEOUT_MIN)
             logger.info("Próxima execução em %.2f horas...", rem_horas)
             time.sleep(rem)
     except KeyboardInterrupt:
-        logger.info("🟥 Encerrado pelo usuário.")
+        logger.info("👋 Encerrado pelo usuário.")
 
-# ====== Menus de alto nível ======
 def _menu_principal():
     _reload_env_if_changed(force=False)
     while True:
@@ -570,25 +540,12 @@ def _menu_principal():
         if idioma is None:
             continue
 
-        # --- AQUI ESTÁ A ALTERAÇÃO ---
-        # Se o idioma for Egito, chama a rotina de setup da VPN primeiro.
-        if idioma == 'ar-eg':
-            if _HAVE_VPN_SETUP:
-                logger.info("🇪🇬 Detectado idioma Egito. Verificando configuração da VPN...")
-                if not setup_browser_para_egito():
-                    logger.error("❌ A configuração da VPN do Egito falhou ou foi cancelada pelo utilizador.")
-                    logger.info("Retornando ao menu principal.")
-                    continue  # Volta para o menu principal se o setup falhar
-            else:
-                logger.error("❌ Função 'setup_browser_para_egito' não encontrada. Verifique o ficheiro 'browsers.py'.")
-                continue
-
+        # [Removido] --- NENHUMA referência ao setup_browser_para_egito aqui.
 
         conteudo = _submenu_conteudo_por_idioma(idioma)
         if conteudo is None:
             continue
-        
-        # ... (O resto do código da função permanece exatamente igual)
+
         if conteudo[0] == "veo3":
             if modo == "2":
                 horas = _ler_intervalo_horas()
@@ -616,7 +573,6 @@ def _menu_principal():
         else:
             rotina(modo_conteudo=conteudo[0], idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_count=0, image_engine=image_engine, ask_tiktok_headless=True)
         _reload_env_if_changed(force=False)
-
 
 if __name__ == "__main__":
     try:
