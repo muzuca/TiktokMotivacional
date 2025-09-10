@@ -976,23 +976,36 @@ def _auth_has_session_cookie(driver) -> bool:
         return False
 
 def _auth_is_logged_in(driver) -> bool:
-    if _auth_has_session_cookie(driver):
-        return True
     try:
         url = (driver.current_url or "").lower()
-    except Exception:
-        url = ""
-    if any(k in url for k in ["/projects", "/studio", "/home", "/dashboard"]):
-        return True
-    for xp in _get_success_xpaths_from_env():
+        # Heurística negativa: se está em qualquer tela de login, não está autenticado!
+        if any(k in url for k in ["accounts.google.", "/signin", "sign-in", "login", "oauth"]):
+            return False
+        html = (driver.page_source or "").lower()
+        if any(k in html for k in [
+            "sign in with google", "entrar com o google", "continuar com o google",
+            "acessar conta google", "email", "senha", "nome de usu", "sign in", "login"
+        ]):
+            return False
+        # Heurística positiva: verifica se há elementos exclusivos da tela interna "logada"
+        for xp in _get_success_xpaths_from_env():
+            try:
+                el = driver.find_element("xpath", xp)
+                if el and el.is_displayed() and el.is_enabled():
+                    return True
+            except NoSuchElementException:
+                continue
+            except WebDriverException:
+                break
+        # Opcional: botão/avatar
         try:
-            el = driver.find_element("xpath", xp)
-            if el:
+            avatar = driver.find_elements(By.XPATH, "//button[.//img[contains(@src,'avatar')]]")
+            if avatar and avatar[0].is_displayed():
                 return True
-        except NoSuchElementException:
-            continue
-        except WebDriverException:
-            break
+        except Exception:
+            pass
+    except Exception:
+        pass
     return False
 
 def _auth_dump(driver, tag="signin"):
