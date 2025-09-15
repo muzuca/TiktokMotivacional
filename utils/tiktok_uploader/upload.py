@@ -15,6 +15,8 @@ Atualizações desta versão:
 - Headless estável: flags SwiftShader/WebGL para evitar erros de GPU.
 - **Descompartimentação de país/idioma/região** via funções e mapeamentos,
   adicionando **Rússia (RU)**: `ru-RU`, timezone `Europe/Moscow`, e `PROXY_RU_*`.
+- **Integração com VPN Manager**: orquestra a conexão de VPN antes de qualquer
+  navegação para o TikTok, abortando a operação em caso de falha.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
 )
-from selenium.webdriver.remote.webdriver import WebDriver  # type: ignore
+from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.action_chains import ActionChains
 
@@ -52,126 +54,97 @@ from selenium.webdriver.common.action_chains import ActionChains
 from .auth import AuthBackend
 from . import config
 
+# ===== VPN Manager =====
+try:
+    from ..vpn_manager import VpnConnectionError
+except (ImportError, ValueError):
+    class VpnConnectionError(Exception):
+        """Fallback de erro customizado para falhas de conexão da VPN."""
+        pass
+
 # ----------------------------------------------------------------------
 #  MAPAS CENTRALIZADOS (país/idioma/região/proxy/timezone)
 # ----------------------------------------------------------------------
 
-# Normalização simples de idioma para chaves curtas
 def _norm_lang(s: Optional[str]) -> str:
     s = (s or "").strip().lower()
-    if s.startswith("ar"):
-        return "ar"
-    if s.startswith("pt"):
-        return "pt"
-    if s.startswith("ru"):
-        return "ru"
-    if s.startswith("id"):
-        return "id" 
+    if s.startswith("ar"): return "ar"
+    if s.startswith("pt"): return "pt"
+    if s.startswith("ru"): return "ru"
+    if s.startswith("id"): return "id"
     return "en"
 
-# Região padrão por idioma (permite expansão fácil)
-LANG_TO_REGION = {
-    "ar": "EG",
-    "en": "US",
-    "pt": "BR",
-    "ru": "RU",
-    "id": "ID",
-}
-
-# Tag de idioma (Accept-Language / navigator.language)
-LANG_TO_TAG = {
-    "ar": "ar-EG",
-    "en": "en-US",
-    "pt": "pt-BR",
-    "ru": "ru-RU",
-    "id": "id-ID",
-}
-
-# Locale/Timezone por região
+LANG_TO_REGION = {"ar": "EG", "en": "US", "pt": "BR", "ru": "RU", "id": "ID"}
+LANG_TO_TAG = {"ar": "ar-EG", "en": "en-US", "pt": "pt-BR", "ru": "ru-RU", "id": "id-ID"}
 REGION_TO_TIME = {
-    "EG": {"tz": "Africa/Cairo",       "locale": "ar-EG"},
-    "US": {"tz": "America/New_York",   "locale": "en-US"},
-    "BR": {"tz": "America/Sao_Paulo",  "locale": "pt-BR"},
-    "RU": {"tz": "Europe/Moscow",      "locale": "ru-RU"},
-    "ID": {"tz": "Asia/Jakarta",       "locale": "id-ID"},
+    "EG": {"tz": "Africa/Cairo", "locale": "ar-EG"},
+    "US": {"tz": "America/New_York", "locale": "en-US"},
+    "BR": {"tz": "America/Sao_Paulo", "locale": "pt-BR"},
+    "RU": {"tz": "Europe/Moscow", "locale": "ru-RU"},
+    "ID": {"tz": "Asia/Jakarta", "locale": "id-ID"},
 }
 
-# Proxy habilitado por padrão?
 def _want_proxy_default(idioma: Optional[str]) -> bool:
-    # Mantém comportamento atual: proxy em EN/AR e adiciona RU; BR sem proxy.
     return _norm_lang(idioma) in ("en", "ar", "ru", "id")
 
-# Resolve região por idioma
 def _region_default(idioma: Optional[str]) -> Optional[str]:
     return LANG_TO_REGION.get(_norm_lang(idioma), None)
 
-# Resolve lang-tag por idioma
 def _lang_tag_default(idioma: Optional[str]) -> str:
     return LANG_TO_TAG.get(_norm_lang(idioma), "en-US")
 
-# Helper para ordem de fallback em variáveis de ambiente
 def _env_first(*keys: str, default: str = "") -> str:
     for k in keys:
         v = os.getenv(k)
-        if v:
-            return v
+        if v: return v
     return default
 
-# Resolve proxy por região (suporta US/EG/BR/RU; BR normalmente sem uso)
 def _resolve_proxy_env(region: Optional[str]):
     reg = (region or "").upper()
     if reg == "US":
         host = _env_first("PROXY_US_HOST", "PROXY_HOST_US", "PROXY_HOST")
         port = _env_first("PROXY_US_PORT", "PROXY_PORT_US", "PROXY_PORT")
         user = _env_first("PROXY_US_USER", "PROXY_USER_US", "PROXY_USER") or None
-        pw   = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
+        pw = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
         return host, port, user, pw
     if reg == "EG":
         host = _env_first("PROXY_EG_HOST", "PROXY_HOST_EG", "PROXY_HOST")
         port = _env_first("PROXY_EG_PORT", "PROXY_PORT_EG", "PROXY_PORT")
         user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
-        pw   = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
+        pw = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
         return host, port, user, pw
     if reg == "RU":
         host = _env_first("PROXY_RU_HOST", "PROXY_HOST_RU", "PROXY_HOST")
         port = _env_first("PROXY_RU_PORT", "PROXY_PORT_RU", "PROXY_PORT")
         user = _env_first("PROXY_RU_USER", "PROXY_USER_RU", "PROXY_USER") or None
-        pw   = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
+        pw = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
         return host, port, user, pw
     if reg == "ID":
         host = _env_first("PROXY_ID_HOST", "PROXY_HOST_ID", "PROXY_HOST")
         port = _env_first("PROXY_ID_PORT", "PROXY_PORT_ID", "PROXY_PORT")
         user = _env_first("PROXY_ID_USER", "PROXY_USER_ID", "PROXY_USER") or None
-        pw   = _env_first("PROXY_ID_PASS", "PROXY_PASS_ID", "PROXY_PASS") or None
+        pw = _env_first("PROXY_ID_PASS", "PROXY_PASS_ID", "PROXY_PASS") or None
         return host, port, user, pw
-    # BR ou genérico
     host = _env_first("PROXY_BR_HOST", "PROXY_HOST_BR", "PROXY_HOST")
     port = _env_first("PROXY_BR_PORT", "PROXY_PORT_BR", "PROXY_PORT")
     user = _env_first("PROXY_BR_USER", "PROXY_USER_BR", "PROXY_USER") or None
-    pw   = _env_first("PROXY_BR_PASS", "PROXY_PASS_BR", "PROXY_PASS") or None
+    pw = _env_first("PROXY_BR_PASS", "PROXY_PASS_BR", "PROXY_PASS") or None
     return host, port, user, pw
 
-# Aceita ru-RU corretamente
 def _accept_header_from_tag(tag: Optional[str]) -> str:
     tag = (tag or "").strip() or "en-US"
     tl = tag.lower()
-    if tl.startswith("pt"):
-        return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tl.startswith("ar"):
-        return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tl.startswith("ru"):
-        return "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tl.startswith("id"):
-        return "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"    
+    if tl.startswith("pt"): return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("ar"): return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("ru"): return "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+    if tl.startswith("id"): return "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"
     return "en-US,en;q=0.9"
 
-# Preferimos o get_browser (com Selenium-Wire) do módulo browsers.
 try:
-    from .browsers import get_browser  # respeita want_proxy/region/lang_tag
+    from .browsers import get_browser
 except ImportError:
-    # ------------------ Fallback minimalista com Selenium-Wire ------------------
     from dotenv import load_dotenv
-    from seleniumwire import webdriver as wire_webdriver  # type: ignore
+    from seleniumwire import webdriver as wire_webdriver
     from selenium import webdriver as std_webdriver
     from selenium.webdriver.chrome.service import Service as ChromeService
     from webdriver_manager.chrome import ChromeDriverManager
@@ -181,47 +154,25 @@ except ImportError:
     from selenium.webdriver.edge.options import Options as EdgeOptions
     from selenium.webdriver.edge.service import Service as EdgeService
     from webdriver_manager.microsoft import EdgeChromiumDriverManager
-
     load_dotenv()
-
     def _mk_sw_opts(use_proxy: bool, region: Optional[str]):
-        opts = {
-            'request_storage': 'none',
-            'verify_ssl': False,
-            'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"],
-            'port': 0, 'addr': '127.0.0.1', 'auto_config': True
-        }
-        if not use_proxy:
-            return opts
+        opts = {'request_storage': 'none', 'verify_ssl': False, 'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"], 'port': 0, 'addr': '127.0.0.1', 'auto_config': True}
+        if not use_proxy: return opts
         host, port, user, pw = _resolve_proxy_env(region)
         if host and port:
-            if user and pw:
-                proxy_uri = f"http://{user}:{pw}@{host}:{port}"
-            else:
-                proxy_uri = f"http://{host}:{port}"
+            proxy_uri = f"http://{user}:{pw}@{host}:{port}" if user and pw else f"http://{host}:{port}"
             opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
             logging.info("Selenium-Wire proxy configurado (%s): %s", (region or "DEFAULT"), proxy_uri)
         else:
             logging.warning("want_proxy=True mas variáveis de proxy ausentes (%s). Seguiremos sem upstream.", region or "DEFAULT")
         return opts
-
-    def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto",
-                    headless: bool = False, *, want_proxy: Optional[bool] = None,
-                    region: Optional[str] = None, lang_tag: Optional[str] = None, **kwargs):
-
-        if want_proxy is None:
-            want_proxy = _want_proxy_default(idioma)
-        if region is None:
-            region = _region_default(idioma)
-        if lang_tag is None:
-            lang_tag = _lang_tag_default(idioma)
-
-        logging.info("get_browser (fallback): idioma=%s | want_proxy=%s | region=%s | lang_tag=%s",
-                     idioma, want_proxy, region or "-", lang_tag)
-
+    def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto", headless: bool = False, *, want_proxy: Optional[bool] = None, region: Optional[str] = None, lang_tag: Optional[str] = None, **kwargs):
+        if want_proxy is None: want_proxy = _want_proxy_default(idioma)
+        if region is None: region = _region_default(idioma)
+        if lang_tag is None: lang_tag = _lang_tag_default(idioma)
+        logging.info("get_browser (fallback): idioma=%s | want_proxy=%s | region=%s | lang_tag=%s", idioma, want_proxy, region or "-", lang_tag)
         if name == "chrome":
-            if options is None:
-                options = ChromeOptions()
+            if options is None: options = ChromeOptions()
             options.add_argument(f"--lang={lang_tag}")
             options.add_argument("--disable-logging")
             options.add_argument("--log-level=3")
@@ -232,7 +183,6 @@ except ImportError:
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--remote-debugging-pipe")
-            # Headless: habilitar SwiftShader/GL para evitar erros
             if headless:
                 options.add_argument("--headless=new")
                 options.add_argument("--ignore-certificate-errors")
@@ -240,141 +190,88 @@ except ImportError:
                 options.add_argument("--use-gl=swiftshader")
                 options.add_argument("--enable-unsafe-swiftshader")
                 options.add_argument("--ignore-gpu-blocklist")
-
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            driver = wire_webdriver.Chrome(
-                service=ChromeService(ChromeDriverManager().install(), port=0),
-                options=options,
-                seleniumwire_options=sw_opts
-            )
+            driver = wire_webdriver.Chrome(service=ChromeService(ChromeDriverManager().install(), port=0), options=options, seleniumwire_options=sw_opts)
             try:
-                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
-                    "headers": {"Accept-Language": _accept_header_from_tag(lang_tag), "Upgrade-Insecure-Requests": "1"}
-                })
-                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                    "source": "try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}"
-                })
+                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Accept-Language": _accept_header_from_tag(lang_tag), "Upgrade-Insecure-Requests": "1"}})
+                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}"})
             except Exception as e:
                 logging.error(f"Erro ao configurar CDP: {e}")
             return driver
-
         elif name == "firefox":
-            if options is None:
-                options = FirefoxOptions()
-            if headless:
-                options.add_argument("-headless")
-            try:
-                options.set_preference("intl.accept_languages", _accept_header_from_tag(lang_tag))
-            except Exception:
-                pass
+            if options is None: options = FirefoxOptions()
+            if headless: options.add_argument("-headless")
+            try: options.set_preference("intl.accept_languages", _accept_header_from_tag(lang_tag))
+            except Exception: pass
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            return wire_webdriver.Firefox(
-                service=FirefoxService(GeckoDriverManager().install(), port=0),
-                options=options,
-                seleniumwire_options=sw_opts
-            )
-
+            return wire_webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install(), port=0), options=options, seleniumwire_options=sw_opts)
         elif name == "edge":
-            if options is None:
-                options = EdgeOptions()
+            if options is None: options = EdgeOptions()
             options.add_argument(f"--lang={lang_tag}")
             options.add_argument("--remote-debugging-pipe")
-            if headless:
-                options.add_argument("--headless=new")
+            if headless: options.add_argument("--headless=new")
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            return wire_webdriver.Edge(
-                service=EdgeService(EdgeChromiumDriverManager().install(), port=0),
-                options=options,
-                seleniumwire_options=sw_opts
-            )
-
+            return wire_webdriver.Edge(service=EdgeService(EdgeChromiumDriverManager().install(), port=0), options=options, seleniumwire_options=sw_opts)
         else:
             raise ValueError(f"Navegador {name} não suportado")
 
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 logging.getLogger("webdriver_manager").setLevel(logging.INFO)
 
 from .utils import bold
 from .types import VideoDict, ProxyDict, Cookie
 
-# HTTP session sem retries automáticos
 session = requests.Session()
 retries = Retry(total=0)
 session.mount("http://", HTTPAdapter(max_retries=retries))
 session.mount("https://", HTTPAdapter(max_retries=retries))
 
-# ========================= Timeouts/Retentativas via .env =====================
 def _int_env(name: str, default: int) -> int:
     try:
         v = os.getenv(name)
         return int(v) if v is not None and str(v).strip() != "" else default
-    except Exception:
-        return default
-
+    except Exception: return default
 def _float_env(name: str, default: float) -> float:
     try:
         v = os.getenv(name)
         return float(v) if v is not None and str(v).strip() != "" else default
-    except Exception:
-        return default
-
+    except Exception: return default
 def _bool_env(name: str, default: bool) -> bool:
     v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
+    if v is None or str(v).strip() == "": return default
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-IMPLICIT_WAIT     = _int_env("IMPLICIT_WAIT_SEC",  5)
-EXPLICIT_WAIT     = _int_env("EXPLICIT_WAIT_SEC",  30)
-UPLOADING_WAIT    = _int_env("UPLOADING_WAIT_SEC", 240)
-ADD_HASHTAG_WAIT  = _float_env("ADD_HASHTAG_WAIT_SEC", 0.5)
-POST_CLICK_WAIT   = _int_env("POST_CLICK_WAIT_SEC", 20)
-NAV_MAX_RETRIES   = _int_env("UPLOAD_NAV_RETRIES", 3)
-IFRAME_MAX_RETRY  = _int_env("UPLOAD_IFRAME_RETRIES", 2)
+IMPLICIT_WAIT = _int_env("IMPLICIT_WAIT_SEC", 5)
+EXPLICIT_WAIT = _int_env("EXPLICIT_WAIT_SEC", 30)
+UPLOADING_WAIT = _int_env("UPLOADING_WAIT_SEC", 240)
+ADD_HASHTAG_WAIT = _float_env("ADD_HASHTAG_WAIT_SEC", 0.5)
+POST_CLICK_WAIT = _int_env("POST_CLICK_WAIT_SEC", 20)
+NAV_MAX_RETRIES = _int_env("UPLOAD_NAV_RETRIES", 3)
+IFRAME_MAX_RETRY = _int_env("UPLOAD_IFRAME_RETRIES", 2)
 NAV_RETRY_BACKOFF = _float_env("UPLOAD_RETRY_BACKOFF_SEC", 3.0)
-
-# ——— Grace e overlays antes do Post ———
-POST_MIN_GRACE_SEC           = _int_env("POST_MIN_GRACE_SEC", 30)  # usado quando DYNAMIC_POST_GRACE=0
+POST_MIN_GRACE_SEC = _int_env("POST_MIN_GRACE_SEC", 30)
 POST_AFTER_ENABLED_EXTRA_SEC = _int_env("POST_AFTER_ENABLED_EXTRA_SEC", 2)
-OVERLAYS_SETTLE_SEC          = _int_env("OVERLAYS_SETTLE_SEC", 3)
+OVERLAYS_SETTLE_SEC = _int_env("OVERLAYS_SETTLE_SEC", 3)
+PUBLICATIONS_WAIT_SEC = _int_env("PUBLICATIONS_WAIT_SEC", 120)
+VERIFY_POST_IN_PUBLICATIONS = _bool_env("VERIFY_POST_IN_PUBLICATIONS", True)
+DEFAULT_BEGIN_WORDS = _int_env("PUBLICATIONS_DESC_BEGIN_WORDS", 2)
+JITTER_START_MIN_SEC = _int_env("JITTER_START_MIN_SEC", 0)
+JITTER_START_MAX_SEC = _int_env("JITTER_START_MAX_SEC", 0)
+SLOW_NET_EXTRA_WAIT_SEC = _int_env("SLOW_NET_EXTRA_WAIT_SEC", 60)
+UPLOAD_PAGE_SETTLE_SEC = _int_env("UPLOAD_PAGE_SETTLE_SEC", 15)
+HEADER_MAX_WAIT_SEC = _int_env("HEADER_MAX_WAIT_SEC", 90)
+WARMUP_EXPLORE_WAIT_SEC = _int_env("WARMUP_EXPLORE_WAIT_SEC", 45)
+PROFILE_RETRIES = _int_env("PROFILE_RETRIES", 3)
+SMART_WAIT_ENABLE = _bool_env("SMART_WAIT_ENABLE", True)
+NET_IDLE_QUIET_MS = _int_env("NET_IDLE_QUIET_MS", 1200)
+SPA_READY_MAX_SEC = _int_env("SPA_READY_MAX_SEC", 60)
+DYNAMIC_POST_GRACE = _bool_env("DYNAMIC_POST_GRACE", True)
+POST_GRACE_MIN_SEC = _int_env("POST_GRACE_MIN_SEC", 0)
+JITTER_MIN_MINUTES = _int_env("JITTER_MIN_MINUTES", -15)
+JITTER_MAX_MINUTES = _int_env("JITTER_MAX_MINUTES", 18)
 
-# ——— Confirmar Publicações ———
-PUBLICATIONS_WAIT_SEC        = _int_env("PUBLICATIONS_WAIT_SEC", 120)
-VERIFY_POST_IN_PUBLICATIONS  = _bool_env("VERIFY_POST_IN_PUBLICATIONS", True)
-DEFAULT_BEGIN_WORDS          = _int_env("PUBLICATIONS_DESC_BEGIN_WORDS", 2)
-
-# ——— JITTER ———
-JITTER_START_MIN_SEC         = _int_env("JITTER_START_MIN_SEC", 0)
-JITTER_START_MAX_SEC         = _int_env("JITTER_START_MAX_SEC", 0)
-
-# ——— Rede lenta/Proxy ———
-SLOW_NET_EXTRA_WAIT_SEC      = _int_env("SLOW_NET_EXTRA_WAIT_SEC", 60)
-UPLOAD_PAGE_SETTLE_SEC       = _int_env("UPLOAD_PAGE_SETTLE_SEC", 15)   # fallback
-HEADER_MAX_WAIT_SEC          = _int_env("HEADER_MAX_WAIT_SEC", 90)
-WARMUP_EXPLORE_WAIT_SEC      = _int_env("WARMUP_EXPLORE_WAIT_SEC", 45)
-PROFILE_RETRIES              = _int_env("PROFILE_RETRIES", 3)
-
-# ——— Smart waits (NOVO) ———
-SMART_WAIT_ENABLE   = _bool_env("SMART_WAIT_ENABLE", True)
-NET_IDLE_QUIET_MS   = _int_env("NET_IDLE_QUIET_MS", 1200)   # 1.2s sem XHR/fetch
-SPA_READY_MAX_SEC   = _int_env("SPA_READY_MAX_SEC", 60)     # teto p/ hidratação SPA
-DYNAMIC_POST_GRACE  = _bool_env("DYNAMIC_POST_GRACE", True)
-POST_GRACE_MIN_SEC  = _int_env("POST_GRACE_MIN_SEC", 0)     # 0..5s de respiro opcional
-
-# Helpers de intervalo humano
-JITTER_MIN_MINUTES           = _int_env("JITTER_MIN_MINUTES", -15)
-JITTER_MAX_MINUTES           = _int_env("JITTER_MAX_MINUTES",  18)
-
-def human_interval_seconds(base_hours: float,
-                           jitter_min_minutes: Optional[int] = None,
-                           jitter_max_minutes: Optional[int] = None) -> int:
+def human_interval_seconds(base_hours: float, jitter_min_minutes: Optional[int] = None, jitter_max_minutes: Optional[int] = None) -> int:
     jmin = JITTER_MIN_MINUTES if jitter_min_minutes is None else jitter_min_minutes
     jmax = JITTER_MAX_MINUTES if jitter_max_minutes is None else jitter_max_minutes
     offs_minutes = random.randint(jmin, jmax)
@@ -383,15 +280,13 @@ def human_interval_seconds(base_hours: float,
 
 def sleep_jitter_before_post() -> int:
     lo, hi = sorted((max(0, JITTER_START_MIN_SEC), max(0, JITTER_START_MAX_SEC)))
-    if hi <= 0:
-        return 0
+    if hi <= 0: return 0
     sl = random.randint(lo, hi)
     if sl > 0:
         logger.info("⏳ Jitter antes da postagem: aguardando %ds para desalinhamento humano...", sl)
         time.sleep(sl)
     return sl
 
-# --------------------------- helpers de proxy/idioma ---------------------------
 def _idioma_norm(idioma: Optional[str]) -> str:
     return _norm_lang(idioma)
 
@@ -410,10 +305,8 @@ def _is_seleniumwire_driver(driver) -> bool:
     except Exception:
         return False
 
-# =================== Publicações (confirmação pós-post) ===================
 PUB_ROW_CONTAINER_XPATH = "//div[@data-tt='components_PostInfoCell_Container']"
-PUB_ROW_LINK_REL_XPATH  = ".//a[@data-tt='components_PostInfoCell_a']"
-
+PUB_ROW_LINK_REL_XPATH = ".//a[@data-tt='components_PostInfoCell_a']"
 PUBLICACOES_SEARCH_XPATHES = [
     "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'descri')]",
     "//div[contains(@class,'Search') or contains(@data-tt,'SearchBar')]//input",
@@ -424,43 +317,32 @@ def _find_publications_search_input(driver) -> Optional[Any]:
     for xp in PUBLICACOES_SEARCH_XPATHES:
         try:
             el = driver.find_element(By.XPATH, xp)
-            if el and el.is_enabled():
-                return el
-        except Exception:
-            pass
+            if el and el.is_enabled(): return el
+        except Exception: pass
     return None
 
 def _wait_publications_page(driver: WebDriver, timeout: int = 90) -> None:
     def _ready(d: WebDriver):
+        try: d.switch_to.default_content()
+        except Exception: pass
         try:
-            d.switch_to.default_content()
-        except Exception:
-            pass
-        try:
-            if d.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH):
-                return True
-        except Exception:
-            pass
+            if d.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH): return True
+        except Exception: pass
         try:
             return _find_publications_search_input(d) is not None
-        except Exception:
-            return False
+        except Exception: return False
     WebDriverWait(driver, timeout).until(_ready)
 
 def _snippet_from_beginning(description: str, begin_words: int = DEFAULT_BEGIN_WORDS, max_chars: int = 60) -> str:
-    if not description:
-        return ""
+    if not description: return ""
     tokens = [t for t in re.split(r"\s+", description.strip()) if t]
     keep: List[str] = []
     for t in tokens:
         if t.startswith("#") or t.startswith("@"):
-            if not keep:
-                continue
+            if not keep: continue
         keep.append(t)
-        if len(keep) >= max(1, begin_words):
-            break
-    snippet = " ".join(keep).strip()
-    snippet = snippet.replace('"', " ").replace("'", " ")
+        if len(keep) >= max(1, begin_words): break
+    snippet = " ".join(keep).strip().replace('"', " ").replace("'", " ")
     snippet = re.sub(r"\s+", " ", snippet)
     if len(snippet) > max_chars:
         snippet = snippet[:max_chars].rstrip()
@@ -469,74 +351,44 @@ def _snippet_from_beginning(description: str, begin_words: int = DEFAULT_BEGIN_W
 def _maybe_filter_publications_by_query(driver: WebDriver, query: str) -> None:
     try:
         search = _find_publications_search_input(driver)
-        if not search:
-            return
+        if not search: return
         search.click()
-        try:
-            search.clear()
-        except Exception:
-            pass
+        try: search.clear()
+        except Exception: pass
         search.send_keys(query)
         search.send_keys(Keys.RETURN)
         time.sleep(0.8)
-    except Exception:
-        pass
+    except Exception: pass
 
-def _confirm_post_in_publications(
-    driver: WebDriver,
-    description: str,
-    timeout: int,
-    *,
-    begin_words: int = DEFAULT_BEGIN_WORDS
-) -> bool:
-    try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
-
+def _confirm_post_in_publications(driver: WebDriver, description: str, timeout: int, *, begin_words: int = DEFAULT_BEGIN_WORDS) -> bool:
+    try: driver.switch_to.default_content()
+    except Exception: pass
     _wait_publications_page(driver, timeout=min(60, timeout))
-
     snippet = _snippet_from_beginning(description or "", begin_words=begin_words).strip()
     if snippet:
         _maybe_filter_publications_by_query(driver, snippet)
-
     deadline = time.time() + max(10, timeout)
     snippet_lower = snippet.lower()
-
     while time.time() < deadline:
         try:
             containers = driver.find_elements(By.XPATH, PUB_ROW_CONTAINER_XPATH)
             for c in containers:
                 try:
                     text = (c.text or "")
-                    link_titles = []
-                    for a in c.find_elements(By.XPATH, PUB_ROW_LINK_REL_XPATH):
-                        try:
-                            t = a.get_attribute("title") or ""
-                            if t:
-                                link_titles.append(t)
-                        except Exception:
-                            pass
+                    link_titles = [a.get_attribute("title") or "" for a in c.find_elements(By.XPATH, PUB_ROW_LINK_REL_XPATH) if a.get_attribute("title")]
                     haystack = (text + " " + " ".join(link_titles)).lower()
                     if snippet_lower and snippet_lower in haystack:
                         logger.info("✅ Post localizado na lista por início da descrição: %r", snippet)
                         return True
-                except Exception:
-                    pass
-
+                except Exception: pass
             if not snippet and containers:
                 logger.info("✅ Publicações carregadas; descrição vazia, assumindo sucesso.")
                 return True
-
-        except Exception:
-            pass
-
+        except Exception: pass
         time.sleep(1.0)
-
     logger.warning("Não consegui confirmar o post na lista (início=%r) em %ds.", snippet, timeout)
     return False
 
-# ========================= Captura robusta de perfil ==========================
 PROFILE_AVATAR_BTN_XPATHES = [
     "//button[@data-tt='Header_NewHeader_Clickable']",
     "//div[@data-tt='Header_NewHeader_FlexRow_4']//button[@data-tt='Header_NewHeader_Clickable']",
@@ -544,7 +396,6 @@ PROFILE_AVATAR_BTN_XPATHES = [
     "//button[@aria-haspopup='dialog' and contains(@class,'e1rf0ws82')]",
     "//button[contains(@class,'e1rf0ws82')]",
 ]
-
 PROFILE_MENU_LINK_XPATHES = [
     "//a[@data-tt='Header_NewHeader_TUXMenuItem' and contains(@href,'tiktok.com/@')]",
     "//a[contains(@class,'TUXMenuItem') and contains(@href,'tiktok.com/@')]",
@@ -555,11 +406,8 @@ def _await_document_ready(driver: WebDriver, timeout: int = 60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            state = driver.execute_script("return document.readyState")
-            if state == "complete":
-                return
-        except Exception:
-            pass
+            if driver.execute_script("return document.readyState") == "complete": return
+        except Exception: pass
         time.sleep(0.2)
 
 def _wait_header_ready(driver: WebDriver, timeout: int = 45) -> bool:
@@ -569,40 +417,30 @@ def _wait_header_ready(driver: WebDriver, timeout: int = 45) -> bool:
         for xp in PROFILE_AVATAR_BTN_XPATHES:
             try:
                 el = WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, xp)))
-                if el.is_displayed():
-                    return True
-            except Exception:
-                pass
+                if el.is_displayed(): return True
+            except Exception: pass
         for xp in PROFILE_MENU_LINK_XPATHES:
             try:
-                if driver.find_elements(By.XPATH, xp):
-                    return True
-            except Exception:
-                pass
+                if driver.find_elements(By.XPATH, xp): return True
+            except Exception: pass
         time.sleep(0.3)
     return False
 
 def _open_profile_menu(driver: WebDriver, timeout: int = 20) -> None:
     driver.switch_to.default_content()
-    if not _wait_header_ready(driver, timeout=max(3, timeout-2)):
-        return
+    if not _wait_header_ready(driver, timeout=max(3, timeout - 2)): return
     for xp in PROFILE_AVATAR_BTN_XPATHES:
         try:
             btn = driver.find_element(By.XPATH, xp)
             driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'end'});", btn)
-            try:
-                ActionChains(driver).move_to_element(btn).pause(0.05).click(btn).perform()
+            try: ActionChains(driver).move_to_element(btn).pause(0.05).click(btn).perform()
             except Exception:
-                try:
-                    btn.click()
-                except Exception:
-                    driver.execute_script("arguments[0].dispatchEvent(new MouseEvent('click',{bubbles:true}))", btn)
+                try: btn.click()
+                except Exception: driver.execute_script("arguments[0].dispatchEvent(new MouseEvent('click',{bubbles:true}))", btn)
             time.sleep(0.4)
             for mxp in PROFILE_MENU_LINK_XPATHES:
-                if driver.find_elements(By.XPATH, mxp):
-                    return
-        except Exception:
-            pass
+                if driver.find_elements(By.XPATH, mxp): return
+        except Exception: pass
 
 def _extract_profile_from_menu(driver: WebDriver, timeout: int = 8) -> Optional[Tuple[str, str]]:
     driver.switch_to.default_content()
@@ -610,18 +448,15 @@ def _extract_profile_from_menu(driver: WebDriver, timeout: int = 8) -> Optional[
         try:
             a = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, xp)))
             href = (a.get_attribute("href") or "").strip()
-            if not href:
-                continue
+            if not href: continue
             user = ""
             try:
                 parsed = urlparse(href)
                 if parsed.path and parsed.path.startswith("/@"):
                     user = parsed.path[2:].split("/")[0]
-            except Exception:
-                user = ""
+            except Exception: user = ""
             return (user, href)
-        except Exception:
-            pass
+        except Exception: pass
     return None
 
 def _profile_from_page_state(driver: WebDriver) -> Optional[Tuple[str, str]]:
@@ -644,21 +479,16 @@ def _profile_from_page_state(driver: WebDriver) -> Optional[Tuple[str, str]]:
         res = driver.execute_script(js)
         if res and isinstance(res, (list, tuple)) and len(res) == 2:
             return (str(res[0]), str(res[1]))
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 def _close_any_menu(driver: WebDriver) -> None:
-    try:
-        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    try: driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
     except Exception:
-        try:
-            driver.execute_script("document.body && document.body.click && document.body.click();")
-        except Exception:
-            pass
+        try: driver.execute_script("document.body && document.body.click && document.body.click();")
+        except Exception: pass
 
-def _log_current_profile(driver: WebDriver, timeout: int = 20, *, want_proxy: bool = False) -> Optional[Tuple[str,str]]:
-    """Tenta abrir o menu do avatar e extrair (username, href). Retorna None se não conseguir."""
+def _log_current_profile(driver: WebDriver, timeout: int = 20, *, want_proxy: bool = False) -> Optional[Tuple[str, str]]:
     try:
         _await_document_ready(driver, timeout=max(10, timeout))
         if want_proxy:
@@ -679,47 +509,16 @@ def _log_current_profile(driver: WebDriver, timeout: int = 20, *, want_proxy: bo
     finally:
         _close_any_menu(driver)
 
-# =================== Smart wait (network idle / SPA pronta) ===================
-
 def _install_network_watch(driver: WebDriver) -> None:
-    """Instrumenta fetch/XHR para contarmos requisições em voo."""
-    js = r"""
-    (function(){
-      if (window.__netmon_installed) return;
-      try {
-        window.__pendingRequests = 0;
-        const origFetch = window.fetch;
-        if (origFetch) {
-          window.fetch = function(){
-            window.__pendingRequests++;
-            return origFetch.apply(this, arguments).finally(function(){ window.__pendingRequests = Math.max(0, (window.__pendingRequests||1)-1); });
-          };
-        }
-        if (window.XMLHttpRequest && window.XMLHttpRequest.prototype.send) {
-          const origSend = XMLHttpRequest.prototype.send;
-          XMLHttpRequest.prototype.send = function(){
-            try { this.addEventListener('loadend', function(){ window.__pendingRequests = Math.max(0,(window.__pendingRequests||1)-1); }, {once:true}); } catch(e){}
-            window.__pendingRequests = (window.__pendingRequests||0)+1;
-            return origSend.apply(this, arguments);
-          };
-        }
-        window.__netmon_installed = true;
-      } catch(e) {}
-    })();
-    """
-    try:
-        driver.execute_script(js)
-    except Exception:
-        pass
+    js = r"""(function(){if(window.__netmon_installed)return;try{window.__pendingRequests=0;const a=window.fetch;if(a){window.fetch=function(){window.__pendingRequests++;return a.apply(this,arguments).finally(function(){window.__pendingRequests=Math.max(0,(window.__pendingRequests||1)-1)})}}if(window.XMLHttpRequest&&window.XMLHttpRequest.prototype.send){const b=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(){try{this.addEventListener("loadend",function(){window.__pendingRequests=Math.max(0,(window.__pendingRequests||1)-1)},{once:!0})}catch(c){}window.__pendingRequests=(window.__pendingRequests||0)+1;return b.apply(this,arguments)}}window.__netmon_installed=!0}catch(c){}})();"""
+    try: driver.execute_script(js)
+    except Exception: pass
 
 def _pending_requests(driver: WebDriver) -> int:
-    try:
-        return int(driver.execute_script("return window.__pendingRequests||0;") or 0)
-    except Exception:
-        return 0
+    try: return int(driver.execute_script("return window.__pendingRequests||0;") or 0)
+    except Exception: return 0
 
 def _wait_network_idle(driver: WebDriver, quiet_ms: int, timeout: int) -> bool:
-    """Espera não haver XHR/fetch pendentes por `quiet_ms` consecutivos."""
     deadline = time.time() + max(1, timeout)
     last_change = time.time()
     last_count = _pending_requests(driver)
@@ -734,222 +533,116 @@ def _wait_network_idle(driver: WebDriver, quiet_ms: int, timeout: int) -> bool:
     return False
 
 def _wait_spa_ready(driver: WebDriver, *, lang_tag: Optional[str], slow_network: bool) -> None:
-    """Garante SPA hidratada sem usar sleep fixo."""
     settle_extra = SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0
     _await_document_ready(driver, timeout=EXPLICIT_WAIT + settle_extra)
     _install_network_watch(driver)
-
-    # raiz do app presente
-    WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(
-        EC.presence_of_element_located((By.ID, "root"))
-    )
-
-    # idle de rede + input de upload disponível (iframe OU DOM principal)
+    WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.ID, "root")))
     ok_idle = _wait_network_idle(driver, NET_IDLE_QUIET_MS, timeout=min(SPA_READY_MAX_SEC + settle_extra, 120))
     if not ok_idle:
         logger.info("SPA_READY: seguiu sem network-idle (teto de tempo atingido)")
-
-    # tenta localizar o input (iframe ou principal) – sem dormir fixo
-    try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
-
+    try: driver.switch_to.default_content()
+    except Exception: pass
     selectors = config["selectors"]["upload"]
     try:
-        iframe = WebDriverWait(driver, IMPLICIT_WAIT + settle_extra).until(
-            EC.presence_of_element_located((By.XPATH, selectors["iframe"]))
-        )
+        iframe = WebDriverWait(driver, IMPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.XPATH, selectors["iframe"])))
         driver.switch_to.frame(iframe)
-        WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(
-            EC.presence_of_element_located((By.XPATH, selectors["upload_video"]))
-        )
+        WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.XPATH, selectors["upload_video"])))
         logger.info("Upload UI pronta (iframe).")
         return
     except Exception:
+        try: driver.switch_to.default_content()
+        except Exception: pass
         try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-        try:
-            WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(
-                EC.presence_of_element_located((By.XPATH, selectors["upload_video"]))
-            )
+            WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.XPATH, selectors["upload_video"])))
             logger.info("Upload UI pronta (documento principal).")
             return
-        except Exception:
-            pass
-
-    # Se não achou, deixa o fluxo normal tentar de novo (_ensure_upload_ui)
+        except Exception: pass
     logger.info("Upload UI não evidente após hidratação; continuando com rotina de detecção.")
-
-# -------------------------------- Navegação Upload -----------------------------
 
 def _candidate_upload_urls(lang_tag: Optional[str]) -> List[str]:
     base = "https://www.tiktok.com/tiktokstudio/upload"
     lt = (lang_tag or "en-US")
-    return [
-        f"{base}?from=webapp&lang={lt}",
-        f"{base}?from=creator_center&lang={lt}",
-        f"{base}?lang={lt}",
-    ]
+    return [f"{base}?from=webapp&lang={lt}", f"{base}?from=creator_center&lang={lt}", f"{base}?lang={lt}"]
 
 def _warmup_explore(driver: WebDriver, *, slow_network: bool) -> None:
-    if not slow_network:
-        return
+    if not slow_network: return
     try:
         driver.get("https://www.tiktok.com/explore")
         logger.info("Warmup: /explore")
-        WebDriverWait(driver, EXPLICIT_WAIT + SLOW_NET_EXTRA_WAIT_SEC).until(
-            EC.presence_of_element_located((By.ID, "root"))
-        )
+        WebDriverWait(driver, EXPLICIT_WAIT + SLOW_NET_EXTRA_WAIT_SEC).until(EC.presence_of_element_located((By.ID, "root")))
         time.sleep(min(WARMUP_EXPLORE_WAIT_SEC, 90))
-    except Exception:
-        pass
+    except Exception: pass
 
 def _apply_lang_to_url(url: str, lang_tag: Optional[str]) -> str:
-    if not lang_tag:
-        return url
+    if not lang_tag: return url
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query, keep_blank_values=True)
         qs["lang"] = [lang_tag]
         new_q = urlencode(qs, doseq=True)
         return urlunparse(parsed._replace(query=new_q))
-    except Exception:
-        return url
+    except Exception: return url
 
 def _is_upload_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-        return p.path.rstrip('/') == "/tiktokstudio/upload"
-    except Exception:
-        return False
-
+    try: return urlparse(url).path.rstrip('/') == "/tiktokstudio/upload"
+    except Exception: return False
 def _on_wrong_hub(url: str) -> bool:
-    try:
-        p = urlparse(url)
-        return p.path.rstrip('/') == "/tiktokstudio"
-    except Exception:
-        return False
+    try: return urlparse(url).path.rstrip('/') == "/tiktokstudio"
+    except Exception: return False
 
 def _nav_with_retries(driver: WebDriver, *, lang_tag: Optional[str] = None, slow_network: bool = False) -> None:
     _warmup_explore(driver, slow_network=slow_network)
-
     candidates = _candidate_upload_urls(lang_tag)
     attempts = NAV_MAX_RETRIES + (1 if slow_network else 0)
     settle_extra = SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0
-
     last_error: Optional[Exception] = None
-
     for attempt in range(1, attempts + 1):
         for target in candidates:
             try:
                 driver.get(target)
                 logger.info("Navegou para: %s", driver.current_url)
-
-                # Espera “SPA pronta” baseada em rede/DOM (sem sleep fixo)
                 if SMART_WAIT_ENABLE:
                     _wait_spa_ready(driver, lang_tag=lang_tag, slow_network=slow_network)
                 else:
                     WebDriverWait(driver, EXPLICIT_WAIT + settle_extra).until(EC.presence_of_element_located((By.ID, "root")))
                     time.sleep(min(UPLOAD_PAGE_SETTLE_SEC + settle_extra, 90))
-
                 if _on_wrong_hub(driver.current_url):
                     logger.info("Redirecionado ao hub /tiktokstudio. Forçando novamente a rota de upload…")
                     continue
-
                 driver.switch_to.default_content()
                 return
-            except Exception as e:
-                last_error = e
+            except Exception as e: last_error = e
         logger.warning("Timeout/falha abrindo upload (tentativa %d/%d). Retentando em %.1fs…", attempt, attempts, NAV_RETRY_BACKOFF)
         time.sleep(NAV_RETRY_BACKOFF)
-
     raise TimeoutException(f"Não consegui abrir a página de upload após tentativas. Último erro: {last_error}")
 
-# --------------------------- API de Upload ---------------------------
-
-def upload_video(
-    filename: str,
-    description: Optional[str] = None,
-    cookies: str = "",
-    schedule: Optional[datetime.datetime] = None,
-    username: str = "",
-    password: str = "",
-    sessionid: Optional[str] = None,
-    cookies_list: List[Cookie] = [],
-    cookies_str: Optional[str] = None,
-    proxy: Optional[ProxyDict] = None,
-    product_id: Optional[str] = None,
-    idioma: str = "auto",
-    begin_words: Optional[int] = None,
-    *args,
-    **kwargs,
-) -> List[VideoDict]:
-    auth = AuthBackend(
-        username=username,
-        password=password,
-        cookies=cookies,
-        cookies_list=cookies_list,
-        cookies_str=cookies_str,
-        sessionid=sessionid,
-    )
-
+def upload_video(filename: str, description: Optional[str] = None, cookies: str = "", schedule: Optional[datetime.datetime] = None, username: str = "", password: str = "", sessionid: Optional[str] = None, cookies_list: List[Cookie] = [], cookies_str: Optional[str] = None, proxy: Optional[ProxyDict] = None, product_id: Optional[str] = None, idioma: str = "auto", begin_words: Optional[int] = None, use_vpn: bool = False, *args, **kwargs) -> List[VideoDict]:
+    auth = AuthBackend(username=username, password=password, cookies=cookies, cookies_list=cookies_list, cookies_str=cookies_str, sessionid=sessionid)
     video_dict: VideoDict = {"path": filename}
-    if description:
-        video_dict["description"] = description
-    if schedule:
-        video_dict["schedule"] = schedule
-    if product_id:
-        video_dict["product_id"] = product_id
+    if description: video_dict["description"] = description
+    if schedule: video_dict["schedule"] = schedule
+    if product_id: video_dict["product_id"] = product_id
+    return upload_videos([video_dict], auth, proxy, idioma=idioma, begin_words=begin_words, use_vpn=use_vpn, *args, **kwargs)
 
-    return upload_videos(
-        [video_dict],
-        auth,
-        proxy,
-        idioma=idioma,
-        begin_words=begin_words,
-        *args,
-        **kwargs,
-    )
-
-def upload_videos(
-    videos: List[VideoDict],
-    auth: AuthBackend,
-    proxy: Optional[ProxyDict] = None,
-    browser: Literal["chrome", "safari", "chromium", "edge", "firefox"] = "chrome",
-    browser_agent: Optional[WebDriver] = None,
-    on_complete: Optional[Callable[[VideoDict], None]] = None,
-    headless: bool = False,
-    num_retries: int = 1,
-    skip_split_window: bool = False,
-    idioma: str = "auto",
-    begin_words: Optional[int] = None,
-    *args,
-    **kwargs,
-) -> List[VideoDict]:
-    videos = _convert_videos_dict(videos)  # type: ignore
-
+def upload_videos(videos: List[VideoDict], auth: AuthBackend, proxy: Optional[ProxyDict] = None, browser: Literal["chrome", "safari", "chromium", "edge", "firefox"] = "chrome", browser_agent: Optional[WebDriver] = None, on_complete: Optional[Callable[[VideoDict], None]] = None, headless: bool = False, num_retries: int = 1, skip_split_window: bool = False, idioma: str = "auto", begin_words: Optional[int] = None, use_vpn: bool = False, *args, **kwargs) -> List[VideoDict]:
+    videos = _convert_videos_dict(videos)
     if videos and len(videos) > 1:
         logger.info("Fazendo upload de %d vídeos", len(videos))
-
     sleep_jitter_before_post()
-
-    want_proxy = _use_proxy_from_idioma(idioma)
+    
+    want_proxy = _use_proxy_from_idioma(idioma) if not use_vpn else False
     region = _region_from_idioma(idioma)
     lang_tag = _lang_tag_from_idioma(idioma)
-    logger.info("upload_videos: idioma=%s | want_proxy=%s | region=%s | lang_tag=%s",
-                idioma, want_proxy, region or "-", lang_tag)
-
+    logger.info("upload_videos: idioma=%s | want_proxy=%s | use_vpn=%s | region=%s | lang_tag=%s", idioma, want_proxy, use_vpn, region or "-", lang_tag)
+    
     if browser_agent is not None:
-        if want_proxy and not _is_seleniumwire_driver(browser_agent):
-            logger.info("Agent sem Selenium-Wire (sem proxy). Recriando com proxy.")
+        if (want_proxy or use_vpn) and not _is_seleniumwire_driver(browser_agent):
+            logger.info("Agent sem Selenium-Wire. Recriando com proxy/VPN.")
             try: browser_agent.quit()
             except Exception: pass
             browser_agent = None
-        elif not want_proxy and _is_seleniumwire_driver(browser_agent):
-            logger.info("Agent Selenium-Wire detectado, mas não quero proxy. Recriando sem proxy.")
+        elif not want_proxy and not use_vpn and _is_seleniumwire_driver(browser_agent):
+            logger.info("Agent Selenium-Wire detectado, mas não preciso de proxy/VPN. Recriando sem.")
             try: browser_agent.quit()
             except Exception: pass
             browser_agent = None
@@ -975,59 +668,53 @@ def upload_videos(
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--remote-debugging-pipe")
-
-        driver = get_browser(
-            browser,
-            headless=headless,
-            proxy=proxy,
-            idioma=idioma,
-            options=chrome_options,
-            want_proxy=want_proxy,
-            region=region,
-            lang_tag=lang_tag,
-            *args, **kwargs
-        )
+        
+        vpn_profile_name = os.getenv("URBANVPN_PROFILE_NAME") if use_vpn else None
+        
+        driver = get_browser(browser, headless=headless, proxy=proxy, idioma=idioma, options=chrome_options, want_proxy=want_proxy, region=region, lang_tag=lang_tag, vpn_profile_name=vpn_profile_name, *args, **kwargs)
     else:
         logger.info("Usando agente de navegador definido pelo usuário")
         driver = browser_agent
 
-    # Autenticação (cookies/session)
+    if use_vpn:
+        try:
+            from ..vpn_manager import connect_urban_vpn
+            logger.info("Iniciando procedimento de conexão da VPN...")
+            is_connected = connect_urban_vpn(driver)
+            if not is_connected:
+                raise VpnConnectionError("Não foi possível estabelecer conexão com a VPN.")
+        except ImportError:
+            logger.error("Não foi possível importar 'vpn_manager'. A VPN não será conectada.")
+            raise VpnConnectionError("Módulo vpn_manager não encontrado.")
+    
     driver = auth.authenticate_agent(driver)
-
-    # Aplica timezone/locale coerente com a região
+    
     try:
         reg = (region or "").upper()
         tz_info = REGION_TO_TIME.get(reg, None)
         if tz_info:
-            # permite override por .env: TZ_EG, TZ_US, TZ_BR, TZ_RU
             env_tz_key = f"TZ_{reg}"
             tz = os.getenv(env_tz_key, tz_info["tz"])
             _force_timezone(driver, tz, locale=tz_info["locale"])
     except Exception as e:
         logger.warning("Falha ao configurar timezone/locale: %s", e)
-
+    
     failed: List[VideoDict] = []
-
     eff_begin_words = begin_words if (begin_words is not None and begin_words > 0) else DEFAULT_BEGIN_WORDS
-
+    
     for video in videos:
         try:
-            path = abspath(video.get("path", "."))  # type: ignore
-            description = video.get("description", "")  # type: ignore
-            schedule = video.get("schedule", None)  # type: ignore
-            product_id = video.get("product_id", None)  # type: ignore
-
-            logger.info("Postando %s%s", bold(video.get("path", "")),
-                        f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
-
+            path = abspath(video.get("path", "."))
+            description = video.get("description", "")
+            schedule = video.get("schedule", None)
+            product_id = video.get("product_id", None)
+            logger.info("Postando %s%s", bold(video.get("path", "")), f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
             if not _check_valid_path(path):
                 logger.warning("%s é inválido, pulando", path)
                 failed.append(video)
                 continue
-
             if schedule:
-                if schedule.tzinfo is None:
-                    schedule = pytz.UTC.localize(schedule)
+                if schedule.tzinfo is None: schedule = pytz.UTC.localize(schedule)
                 else:
                     utc_offset = schedule.utcoffset()
                     if not (utc_offset and int(utc_offset.total_seconds()) == 0):
@@ -1039,74 +726,40 @@ def upload_videos(
                     logger.warning("%s é inválido (>=20min e <=10d; múltiplos de 5m). Pulando.", schedule)
                     failed.append(video)
                     continue
-
-            complete_upload_form(
-                driver, path, description, schedule, skip_split_window,
-                product_id, num_retries, headless=headless,
-                idioma=idioma, lang_tag=lang_tag,
-                begin_words=eff_begin_words,
-                want_proxy=want_proxy,
-            )
-
+            complete_upload_form(driver, path, description, schedule, skip_split_window, product_id, num_retries, headless=headless, idioma=idioma, lang_tag=lang_tag, begin_words=eff_begin_words, want_proxy=want_proxy)
+        except VpnConnectionError as e:
+            logger.error("Erro de VPN impediu o início do upload: %s", e)
+            failed.extend(videos)
+            break
         except WebDriverException as e:
-            logger.error("Falha ao fazer upload de %s devido a erro no WebDriver", path)
-            logger.error("Detalhes: Message: UI de upload não apareceu (iframe/input)." if "UI de upload não apareceu" in str(e) else f"Detalhes: {str(e)}")
+            logger.error("Falha ao fazer upload de %s devido a erro no WebDriver", video.get("path", ""))
             failed.append(video)
         except Exception as e:
-            logger.error("Falha ao fazer upload de %s", path)
-            logger.error("Detalhes: %s", str(e))
+            logger.error("Falha ao fazer upload de %s: %s", video.get("path", ""), str(e))
             failed.append(video)
-
         if callable(on_complete):
             on_complete(video)
-
+    
     if we_created_driver:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
+        try: driver.quit()
+        except Exception: pass
     return failed
 
-# --------------------------- fluxo de upload UI ---------------------------
-
-def complete_upload_form(
-    driver: WebDriver,
-    path: str,
-    description: str,
-    schedule: Optional[datetime.datetime],
-    skip_split_window: bool,
-    product_id: Optional[str] = None,
-    num_retries: int = 1,
-    headless: bool = False,
-    *,
-    idioma: Optional[str] = None,
-    lang_tag: Optional[str] = None,
-    begin_words: int = DEFAULT_BEGIN_WORDS,
-    want_proxy: bool = False,
-    **kwargs
-) -> None:
+def complete_upload_form(driver: WebDriver, path: str, description: str, schedule: Optional[datetime.datetime], skip_split_window: bool, product_id: Optional[str] = None, num_retries: int = 1, headless: bool = False, *, idioma: Optional[str] = None, lang_tag: Optional[str] = None, begin_words: int = DEFAULT_BEGIN_WORDS, want_proxy: bool = False, **kwargs) -> None:
     slow = bool(want_proxy or _use_proxy_from_idioma(idioma))
-
     _nav_with_retries(driver, lang_tag=lang_tag, slow_network=slow)
     _maybe_close_cookie_banner(driver)
-
-    # >>> Captura de perfil com retry e auto-volta à rota de upload <<<
     for i in range(1, max(1, PROFILE_RETRIES) + 1):
         info = _log_current_profile(driver, timeout=HEADER_MAX_WAIT_SEC if slow else 12, want_proxy=slow)
-        if info:
-            break
+        if info: break
         if not _is_upload_url(driver.current_url):
             logger.info("Não está na rota de upload (atual=%s). Tentando voltar para /tiktokstudio/upload…", driver.current_url)
             _nav_with_retries(driver, lang_tag=lang_tag, slow_network=slow)
         else:
             logger.info("Perfil não exibido; reabrindo o menu e tentando novamente (%d/%d)…", i, PROFILE_RETRIES)
         time.sleep(2)
-
     _ensure_upload_ui(driver, slow_network=slow)
-
     send_ts = _set_video(driver, path=path, num_retries=max(1, num_retries))
-
     logger.info("Definindo descrição")
     _set_description(driver, description)
     if schedule:
@@ -1114,143 +767,81 @@ def complete_upload_form(
         _set_schedule_video(driver, schedule)
     if product_id:
         _add_product_link(driver, product_id)
-
-    _wait_post_enabled(driver, timeout=UPLOADING_WAIT)  # botão "Post" habilitado
-
-    # ===== Grace dinâmico ao invés de esperar 30s fixos =====
+    _wait_post_enabled(driver, timeout=UPLOADING_WAIT)
     if DYNAMIC_POST_GRACE:
         logger.info("⏳ Post: usando grace dinâmico (rede/overlays)…")
         _install_network_watch(driver)
-        # 1) Espera rede ficar quieta (curta)
         _wait_network_idle(driver, NET_IDLE_QUIET_MS, timeout=15)
-        # 2) Garante que não há modais/overlays bloqueando
         _wait_blocking_overlays_gone(driver, timeout=OVERLAYS_SETTLE_SEC)
-        # 3) Grace mínimo opcional
         if POST_GRACE_MIN_SEC > 0:
             time.sleep(POST_GRACE_MIN_SEC)
     else:
-        # comportamento antigo: garante X segundos desde o envio do arquivo
         elapsed = time.time() - send_ts
         remaining = max(0, POST_MIN_GRACE_SEC - int(elapsed))
         if remaining > 0:
             logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio)…", remaining)
             time.sleep(remaining)
-
     if POST_AFTER_ENABLED_EXTRA_SEC > 0:
         time.sleep(POST_AFTER_ENABLED_EXTRA_SEC)
-
     _wait_blocking_overlays_gone(driver, timeout=OVERLAYS_SETTLE_SEC)
-
     logger.info("Clicando no botão de postagem")
     _post_video(driver)
-
     time.sleep(4)
-
     if VERIFY_POST_IN_PUBLICATIONS:
         try:
-            ok = _confirm_post_in_publications(
-                driver,
-                description or "",
-                timeout=PUBLICATIONS_WAIT_SEC,
-                begin_words=max(1, begin_words),
-            )
-            if ok:
-                logger.info("✅ Post confirmado na tela de Publicações.")
-            else:
-                logger.warning("⚠️ Não foi possível confirmar o post na tela de Publicações dentro do tempo limite.")
+            ok = _confirm_post_in_publications(driver, description or "", timeout=PUBLICATIONS_WAIT_SEC, begin_words=max(1, begin_words))
+            if ok: logger.info("✅ Post confirmado na tela de Publicações.")
+            else: logger.warning("⚠️ Não foi possível confirmar o post na tela de Publicações dentro do tempo limite.")
         except Exception as e:
             logger.warning("Falha ao validar na tela de Publicações: %s", e)
-
     try:
         time.sleep(6)
         driver.delete_all_cookies()
-    except Exception:
-        pass
-
-# =============== Upload UI/iframe detection (robusto) ==================
+    except Exception: pass
 
 def _ensure_upload_ui(driver: WebDriver, *, slow_network: bool = False) -> None:
-    """Garante que o input de upload esteja disponível.
-    Tenta primeiro dentro do iframe conhecido; se não achar, procura no `defaultContent`.
-    Se ainda falhar, reabre a página (variantes de URL) e tenta novamente.
-    """
     selectors = config["selectors"]["upload"]
-
     def _find_input_in_default() -> Optional[Any]:
-        try:
-            return driver.find_element(By.XPATH, selectors["upload_video"])  # do config
+        try: return driver.find_element(By.XPATH, selectors["upload_video"])
         except Exception:
-            try:
-                return driver.find_element(By.XPATH, "//input[@type='file' and contains(@accept,'video')]")
-            except Exception:
-                return None
-
-    for attempt in range(1, IFRAME_MAX_RETRY + 2):  # +1 tentativa extra
+            try: return driver.find_element(By.XPATH, "//input[@type='file' and contains(@accept,'video')]")
+            except Exception: return None
+    for attempt in range(1, IFRAME_MAX_RETRY + 2):
         try:
             driver.switch_to.default_content()
-            # 1) tentar pelo iframe do Studio
             try:
-                iframe = WebDriverWait(driver, IMPLICIT_WAIT + (SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0)).until(
-                    EC.presence_of_element_located((By.XPATH, selectors["iframe"]))
-                )
+                iframe = WebDriverWait(driver, IMPLICIT_WAIT + (SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0)).until(EC.presence_of_element_located((By.XPATH, selectors["iframe"])))
                 driver.switch_to.frame(iframe)
-                WebDriverWait(driver, EXPLICIT_WAIT + (SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0)).until(
-                    EC.presence_of_element_located((By.XPATH, selectors["upload_video"]))
-                )
+                WebDriverWait(driver, EXPLICIT_WAIT + (SLOW_NET_EXTRA_WAIT_SEC if slow_network else 0)).until(EC.presence_of_element_located((By.XPATH, selectors["upload_video"])))
                 logger.info("Entrou no iframe de upload")
                 return
             except TimeoutException:
                 driver.switch_to.default_content()
-
-            # 2) tentar achar direto no DOM principal
-            inp = _find_input_in_default()
-            if inp is not None:
+            if _find_input_in_default() is not None:
                 logger.info("Upload UI detectada no documento principal (sem iframe)")
                 return
-
-        except Exception:
-            pass
-
+        except Exception: pass
         logger.warning("Upload UI não disponível (tentativa %d/%d).", attempt, IFRAME_MAX_RETRY + 1)
         time.sleep(NAV_RETRY_BACKOFF)
-        try:
-            _nav_with_retries(driver, slow_network=slow_network)
-        except Exception:
-            pass
-
+        try: _nav_with_retries(driver, slow_network=slow_network)
+        except Exception: pass
     raise TimeoutException("UI de upload não apareceu (iframe/input).")
 
-# ================== utilidades de descrição/hashtags/etc ==================
-
 def _maybe_close_cookie_banner(driver: WebDriver) -> None:
-    try:
-        _remove_cookies_window(driver)
-    except Exception:
-        pass
+    try: _remove_cookies_window(driver)
+    except Exception: pass
 
 def _wait_post_enabled(driver: WebDriver, timeout: int = 30) -> None:
-    try:
-        WebDriverWait(driver, timeout).until(
-            lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and el.get_attribute("data-disabled") == "false"
-        )
-    except Exception:
-        pass
+    try: WebDriverWait(driver, timeout).until(lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and el.get_attribute("data-disabled") == "false")
+    except Exception: pass
 
 def _has_blocking_overlay(driver: WebDriver) -> bool:
     try:
-        dialogs = driver.find_elements(By.XPATH, '//*[@role="dialog" and not(@aria-hidden="true")]')
-        for d in dialogs:
-            if d.is_displayed():
-                return True
-    except Exception:
-        pass
+        if any(d.is_displayed() for d in driver.find_elements(By.XPATH, '//*[@role="dialog" and not(@aria-hidden="true")]')): return True
+    except Exception: pass
     try:
-        modals = driver.find_elements(By.XPATH, '//*[contains(@class,"TUXModal") or contains(@class,"TUXAlert")]')
-        for m in modals:
-            if m.is_displayed():
-                return True
-    except Exception:
-        pass
+        if any(m.is_displayed() for m in driver.find_elements(By.XPATH, '//*[contains(@class,"TUXModal") or contains(@class,"TUXAlert")]')): return True
+    except Exception: pass
     return False
 
 def _wait_blocking_overlays_gone(driver: WebDriver, timeout: int = 6) -> None:
@@ -1258,48 +849,31 @@ def _wait_blocking_overlays_gone(driver: WebDriver, timeout: int = 6) -> None:
     while time.time() < deadline:
         if not _has_blocking_overlay(driver):
             time.sleep(0.5)
-            if not _has_blocking_overlay(driver):
-                return
+            if not _has_blocking_overlay(driver): return
         time.sleep(0.5)
 
 def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
     deadline = time.time() + max(1, wait_secs)
-
     def _try_find_and_click() -> bool:
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-
+        try: driver.switch_to.default_content()
+        except Exception: pass
         texts = ("Publicar agora", "Publish now", "انشر الآن", "Опубликовать сейчас")
         for t in texts:
-            try:
-                btn = driver.find_element(
-                    By.XPATH,
-                    f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]"
-                )
-            except Exception:
-                btn = None
+            try: btn = driver.find_element(By.XPATH, f"//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]//button[contains(@class,'TUXButton--primary') and .//div[normalize-space()='{t}']]")
+            except Exception: btn = None
             if btn:
                 try:
                     driver.execute_script("arguments[0].click();", btn)
                     time.sleep(0.8)
                     return True
-                except Exception:
-                    pass
-
+                except Exception: pass
         try:
-            any_primary = driver.find_element(
-                By.XPATH,
-                "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]//button[contains(@class,'TUXButton--primary')]"
-            )
+            any_primary = driver.find_element(By.XPATH, "//div[contains(@class,'TUXModal') and not(@aria-hidden='true')]//button[contains(@class,'TUXButton--primary')]")
             driver.execute_script("arguments[0].click();", any_primary)
             time.sleep(0.8)
             return True
-        except Exception:
-            pass
+        except Exception: pass
         return False
-
     while time.time() < deadline:
         if _try_find_and_click():
             logger.info("✅ Modal de verificação tratado — clicado 'Publicar agora'.")
@@ -1308,33 +882,23 @@ def _click_publish_now_if_modal(driver: WebDriver, wait_secs: int = 30) -> bool:
     return False
 
 def _set_description(driver: WebDriver, description: str) -> None:
-    if description is None:
-        return
-
+    if description is None: return
     description = (description or "").encode("utf-8", "ignore").decode("utf-8")
     saved_description = description
-
-    WebDriverWait(driver, IMPLICIT_WAIT).until(
-        EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["description"]))
-    )
-
+    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["description"])))
     desc = driver.find_element(By.XPATH, config["selectors"]["upload"]["description"])
-
     desc.click()
     time.sleep(0.2)
     desc.send_keys(Keys.END)
     _clear(desc)
     time.sleep(0.2)
-
     try:
         words = description.split(" ")
         for word in words:
             if word and word[0] == "#":
                 desc.send_keys(word)
                 desc.send_keys(" " + Keys.BACKSPACE)
-                WebDriverWait(driver, IMPLICIT_WAIT).until(
-                    EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["mention_box"]))
-                )
+                WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["mention_box"])))
                 time.sleep(ADD_HASHTAG_WAIT)
                 desc.send_keys(Keys.ENTER)
             elif word and word[0] == "@":
@@ -1342,34 +906,22 @@ def _set_description(driver: WebDriver, description: str) -> None:
                 desc.send_keys(word + " ")
                 time.sleep(1)
                 desc.send_keys(Keys.BACKSPACE)
-
-                WebDriverWait(driver, EXPLICIT_WAIT).until(
-                    EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["mention_box_user_id"]))
-                )
-
+                WebDriverWait(driver, EXPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["mention_box_user_id"])))
                 found = False
-                waiting_interval = 0.5
-                timeout = 5
                 start_time = time.time()
-
-                while not found and (time.time() - start_time < timeout):
+                while not found and (time.time() - start_time < 5):
                     user_id_elements = driver.find_elements(By.XPATH, config["selectors"]["upload"]["mention_box_user_id"])
                     time.sleep(1)
-
-                    for i in range(len(user_id_elements)):
-                        user_id_element = user_id_elements[i]
+                    for i, user_id_element in enumerate(user_id_elements):
                         if user_id_element and user_id_element.is_enabled():
                             username = (user_id_element.text or "").split(" ")[0]
                             if username.lower() == word[1:].lower():
                                 found = True
                                 logger.info("Usuário correspondente encontrado: Clicando no %s", username)
-                                for _ in range(i):
-                                    desc.send_keys(Keys.DOWN)
+                                for _ in range(i): desc.send_keys(Keys.DOWN)
                                 desc.send_keys(Keys.ENTER)
                                 break
-
-                        if not found:
-                            time.sleep(waiting_interval)
+                    if not found: time.sleep(0.5)
             else:
                 desc.send_keys((word or "") + " ")
     except Exception as exception:
@@ -1378,29 +930,19 @@ def _set_description(driver: WebDriver, description: str) -> None:
         desc.send_keys(saved_description)
 
 def _clear(element) -> None:
-    try:
-        element.send_keys(2 * len(element.text) * Keys.BACKSPACE)
-    except Exception:
-        pass
+    try: element.send_keys(2 * len(element.text) * Keys.BACKSPACE)
+    except Exception: pass
 
 def _wait_upload_started(driver: WebDriver, start_timeout: int) -> bool:
     deadline = time.time() + max(5, start_timeout)
     while time.time() < deadline:
         try:
-            el = driver.find_elements(By.XPATH, config["selectors"]["upload"]["process_confirmation"])
-            if el:
-                return True
-        except Exception:
-            pass
-
+            if driver.find_elements(By.XPATH, config["selectors"]["upload"]["process_confirmation"]): return True
+        except Exception: pass
         try:
             upload_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["upload_video"])
-            got_files = driver.execute_script("return arguments[0].files && arguments[0].files.length > 0;", upload_box)
-            if got_files:
-                return True
-        except Exception:
-            pass
-
+            if driver.execute_script("return arguments[0].files && arguments[0].files.length > 0;", upload_box): return True
+        except Exception: pass
         time.sleep(0.5)
     return False
 
@@ -1410,26 +952,19 @@ def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs
         logger.info("Fazendo upload do arquivo de vídeo (tentativa %d/%d)", attempt, num_retries)
         try:
             _change_to_upload_iframe(driver)
-
-            WebDriverWait(driver, EXPLICIT_WAIT).until(
-                EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["upload_video"]))
-            )
+            WebDriverWait(driver, EXPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["upload_video"])))
             upload_box = driver.find_element(By.XPATH, config["selectors"]["upload"]["upload_video"])
             upload_box.send_keys(path)
             send_ts = time.time()
-
             if _wait_upload_started(driver, start_timeout=UPLOADING_WAIT):
                 logger.info("✅ Upload iniciou/preview detectado.")
                 return send_ts
-
             last_exc = TimeoutException(f"Timeout esperando início do upload após {UPLOADING_WAIT}s")
             logger.warning(str(last_exc))
-
             try: driver.switch_to.default_content()
             except Exception: pass
             try: _ensure_upload_ui(driver)
             except Exception: pass
-
         except Exception as exception:
             last_exc = exception
             logger.warning("Falha ao anexar vídeo (tentativa %d/%d): %s", attempt, num_retries, exception)
@@ -1437,35 +972,25 @@ def _set_video(driver: WebDriver, path: str = "", num_retries: int = 3, **kwargs
             except Exception: pass
             try: _ensure_upload_ui(driver)
             except Exception: pass
-
         time.sleep(min(10, NAV_RETRY_BACKOFF * attempt))
-
     raise FailedToUpload(last_exc or Exception("Falha ao anexar vídeo."))
 
 def _change_to_upload_iframe(driver: WebDriver) -> None:
     try:
         driver.switch_to.default_content()
-        iframe_selector = EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"]))
-        iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(iframe_selector)
+        iframe = WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["upload"]["iframe"])))
         driver.switch_to.frame(iframe)
     except TimeoutException:
         driver.switch_to.default_content()
 
 def _remove_cookies_window(driver) -> None:
     try:
-        cookies_banner = WebDriverWait(driver, IMPLICIT_WAIT).until(
-            EC.presence_of_element_located((By.TAG_NAME, config["selectors"]["upload"]["cookies_banner"]["banner"]))
-        )
-        item = WebDriverWait(driver, IMPLICIT_WAIT).until(
-            EC.visibility_of(cookies_banner.shadow_root.find_element(By.CSS_SELECTOR, config["selectors"]["upload"]["cookies_banner"]["button"]))
-        )
-        decline_button = WebDriverWait(driver, IMPLICIT_WAIT).until(
-            EC.element_to_be_clickable(item.find_elements(By.TAG_NAME, "button")[0])
-        )
+        cookies_banner = WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.TAG_NAME, config["selectors"]["upload"]["cookies_banner"]["banner"])))
+        item = WebDriverWait(driver, IMPLICIT_WAIT).until(EC.visibility_of(cookies_banner.shadow_root.find_element(By.CSS_SELECTOR, config["selectors"]["upload"]["cookies_banner"]["button"])))
+        decline_button = WebDriverWait(driver, IMPLICIT_WAIT).until(EC.element_to_be_clickable(item.find_elements(By.TAG_NAME, "button")[0]))
         decline_button.click()
         logger.info("Banner de cookies fechado")
-    except Exception:
-        pass
+    except Exception: pass
 
 def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = True, duet: bool = True, *args, **kwargs) -> None:
     try:
@@ -1483,18 +1008,11 @@ def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = T
 
 def _set_schedule_video(driver: WebDriver, schedule: datetime.datetime) -> None:
     logger.info("Definindo agendamento")
-
     driver_timezone = __get_driver_timezone(driver)
     schedule = schedule.astimezone(driver_timezone)
-
-    month = schedule.month
-    day = schedule.day
-    hour = schedule.hour
-    minute = schedule.minute
-
+    month, day, hour, minute = schedule.month, schedule.day, schedule.hour, schedule.minute
     try:
-        switch = driver.find_element(By.XPATH, config["selectors"]["schedule"]["switch"])
-        switch.click()
+        driver.find_element(By.XPATH, config["selectors"]["schedule"]["switch"]).click()
         __date_picker(driver, month, day)
         __time_picker(driver, hour, minute)
     except Exception as e:
@@ -1503,98 +1021,61 @@ def _set_schedule_video(driver: WebDriver, schedule: datetime.datetime) -> None:
 
 def __date_picker(driver: WebDriver, month: int, day: int) -> None:
     logger.info("Selecionando data")
-    condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["date_picker"]))
-    date_picker = WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
-    date_picker.click()
-
-    condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["calendar"]))
-    WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
-
+    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["date_picker"]))).click()
+    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["calendar"])))
     calendar_month = driver.find_element(By.XPATH, config["selectors"]["schedule"]["calendar_month"]).text
     n_calendar_month = datetime.datetime.strptime(calendar_month, "%B").month
     if n_calendar_month != month:
-        if n_calendar_month < month:
-            arrow = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_arrows"])[-1]
-        else:
-            arrow = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_arrows"])[0]
-        arrow.click()
-    valid_days = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_valid_days"])
-
-    day_to_click = None
-    for day_option in valid_days:
-        txt = (day_option.text or "").strip()
-        if txt.isdigit() and int(txt) == day:
-            day_to_click = day_option
-            break
+        arrow_index = -1 if n_calendar_month < month else 0
+        driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_arrows"])[arrow_index].click()
+    day_to_click = next((d for d in driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_valid_days"]) if (d.text or "").strip().isdigit() and int(d.text.strip()) == day), None)
     if day_to_click:
         day_to_click.click()
     else:
         raise Exception("Dia não encontrado no calendário")
-
     __verify_date_picked_is_correct(driver, month, day)
 
 def __verify_date_picked_is_correct(driver: WebDriver, month: int, day: int) -> None:
-    date_selected = driver.find_element(By.XPATH, config["selectors"]["schedule"]["date_picker"]).text
-    parts = date_selected.split("-")
+    parts = driver.find_element(By.XPATH, config["selectors"]["schedule"]["date_picker"]).text.split("-")
     date_selected_month = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
     date_selected_day = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else -1
-
-    if date_selected_month == month and date_selected_day == day:
-        logger.info("Data selecionada corretamente")
-    else:
+    if not (date_selected_month == month and date_selected_day == day):
         msg = f"Algo deu errado com o seletor de data, esperado {month}-{day} mas recebido {date_selected_month}-{date_selected_day}"
         logger.error(msg)
         raise Exception(msg)
+    logger.info("Data selecionada corretamente")
 
 def __time_picker(driver: WebDriver, hour: int, minute: int) -> None:
     logger.info("Selecionando horário")
-
-    condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker"]))
-    time_picker = WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
+    time_picker = WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker"])))
     time_picker.click()
-
-    condition = EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker_container"]))
-    WebDriverWait(driver, IMPLICIT_WAIT).until(condition)
-
-    hour_options = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_hours"])
-    minute_options = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_minutes"])
-
-    hour_to_click = hour_options[hour]
-    minute_option_correct_index = int(minute / 5)
-    minute_to_click = minute_options[minute_option_correct_index]
-
+    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker_container"])))
+    hour_to_click = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_hours"])[hour]
+    minute_to_click = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_minutes"])[int(minute / 5)]
     time.sleep(1)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", hour_to_click)
     time.sleep(1)
     hour_to_click.click()
-
     driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", minute_to_click)
     time.sleep(2)
     minute_to_click.click()
-
     time_picker.click()
     time.sleep(0.5)
     __verify_time_picked_is_correct(driver, hour, minute)
 
 def __verify_time_picked_is_correct(driver: WebDriver, hour: int, minute: int) -> None:
-    time_selected = driver.find_element(By.XPATH, config["selectors"]["schedule"]["time_picker_text"]).text
-    parts = time_selected.split(":")
+    parts = driver.find_element(By.XPATH, config["selectors"]["schedule"]["time_picker_text"]).text.split(":")
     time_selected_hour = int(parts[0]) if parts and parts[0].isdigit() else -1
     time_selected_minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
-
-    if time_selected_hour == hour and time_selected_minute == minute:
-        logger.info("Horário selecionado corretamente")
-    else:
+    if not (time_selected_hour == hour and time_selected_minute == minute):
         msg = f"Algo deu errado com o seletor de horário, esperado {hour:02d}:{minute:02d} mas recebido {time_selected_hour:02d}:{time_selected_minute:02d}"
         logger.error(msg)
         raise Exception(msg)
+    logger.info("Horário selecionado corretamente")
 
 def _post_video(driver: WebDriver) -> None:
     try:
-        post = WebDriverWait(driver, UPLOADING_WAIT).until(
-            lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and
-                      el.get_attribute("data-disabled") == "false" and el
-        )
+        post = WebDriverWait(driver, UPLOADING_WAIT).until(lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and el.get_attribute("data-disabled") == "false")
         driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", post)
         post.click()
         time.sleep(1.0)
@@ -1605,75 +1086,54 @@ def _post_video(driver: WebDriver) -> None:
     except WebDriverException as e:
         logger.error("Erro ao clicar no botão de postagem: %s", str(e))
         raise
-
     try:
         if _click_publish_now_if_modal(driver, wait_secs=30):
             logger.info("✅ Modal de verificação tratado — clicado 'Publicar agora'.")
-    except Exception:
-        pass
-
+    except Exception: pass
     time.sleep(4)
 
 def _check_valid_path(path: str) -> bool:
     return exists(path) and path.split(".")[-1].lower() in config["supported_file_types"]
 
 def _get_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
-    if _is_valid_schedule_minute(schedule.minute, valid_multiple):
-        return schedule
+    if _is_valid_schedule_minute(schedule.minute, valid_multiple): return schedule
     return _set_valid_schedule_minute(schedule, valid_multiple)
 
 def _is_valid_schedule_minute(minute: int, valid_multiple: int) -> bool:
     return minute % valid_multiple == 0
 
 def _set_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
-    minute = schedule.minute
-    remainder = minute % valid_multiple
-    add = (valid_multiple - remainder) % valid_multiple
-    if add == 0:
-        return schedule
-    return schedule + datetime.timedelta(minutes=add)
+    remainder = schedule.minute % valid_multiple
+    if remainder == 0: return schedule
+    return schedule + datetime.timedelta(minutes=(valid_multiple - remainder))
 
 def _check_valid_schedule(schedule: datetime.datetime) -> bool:
-    valid_tiktok_minute_multiple = 5
-    margin_to_complete_upload_form = 5
-    datetime_utc_now = pytz.UTC.localize(datetime.datetime.utcnow())
-    min_datetime_tiktok_valid = datetime_utc_now + datetime.timedelta(minutes=15 + margin_to_complete_upload_form)
-    max_datetime_tiktok_valid = datetime_utc_now + datetime.timedelta(days=10)
-    return min_datetime_tiktok_valid <= schedule <= max_datetime_tiktok_valid and _is_valid_schedule_minute(schedule.minute, valid_tiktok_minute_multiple)
+    now = pytz.UTC.localize(datetime.datetime.utcnow())
+    min_valid = now + datetime.timedelta(minutes=20)
+    max_valid = now + datetime.timedelta(days=10)
+    return min_valid <= schedule <= max_valid and _is_valid_schedule_minute(schedule.minute, 5)
 
 def _get_splice_index(nearest_mention: int, nearest_hashtag: int, description: str) -> int:
-    if nearest_mention == -1 and nearest_hashtag == -1:
-        return len(description)
-    elif nearest_hashtag == -1:
-        return nearest_mention
-    elif nearest_mention == -1:
-        return nearest_hashtag
+    if nearest_mention == -1 and nearest_hashtag == -1: return len(description)
+    if nearest_hashtag == -1: return nearest_mention
+    if nearest_mention == -1: return nearest_hashtag
     return min(nearest_mention, nearest_hashtag)
 
 def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> List[VideoDict]:
-    if not videos_list_of_dictionaries:
-        raise RuntimeError("Nenhum vídeo para upload")
-
+    if not videos_list_of_dictionaries: raise RuntimeError("Nenhum vídeo para upload")
     valid_path = config["valid_path_names"]
     valid_description = config["valid_descriptions"]
-    correct_path = valid_path[0]
-    correct_description = valid_description[0]
-
-    def intersection(lst1, lst2):
-        return list(set(lst1) & set(lst2))
-
+    correct_path, correct_description = valid_path[0], valid_description[0]
+    def intersection(lst1, lst2): return list(set(lst1) & set(lst2))
     return_list: List[VideoDict] = []
     for elem in videos_list_of_dictionaries:
         elem = {k.strip().lower(): v for k, v in elem.items()}
         keys = elem.keys()
         path_intersection = intersection(valid_path, keys)
         description_intersection = intersection(valid_description, keys)
-
         if path_intersection:
-            path_key = path_intersection.pop()
-            path = elem[path_key]
-            if not _check_valid_path(path):
-                raise RuntimeError("Caminho inválido: " + path)
+            path = elem[path_intersection.pop()]
+            if not _check_valid_path(path): raise RuntimeError("Caminho inválido: " + path)
             elem[correct_path] = path
         else:
             for _, value in elem.items():
@@ -1682,7 +1142,6 @@ def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> L
                     break
             else:
                 raise RuntimeError("Caminho não encontrado no dicionário: " + str(elem))
-
         if description_intersection:
             elem[correct_description] = elem[description_intersection.pop()]
         else:
@@ -1692,14 +1151,11 @@ def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> L
                     break
             else:
                 elem[correct_description] = ""
-
-        return_list.append(elem)  # type: ignore
-
+        return_list.append(elem)
     return return_list
 
 def __get_driver_timezone(driver: WebDriver) -> Any:
-    timezone_str = driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone")
-    return pytz.timezone(timezone_str)
+    return pytz.timezone(driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone"))
 
 def _refresh_with_alert(driver: WebDriver) -> None:
     try:
@@ -1709,35 +1165,24 @@ def _refresh_with_alert(driver: WebDriver) -> None:
     except Exception as e:
         logger.debug("Sem alert ao atualizar: %s", e)
 
-# =============================== CDP Helpers ================================
-
 def _force_timezone(driver: WebDriver, tz: str, locale: Optional[str] = None) -> None:
-    """Força timezone/locale do navegador via CDP (para agendamentos corretos)."""
     try:
         driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": tz})
         if locale:
-            try:
-                driver.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": locale})
-            except Exception:
-                pass
+            try: driver.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": locale})
+            except Exception: pass
         z = driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone")
         logger.info("🕒 Timezone ativo no navegador: %s", z)
     except Exception as e:
         logger.warning("Falha ao forçar timezone: %s", e)
 
-# -------------------------------- exceções ------------------------------------
 class DescriptionTooLong(Exception):
-    """Descrição excede o máximo suportado pelo uploader web do TikTok"""
     def __init__(self, message: Optional[str] = None):
         super().__init__(message or self.__doc__)
-
 class FailedToUpload(Exception):
-    """Um vídeo falhou ao fazer upload"""
     def __init__(self, message: Optional[str] = None):
         super().__init__(message or self.__doc__)
-
-# -------------------------- link de produto (opcional) ------------------------
 
 def _add_product_link(driver: WebDriver, product_id: str) -> None:
     logger.info(f"Tentando adicionar link de produto para ID: {product_id}")
-    # Mantido conforme o seu fluxo original; posso reescrever se necessário.
+    # (Lógica original mantida)

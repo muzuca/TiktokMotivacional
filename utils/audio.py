@@ -50,7 +50,7 @@ USER_AGENT = "TiktokMotivacional/1.0 (+https://local)"
 # - Para Egito: usa PROXY_HOST_EG/PORT_EG/USER_EG/PASS_EG
 # - Auto por idioma: se começar com 'ar' -> usar região 'EG' (pode desativar com PROXY_AUTO_BY_LANG=0)
 PROXY_AUTO_BY_LANG = os.getenv("PROXY_AUTO_BY_LANG", "1").strip().lower() not in ("0", "false", "no")
-DEFAULT_PROXY_REGION = (os.getenv("DEFAULT_PROXY_REGION", "") or "").upper() or None  # ex: 'US' ou 'EG'
+DEFAULT_PROXY_REGION = None
 
 def _proxy_url_from_env(prefix: str) -> Optional[str]:
     host = os.getenv(f"{prefix}_HOST", "").strip()
@@ -231,7 +231,7 @@ def buscar_audio_freesound(
         raise ValueError("FREESOUND_API_KEY não configurada no .env.")
 
     region = _pick_proxy_region(proxy_region, idioma)
-    session = _get_session(region)
+    session = _get_session(None)
 
     def tentar() -> str:
         logger.info("🔍 Freesound (%s): query='%s', sort='%s', filtros='%s'", region or "DEFAULT", query, sort, additional_filters)
@@ -286,7 +286,7 @@ def obter_caminho_audio(query="inspirational", diretorio=AUDIO_DIR,
 
         def tentar_remoto():
             return buscar_audio_freesound(query, diretorio, sort, additional_filters,
-                                          proxy_region=region, idioma=idioma, max_retries=1)
+                                          proxy_region=None, idioma=idioma, max_retries=1)
 
         for i in range(MAX_RETRIES_DEFAULT):
             caminho = _retry(tentar_remoto, tries=1, on_error_msg=f"Rodada remota {i+1}")
