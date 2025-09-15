@@ -1,4 +1,4 @@
-# utils/vpn_manager.py (VERSÃO FINAL COM VERIFICAÇÃO PRECISA)
+# utils/vpn_manager.py (VERSÃO FINAL SEM CLIQUE REDUNDANTE NO PLAY)
 import os
 import time
 import logging
@@ -32,7 +32,7 @@ def is_vpn_setup_complete(profile_name: str) -> bool:
 
 def connect_urban_vpn(driver: WebDriver) -> bool:
     """
-    Automatiza a conexão da Urban VPN com verificação de status aprimorada.
+    Automatiza a conexão da Urban VPN. Clicar no país já inicia a conexão.
     """
     try:
         ext_id = os.getenv("URBANVPN_EXTENSION_ID")
@@ -56,7 +56,7 @@ def connect_urban_vpn(driver: WebDriver) -> bool:
         logger.info("Aguardando a interface da extensão carregar...")
         time.sleep(5) 
 
-        # PASSO 1: Lidar com telas de consentimento
+        # PASSO 1: Lidar com telas de consentimento (se aparecerem)
         try:
             agree_button_wait = WebDriverWait(driver, 7)
             agree_button1 = agree_button_wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Agree']")))
@@ -87,20 +87,19 @@ def connect_urban_vpn(driver: WebDriver) -> bool:
         search_input.clear(); search_input.send_keys(country_name); time.sleep(2)
 
         # PASSO 4: Clicar no país que apareceu nos resultados da busca
-        logger.info(f"Procurando por '{country_name}' nos resultados da busca...")
+        logger.info(f"Procurando por '{country_name}' e clicando para conectar...")
         country_element = wait.until(EC.element_to_be_clickable(
             (By.XPATH, f"//div[contains(@class, 'selector-option')]//p[contains(., '{country_name}')]")
         ))
-        country_element.click(); logger.info(f"País '{country_name}' selecionado."); time.sleep(2)
-
-        # PASSO 5: Clicar no botão de conectar (Play)
-        logger.info("Procurando o botão de conectar (play)...")
-        play_button = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//button[contains(@class, 'play-button')]")
-        ))
-        play_button.click(); logger.info("Botão de conectar clicado."); time.sleep(3)
+        country_element.click(); 
+        logger.info(f"País '{country_name}' selecionado. A conexão deve iniciar automaticamente.")
+        time.sleep(3)
         
-        # PASSO 6: Lidar com o popup "Rate Us" (se aparecer)
+        # ######################################################################
+        # REMOVIDO: O clique no botão de play era redundante e desconectava a VPN.
+        # ######################################################################
+
+        # PASSO 5: Lidar com o popup "Rate Us" (se aparecer)
         try:
             rate_us_wait = WebDriverWait(driver, 5)
             rate_us_button = rate_us_wait.until(EC.presence_of_element_located((By.XPATH, "//button[contains(@class, 'rate-us-page__action')]")))
@@ -111,10 +110,7 @@ def connect_urban_vpn(driver: WebDriver) -> bool:
         except Exception:
             logger.info("Nenhum popup de avaliação encontrado.")
 
-        # ######################################################################
-        # MUDANÇA APLICADA - VERIFICAÇÃO DE CONEXÃO MAIS ROBUSTA
-        # ######################################################################
-        # PASSO 7: Espera o status "Connected" aparecer
+        # PASSO 6: Espera o status "Connected" aparecer
         logger.info("Aguardando confirmação da conexão (status 'Connected')...")
         WebDriverWait(driver, connect_timeout).until(
             EC.presence_of_element_located((
@@ -127,6 +123,7 @@ def connect_urban_vpn(driver: WebDriver) -> bool:
         return True
 
     except Exception as e:
+        # Log de erro simplificado, como solicitado
         logger.error(f"❌ Falha ao conectar a Urban VPN. Erro: {type(e).__name__} - {e}")
         raise VpnConnectionError("Não foi possível estabelecer conexão com a VPN.") from e
     
