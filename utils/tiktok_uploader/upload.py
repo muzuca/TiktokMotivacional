@@ -616,158 +616,165 @@ def _nav_with_retries(driver: WebDriver, *, lang_tag: Optional[str] = None, slow
         time.sleep(NAV_RETRY_BACKOFF)
     raise TimeoutException(f"Não consegui abrir a página de upload após tentativas. Último erro: {last_error}")
 
-def upload_video(filename: str, description: Optional[str] = None, cookies: str = "", schedule: Optional[datetime.datetime] = None, username: str = "", password: str = "", sessionid: Optional[str] = None, cookies_list: List[Cookie] = [], cookies_str: Optional[str] = None, proxy: Optional[ProxyDict] = None, product_id: Optional[str] = None, idioma: str = "auto", begin_words: Optional[int] = None, use_vpn: bool = False, *args, **kwargs) -> List[VideoDict]:
-    auth = AuthBackend(username=username, password=password, cookies=cookies, cookies_list=cookies_list, cookies_str=cookies_str, sessionid=sessionid)
-    video_dict: VideoDict = {"path": filename}
-    if description: video_dict["description"] = description
-    if schedule: video_dict["schedule"] = schedule
-    if product_id: video_dict["product_id"] = product_id
-    return upload_videos([video_dict], auth, proxy, idioma=idioma, begin_words=begin_words, use_vpn=use_vpn, *args, **kwargs)
+def upload_video(
+    filename: str,
+    description: Optional[str] = None,
+    cookies: str = "",
+    username: str = "",
+    password: str = "",
+    sessionid: Optional[str] = None,
+    cookies_list: List[Cookie] = [],
+    proxy: Optional[ProxyDict] = None,
+    idioma: str = "auto",
+    headless: bool = False,
+    browser: Literal["chrome", "edge", "firefox"] = "chrome",
+    browser_agent: Optional[WebDriver] = None,
+    use_vpn: bool = False,
+    num_retries: int = 1,
+    begin_words: Optional[int] = None,
+    *args,
+    **kwargs
+) -> bool:
+    """
+    Faz o upload de um único vídeo para o TikTok.
+    Unifica a lógica, gerencia o navegador e retorna True para sucesso ou False para falha.
+    """
+    if not _check_valid_path(filename):
+        logger.error("%s é um caminho de arquivo inválido. Abortando.", filename)
+        return False
 
-def upload_videos(videos: List[VideoDict], auth: AuthBackend, proxy: Optional[ProxyDict] = None, browser: Literal["chrome", "safari", "chromium", "edge", "firefox"] = "chrome", browser_agent: Optional[WebDriver] = None, on_complete: Optional[Callable[[VideoDict], None]] = None, headless: bool = False, num_retries: int = 1, skip_split_window: bool = False, idioma: str = "auto", begin_words: Optional[int] = None, use_vpn: bool = False, *args, **kwargs) -> List[VideoDict]:
-    videos = _convert_videos_dict(videos)
-    if videos and len(videos) > 1:
-        logger.info("Fazendo upload de %d vídeos", len(videos))
     sleep_jitter_before_post()
-    
+
+    # Determina as configurações de rede e idioma
     want_proxy = _use_proxy_from_idioma(idioma) if not use_vpn else False
     region = _region_from_idioma(idioma)
     lang_tag = _lang_tag_from_idioma(idioma)
-    logger.info("upload_videos: idioma=%s | want_proxy=%s | use_vpn=%s | region=%s | lang_tag=%s", idioma, want_proxy, use_vpn, region or "-", lang_tag)
-    
-    if browser_agent is not None:
-        if (want_proxy or use_vpn) and not _is_seleniumwire_driver(browser_agent):
-            logger.info("Agent sem Selenium-Wire. Recriando com proxy/VPN.")
-            try: browser_agent.quit()
-            except Exception: pass
-            browser_agent = None
-        elif not want_proxy and not use_vpn and _is_seleniumwire_driver(browser_agent):
-            logger.info("Agent Selenium-Wire detectado, mas não preciso de proxy/VPN. Recriando sem.")
-            try: browser_agent.quit()
-            except Exception: pass
-            browser_agent = None
+    logger.info("upload_video: idioma=%s | want_proxy=%s | use_vpn=%s | region=%s | lang_tag=%s", idioma, want_proxy, use_vpn, region or "-", lang_tag)
 
+    # **CORREÇÃO APLICADA AQUI**
+    # Recupera o nome do perfil da VPN do ambiente se a VPN estiver em uso
+    vpn_profile_name = os.getenv("URBANVPN_PROFILE_NAME") if use_vpn else None
+
+    # Gerenciamento do WebDriver
+    driver = None
     we_created_driver = False
     if not browser_agent:
         we_created_driver = True
-        logger.info("Criando uma instância de navegador %s %s", browser, "(headless)" if headless else "")
-        chrome_options = ChromeOptions()
-        if headless:
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--ignore-certificate-errors")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--use-gl=swiftshader")
-            chrome_options.add_argument("--enable-unsafe-swiftshader")
-            chrome_options.add_argument("--ignore-gpu-blocklist")
-        chrome_options.add_argument("--disable-logging")
-        chrome_options.add_argument("--log-level=3")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-popup-blocking")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--remote-debugging-pipe")
-        
-        vpn_profile_name = os.getenv("URBANVPN_PROFILE_NAME") if use_vpn else None
-        
-        driver = get_browser(browser, headless=headless, proxy=proxy, idioma=idioma, options=chrome_options, want_proxy=want_proxy, region=region, lang_tag=lang_tag, vpn_profile_name=vpn_profile_name, *args, **kwargs)
     else:
         logger.info("Usando agente de navegador definido pelo usuário")
         driver = browser_agent
+        # Lógica para recriar o driver se necessário (mantida)
+        is_wire = _is_seleniumwire_driver(driver)
+        needs_network_features = want_proxy or use_vpn
+        if needs_network_features and not is_wire:
+            logger.warning("Driver existente não suporta proxy/VPN. Recriando.")
+            try: driver.quit()
+            except Exception: pass
+            we_created_driver = True
+            driver = None
 
-    if use_vpn:
-        try:
+    try:
+        if not driver:
+            we_created_driver = True
+            logger.info("Criando uma instância de navegador %s %s", browser, "(headless)" if headless else "")
+            
+            # **CORREÇÃO APLICADA AQUI**
+            # Passa o `vpn_profile_name` para a função que cria o navegador
+            driver = get_browser(
+                browser,
+                headless=headless,
+                proxy=proxy,
+                idioma=idioma,
+                options=ChromeOptions(), # Garante que options seja passado
+                want_proxy=want_proxy,
+                region=region,
+                lang_tag=lang_tag,
+                vpn_profile_name=vpn_profile_name, # <-- LINHA ADICIONADA
+                *args,
+                **kwargs
+            )
+
+        # Autenticação e Configuração
+        if use_vpn:
             from ..vpn_manager import connect_urban_vpn
             logger.info("Iniciando procedimento de conexão da VPN...")
-            is_connected = connect_urban_vpn(driver)
-            if not is_connected:
+            if not connect_urban_vpn(driver):
                 raise VpnConnectionError("Não foi possível estabelecer conexão com a VPN.")
-        except ImportError:
-            logger.error("Não foi possível importar 'vpn_manager'. A VPN não será conectada.")
-            raise VpnConnectionError("Módulo vpn_manager não encontrado.")
-    
-    driver = auth.authenticate_agent(driver)
-    
-    try:
-        reg = (region or "").upper()
-        tz_info = REGION_TO_TIME.get(reg, None)
-        if tz_info:
-            env_tz_key = f"TZ_{reg}"
-            tz = os.getenv(env_tz_key, tz_info["tz"])
-            _force_timezone(driver, tz, locale=tz_info["locale"])
-    except Exception as e:
-        logger.warning("Falha ao configurar timezone/locale: %s", e)
-    
-    failed: List[VideoDict] = []
-    eff_begin_words = begin_words if (begin_words is not None and begin_words > 0) else DEFAULT_BEGIN_WORDS
-    
-    for video in videos:
-        try:
-            path = abspath(video.get("path", "."))
-            description = video.get("description", "")
-            schedule = video.get("schedule", None)
-            product_id = video.get("product_id", None)
-            logger.info("Postando %s%s", bold(video.get("path", "")), f"\n{' ' * 15}com descrição: {bold(description)}" if description else "")
-            if not _check_valid_path(path):
-                logger.warning("%s é inválido, pulando", path)
-                failed.append(video)
-                continue
-            if schedule:
-                if schedule.tzinfo is None: schedule = pytz.UTC.localize(schedule)
-                else:
-                    utc_offset = schedule.utcoffset()
-                    if not (utc_offset and int(utc_offset.total_seconds()) == 0):
-                        logger.warning("%s é inválido, o horário deve ser UTC (offset 0) ou naive (tratado como UTC). Pulando.", schedule)
-                        failed.append(video)
-                        continue
-                schedule = _get_valid_schedule_minute(schedule, 5)
-                if not _check_valid_schedule(schedule):
-                    logger.warning("%s é inválido (>=20min e <=10d; múltiplos de 5m). Pulando.", schedule)
-                    failed.append(video)
-                    continue
-            complete_upload_form(driver, path, description, schedule, skip_split_window, product_id, num_retries, headless=headless, idioma=idioma, lang_tag=lang_tag, begin_words=eff_begin_words, want_proxy=want_proxy)
-        except VpnConnectionError as e:
-            logger.error("Erro de VPN impediu o início do upload: %s", e)
-            failed.extend(videos)
-            break
-        except WebDriverException as e:
-            logger.error("Falha ao fazer upload de %s devido a erro no WebDriver", video.get("path", ""))
-            failed.append(video)
-        except Exception as e:
-            logger.error("Falha ao fazer upload de %s: %s", video.get("path", ""), str(e))
-            failed.append(video)
-        if callable(on_complete):
-            on_complete(video)
-    
-    if we_created_driver:
-        try: driver.quit()
-        except Exception: pass
-    return failed
 
-def complete_upload_form(driver: WebDriver, path: str, description: str, schedule: Optional[datetime.datetime], skip_split_window: bool, product_id: Optional[str] = None, num_retries: int = 1, headless: bool = False, *, idioma: Optional[str] = None, lang_tag: Optional[str] = None, begin_words: int = DEFAULT_BEGIN_WORDS, want_proxy: bool = False, **kwargs) -> None:
+        auth = AuthBackend(username=username, password=password, cookies=cookies, cookies_list=cookies_list, sessionid=sessionid)
+        driver = auth.authenticate_agent(driver)
+
+        try:
+            reg = (region or "").upper()
+            tz_info = REGION_TO_TIME.get(reg, None)
+            if tz_info:
+                _force_timezone(driver, os.getenv(f"TZ_{reg}", tz_info["tz"]), locale=tz_info["locale"])
+        except Exception as e:
+            logger.warning("Falha ao configurar timezone/locale: %s", e)
+
+        # Execução do Upload
+        success = complete_upload_form(
+            driver,
+            path=abspath(filename),
+            description=(description or ""),
+            num_retries=num_retries,
+            headless=headless,
+            idioma=idioma,
+            lang_tag=lang_tag,
+            begin_words=(begin_words or DEFAULT_BEGIN_WORDS),
+            want_proxy=want_proxy,
+            **kwargs
+        )
+        return success
+
+    except Exception as e:
+        logger.error("Ocorreu um erro fatal durante o processo de upload: %s", e)
+        return False
+    finally:
+        if we_created_driver and driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+def complete_upload_form(
+    driver: WebDriver,
+    path: str,
+    description: str,
+    num_retries: int = 1,
+    headless: bool = False,
+    *,
+    idioma: Optional[str] = None,
+    lang_tag: Optional[str] = None,
+    begin_words: int = DEFAULT_BEGIN_WORDS,
+    want_proxy: bool = False,
+    **kwargs
+) -> bool:
+    """
+    Preenche o formulário de upload e retorna True em caso de sucesso e False em caso de falha.
+    """
     slow = bool(want_proxy or _use_proxy_from_idioma(idioma))
     _nav_with_retries(driver, lang_tag=lang_tag, slow_network=slow)
     _maybe_close_cookie_banner(driver)
+
     for i in range(1, max(1, PROFILE_RETRIES) + 1):
         info = _log_current_profile(driver, timeout=HEADER_MAX_WAIT_SEC if slow else 12, want_proxy=slow)
-        if info: break
+        if info:
+            break
         if not _is_upload_url(driver.current_url):
             logger.info("Não está na rota de upload (atual=%s). Tentando voltar para /tiktokstudio/upload…", driver.current_url)
             _nav_with_retries(driver, lang_tag=lang_tag, slow_network=slow)
         else:
             logger.info("Perfil não exibido; reabrindo o menu e tentando novamente (%d/%d)…", i, PROFILE_RETRIES)
         time.sleep(2)
+
     _ensure_upload_ui(driver, slow_network=slow)
     send_ts = _set_video(driver, path=path, num_retries=max(1, num_retries))
     logger.info("Definindo descrição")
     _set_description(driver, description)
-    if schedule:
-        logger.info("Definindo agendamento")
-        _set_schedule_video(driver, schedule)
-    if product_id:
-        _add_product_link(driver, product_id)
+
     _wait_post_enabled(driver, timeout=UPLOADING_WAIT)
+
     if DYNAMIC_POST_GRACE:
         logger.info("⏳ Post: usando grace dinâmico (rede/overlays)…")
         _install_network_watch(driver)
@@ -781,23 +788,39 @@ def complete_upload_form(driver: WebDriver, path: str, description: str, schedul
         if remaining > 0:
             logger.info("⏳ Grace antes de postar: aguardando %ds (desde o envio)…", remaining)
             time.sleep(remaining)
+
     if POST_AFTER_ENABLED_EXTRA_SEC > 0:
         time.sleep(POST_AFTER_ENABLED_EXTRA_SEC)
+
     _wait_blocking_overlays_gone(driver, timeout=OVERLAYS_SETTLE_SEC)
     logger.info("Clicando no botão de postagem")
     _post_video(driver)
     time.sleep(4)
+
+    # **LÓGICA DE RETORNO CORRIGIDA**
+    ok = False  # Assume falha por padrão
     if VERIFY_POST_IN_PUBLICATIONS:
         try:
             ok = _confirm_post_in_publications(driver, description or "", timeout=PUBLICATIONS_WAIT_SEC, begin_words=max(1, begin_words))
-            if ok: logger.info("✅ Post confirmado na tela de Publicações.")
-            else: logger.warning("⚠️ Não foi possível confirmar o post na tela de Publicações dentro do tempo limite.")
+            if ok:
+                logger.info("✅ Post confirmado na tela de Publicações.")
+            else:
+                logger.warning("⚠️ Não foi possível confirmar o post na tela de Publicações dentro do tempo limite.")
         except Exception as e:
             logger.warning("Falha ao validar na tela de Publicações: %s", e)
+            ok = False  # Garante que a exceção resulte em falha
+    else:
+        logger.info("Verificação de publicação desativada. Assumindo sucesso após o clique.")
+        ok = True
+
+    # A limpeza de cookies não afeta o resultado do sucesso/falha
     try:
         time.sleep(6)
         driver.delete_all_cookies()
-    except Exception: pass
+    except Exception:
+        pass
+
+    return ok
 
 def _ensure_upload_ui(driver: WebDriver, *, slow_network: bool = False) -> None:
     selectors = config["selectors"]["upload"]
@@ -1006,118 +1029,54 @@ def _set_interactivity(driver: WebDriver, comment: bool = True, stitch: bool = T
     except Exception as e:
         logger.error("Falha ao definir interatividade: %s", str(e))
 
-def _set_schedule_video(driver: WebDriver, schedule: datetime.datetime) -> None:
-    logger.info("Definindo agendamento")
-    driver_timezone = __get_driver_timezone(driver)
-    schedule = schedule.astimezone(driver_timezone)
-    month, day, hour, minute = schedule.month, schedule.day, schedule.hour, schedule.minute
-    try:
-        driver.find_element(By.XPATH, config["selectors"]["schedule"]["switch"]).click()
-        __date_picker(driver, month, day)
-        __time_picker(driver, hour, minute)
-    except Exception as e:
-        logger.error("Falha ao definir agendamento: %s", str(e))
-        raise FailedToUpload()
-
-def __date_picker(driver: WebDriver, month: int, day: int) -> None:
-    logger.info("Selecionando data")
-    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["date_picker"]))).click()
-    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["calendar"])))
-    calendar_month = driver.find_element(By.XPATH, config["selectors"]["schedule"]["calendar_month"]).text
-    n_calendar_month = datetime.datetime.strptime(calendar_month, "%B").month
-    if n_calendar_month != month:
-        arrow_index = -1 if n_calendar_month < month else 0
-        driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_arrows"])[arrow_index].click()
-    day_to_click = next((d for d in driver.find_elements(By.XPATH, config["selectors"]["schedule"]["calendar_valid_days"]) if (d.text or "").strip().isdigit() and int(d.text.strip()) == day), None)
-    if day_to_click:
-        day_to_click.click()
-    else:
-        raise Exception("Dia não encontrado no calendário")
-    __verify_date_picked_is_correct(driver, month, day)
-
-def __verify_date_picked_is_correct(driver: WebDriver, month: int, day: int) -> None:
-    parts = driver.find_element(By.XPATH, config["selectors"]["schedule"]["date_picker"]).text.split("-")
-    date_selected_month = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
-    date_selected_day = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else -1
-    if not (date_selected_month == month and date_selected_day == day):
-        msg = f"Algo deu errado com o seletor de data, esperado {month}-{day} mas recebido {date_selected_month}-{date_selected_day}"
-        logger.error(msg)
-        raise Exception(msg)
-    logger.info("Data selecionada corretamente")
-
-def __time_picker(driver: WebDriver, hour: int, minute: int) -> None:
-    logger.info("Selecionando horário")
-    time_picker = WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker"])))
-    time_picker.click()
-    WebDriverWait(driver, IMPLICIT_WAIT).until(EC.presence_of_element_located((By.XPATH, config["selectors"]["schedule"]["time_picker_container"])))
-    hour_to_click = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_hours"])[hour]
-    minute_to_click = driver.find_elements(By.XPATH, config["selectors"]["schedule"]["timepicker_minutes"])[int(minute / 5)]
-    time.sleep(1)
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", hour_to_click)
-    time.sleep(1)
-    hour_to_click.click()
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", minute_to_click)
-    time.sleep(2)
-    minute_to_click.click()
-    time_picker.click()
-    time.sleep(0.5)
-    __verify_time_picked_is_correct(driver, hour, minute)
-
-def __verify_time_picked_is_correct(driver: WebDriver, hour: int, minute: int) -> None:
-    parts = driver.find_element(By.XPATH, config["selectors"]["schedule"]["time_picker_text"]).text.split(":")
-    time_selected_hour = int(parts[0]) if parts and parts[0].isdigit() else -1
-    time_selected_minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
-    if not (time_selected_hour == hour and time_selected_minute == minute):
-        msg = f"Algo deu errado com o seletor de horário, esperado {hour:02d}:{minute:02d} mas recebido {time_selected_hour:02d}:{time_selected_minute:02d}"
-        logger.error(msg)
-        raise Exception(msg)
-    logger.info("Horário selecionado corretamente")
-
 def _post_video(driver: WebDriver) -> None:
+    """
+    Localiza o botão de postagem, aguarda até que ele esteja habilitado e, em seguida,
+    clica nele usando um clique via JavaScript para maior robustez.
+    """
+    post_button_xpath = "//button[@data-e2e='post_video_button']"
+    
     try:
-        post = WebDriverWait(driver, UPLOADING_WAIT).until(lambda d: (el := d.find_element(By.XPATH, config["selectors"]["upload"]["post"])) and el.get_attribute("data-disabled") == "false")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", post)
-        post.click()
+        # CORREÇÃO: Define uma condição de espera que retorna o elemento do botão
+        # apenas quando ele está presente E habilitado (data-disabled="false").
+        def post_button_is_ready(d: WebDriver):
+            try:
+                # Tenta encontrar o botão
+                button = d.find_element(By.XPATH, post_button_xpath)
+                # Verifica se o botão está habilitado
+                if button.get_attribute("data-disabled") == "false":
+                    return button  # CONDIÇÃO SATISFEITA: Retorna o ELEMENTO
+                return False  # Botão encontrado, mas desabilitado. Continua esperando.
+            except NoSuchElementException:
+                return False  # Botão ainda não existe. Continua esperando.
+
+        # Aguarda a condição ser satisfeita e armazena o ELEMENTO retornado
+        logger.info("Aguardando o botão 'Publicar' ficar habilitado...")
+        post_button = WebDriverWait(driver, UPLOADING_WAIT).until(post_button_is_ready)
+        
+        # Agora a variável `post_button` contém o elemento do botão, e o clique funcionará.
+        logger.info("Botão 'Publicar' habilitado. Clicando...")
+        driver.execute_script("arguments[0].click();", post_button)
         time.sleep(1.0)
-    except ElementClickInterceptedException:
-        logger.info("Tentando clicar no botão novamente (fallback JS)")
-        driver.execute_script('document.querySelector(".TUXButton--primary").click()')
-        time.sleep(1.0)
+
+    except TimeoutException:
+        logger.error("Timeout: O botão de postagem não ficou habilitado no tempo esperado.")
+        raise FailedToUpload("Botão de postagem não habilitado")
     except WebDriverException as e:
         logger.error("Erro ao clicar no botão de postagem: %s", str(e))
         raise
+
+    # Lógica para tratar o modal de confirmação "Publicar agora" (mantida)
     try:
         if _click_publish_now_if_modal(driver, wait_secs=30):
             logger.info("✅ Modal de verificação tratado — clicado 'Publicar agora'.")
-    except Exception: pass
+    except Exception:
+        pass
+    
     time.sleep(4)
-
+    
 def _check_valid_path(path: str) -> bool:
     return exists(path) and path.split(".")[-1].lower() in config["supported_file_types"]
-
-def _get_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
-    if _is_valid_schedule_minute(schedule.minute, valid_multiple): return schedule
-    return _set_valid_schedule_minute(schedule, valid_multiple)
-
-def _is_valid_schedule_minute(minute: int, valid_multiple: int) -> bool:
-    return minute % valid_multiple == 0
-
-def _set_valid_schedule_minute(schedule: datetime.datetime, valid_multiple: int) -> datetime.datetime:
-    remainder = schedule.minute % valid_multiple
-    if remainder == 0: return schedule
-    return schedule + datetime.timedelta(minutes=(valid_multiple - remainder))
-
-def _check_valid_schedule(schedule: datetime.datetime) -> bool:
-    now = pytz.UTC.localize(datetime.datetime.utcnow())
-    min_valid = now + datetime.timedelta(minutes=20)
-    max_valid = now + datetime.timedelta(days=10)
-    return min_valid <= schedule <= max_valid and _is_valid_schedule_minute(schedule.minute, 5)
-
-def _get_splice_index(nearest_mention: int, nearest_hashtag: int, description: str) -> int:
-    if nearest_mention == -1 and nearest_hashtag == -1: return len(description)
-    if nearest_hashtag == -1: return nearest_mention
-    if nearest_mention == -1: return nearest_hashtag
-    return min(nearest_mention, nearest_hashtag)
 
 def _convert_videos_dict(videos_list_of_dictionaries: List[Dict[str, Any]]) -> List[VideoDict]:
     if not videos_list_of_dictionaries: raise RuntimeError("Nenhum vídeo para upload")
@@ -1176,13 +1135,6 @@ def _force_timezone(driver: WebDriver, tz: str, locale: Optional[str] = None) ->
     except Exception as e:
         logger.warning("Falha ao forçar timezone: %s", e)
 
-class DescriptionTooLong(Exception):
-    def __init__(self, message: Optional[str] = None):
-        super().__init__(message or self.__doc__)
 class FailedToUpload(Exception):
     def __init__(self, message: Optional[str] = None):
         super().__init__(message or self.__doc__)
-
-def _add_product_link(driver: WebDriver, product_id: str) -> None:
-    logger.info(f"Tentando adicionar link de produto para ID: {product_id}")
-    # (Lógica original mantida)

@@ -11,7 +11,8 @@ from socket import error as SocketError
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 
 # Uploader local
-from .tiktok_uploader.upload import upload_video
+# Importamos a exceção FailedToUpload para um tratamento mais específico
+from .tiktok_uploader.upload import upload_video, FailedToUpload
 
 # Países / cookies / diretórios centralizados
 from .countries import (
@@ -137,10 +138,10 @@ def obter_ultimo_video(pasta=PASTA_VIDEOS) -> Optional[str]:
         if not arquivos:
             raise FileNotFoundError(f"⚠️ Nenhum vídeo novo encontrado em {pasta}.")
         ultimo_video = max(arquivos, key=os.path.getmtime)
-        logger.info("📼 Último vídeo encontrado: %s", ultimo_video)
+        logger.info("📹 Último vídeo encontrado: %s", ultimo_video)
         return ultimo_video
     except Exception as e:
-        logger.error("⚠️ Erro ao buscar último vídeo: %s", str(e))
+        logger.error("❌ Erro ao buscar último vídeo: %s", str(e))
         return None
 
 def postar_no_tiktok_e_renomear(
@@ -161,7 +162,7 @@ def postar_no_tiktok_e_renomear(
         return False
     try:
         if os.path.getsize(video_path) <= 0:
-            logger.error("⚠️ Vídeo está com 0 bytes: %s", video_path)
+            logger.error("❌ Vídeo está com 0 bytes: %s", video_path)
             return False
     except Exception:
         pass
@@ -169,7 +170,7 @@ def postar_no_tiktok_e_renomear(
     COOKIES_PATH = cookies_path_for(lang)
     logger.info("🍪 Cookies utilizados: %s", COOKIES_PATH)
     if not os.path.exists(COOKIES_PATH):
-        logger.error("⚠️ Arquivo de cookies não encontrado: %s", COOKIES_PATH)
+        logger.error("❌ Arquivo de cookies não encontrado: %s", COOKIES_PATH)
         return False
 
     if descricao_personalizada:
@@ -187,76 +188,65 @@ def postar_no_tiktok_e_renomear(
         except Exception:
             pass
 
-    schedule = None
-    if agendar:
-        schedule = datetime.now() + timedelta(minutes=20)
-        logger.info("⏰ Agendando post para: %s", schedule.strftime("%H:%M:%S"))
-
-    # ===== LÓGICA CORRIGIDA E CENTRALIZADA =====
     if use_vpn:
         tt_headless = False
-        logger.info("🌐 VPN ativada, forçando modo não-headless.")
+        logger.info("🌍 VPN ativada, forçando modo não-headless.")
     else:
         tt_headless = os.getenv('HEADLESS_UPLOAD', '0').strip() != '0'
-    logger.info("🌐 TikTok headless: %s", "ON" if tt_headless else "OFF")
-    # ============================================
+    logger.info("🤖 TikTok headless: %s", "ON" if tt_headless else "OFF")
 
     logger.info("🚀 Postando vídeo no TikTok: %s", video_path)
     logger.info("📝 Descrição final: %s", description)
     time.sleep(1.0)
 
-    upload_ok = False
-    last_upload_error = None
-
-    for tentativa in range(1, max_upload_attempts + 1):
+    # ===== LÓGICA DE UPLOAD E RETENTATIVA APRIMORADA =====
+    success = False
+    for attempt in range(1, max_upload_attempts + 1):
+        logger.info(">>> Iniciando tentativa de upload %d/%d...", attempt, max_upload_attempts)
         try:
-            upload_video(
+            # A função upload_video agora deve retornar True em sucesso
+            # ou lançar uma exceção em caso de erro.
+            uploaded = upload_video(
                 filename=video_path,
                 description=description,
                 cookies=COOKIES_PATH,
-                comment=True,
-                stitch=True,
-                duet=True,
-                headless=tt_headless, # Passa a decisão correta
-                schedule=schedule,
-                idioma=lang,
+                schedule=False,
+                headless=tt_headless,
+                lang=lang,
                 use_vpn=use_vpn,
             )
-            upload_ok = True
-            logger.info(f"✅ Upload/postagem bem-sucedida na tentativa {tentativa}.")
-            break
-        except (NoSuchElementException, TimeoutException) as e:
-            logger.warning(f"⚠️ Erro Selenium durante upload (tentativa {tentativa}): {e}")
-            last_upload_error = e
-        except SocketError as e:
-            logger.warning(f"⚠️ Erro de socket durante upload (tentativa {tentativa}): {e}")
-            last_upload_error = e
-        except WebDriverException as e:
-            logger.error(f"⚠️ Erro WebDriver durante upload (tentativa {tentativa}): {e}")
-            last_upload_error = e
+
+            if uploaded:
+                logger.info("✅ SUCESSO! O TikTok confirmou o upload na tentativa %d.", attempt)
+                success = True
+                break  # Sai do loop de tentativas pois o upload foi bem-sucedido
+            else:
+                # Este caso pode ocorrer se a função for modificada para retornar False
+                # em vez de lançar uma exceção para falhas "leves".
+                logger.warning("⚠️ A função de upload retornou uma falha não esperada na tentativa %d. Tentando novamente...", attempt)
+
+        except FailedToUpload as e:
+            logger.error("❌ Falha controlada no upload (tentativa %d/%d): %s", attempt, max_upload_attempts, e)
+        except (WebDriverException, SocketError) as e:
+            logger.error("❌ Erro de WebDriver/Rede na tentativa %d/%d: %s", attempt, max_upload_attempts, e)
         except Exception as e:
-            if "VpnConnectionError" in str(type(e)):
-                 logger.error(f"🔥 Falha crítica de VPN na tentativa {tentativa}: {e}")
-                 last_upload_error = e
-                 break
-            logger.error(f"⚠️ Erro geral ao postar (tentativa {tentativa}): {e}")
-            last_upload_error = e
+            logger.critical("❌ Erro inesperado e grave na tentativa %d/%d: %s", attempt, max_upload_attempts, e, exc_info=True)
 
-        if tentativa < max_upload_attempts:
-            logger.info(f"↩️ Tentando novamente upload/post em 30s... (tentativa {tentativa+1}/{max_upload_attempts})")
-            time.sleep(30)
-        else:
-            logger.error(
-                f"🔥 Todas as tentativas ({max_upload_attempts}) de upload falharam para: {video_path}.\n"
-                f"Último erro: {last_upload_error}"
-            )
+        # Se não for a última tentativa, aguarda um pouco antes de tentar de novo
+        if attempt < max_upload_attempts:
+            wait_time = attempt * 5  # Espera um pouco mais a cada tentativa
+            logger.info("...aguardando %d segundos antes da próxima tentativa.", wait_time)
+            time.sleep(wait_time)
 
-    if upload_ok:
-        if imagem_base and os.path.exists(imagem_base): _safe_remove(imagem_base)
-        if imagem_final and os.path.exists(imagem_final): _safe_remove(imagem_final)
-        if video_final and os.path.exists(video_final): _safe_remove(video_final)
-        _cleanup_mid_artifacts()
+    # ===== VERIFICAÇÃO FINAL E LIMPEZA =====
+    if success:
+        logger.info("🎉 Processo finalizado com sucesso. Limpando arquivos de vídeo.")
         _cleanup_prompts_and_video(video_path)
-        return True
     else:
-        return False
+        logger.error("❌❌❌ O UPLOAD FALHOU APÓS %d TENTATIVAS. O vídeo NÃO será removido.", max_upload_attempts)
+        # Opcional: mover o vídeo para uma pasta de "falhas" em vez de deixá-lo
+        # failed_dir = "videos/failed"
+        # os.makedirs(failed_dir, exist_ok=True)
+        # shutil.move(video_path, os.path.join(failed_dir, os.path.basename(video_path)))
+
+    return success
