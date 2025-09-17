@@ -613,21 +613,35 @@ def _perguntar_headless_tiktok(default_on: bool) -> Optional[bool]:
         return False
     return default_on
 
-def _ensure_tiktok_headless_prompt() -> bool:
-    """Pergunta uma vez por execução e grava em TIKTOK_HEADLESS."""
+# EM veo3.py
+def _ensure_tiktok_headless_prompt(use_vpn: bool) -> bool:
+    """
+    Garante que o modo headless do TikTok esteja definido, perguntando ao usuário
+    APENAS se a VPN não estiver em uso.
+    """
     global _TT_HEADLESS_CONFIRMED
     if _TT_HEADLESS_CONFIRMED:
         return True
+
+    # Se a VPN está ativa, FORÇA o modo não-headless e não pergunta.
+    if use_vpn:
+        os.environ["TIKTOK_HEADLESS"] = "0"
+        logger.info("ℹ️ VPN para TikTok ativada. O modo Headless foi desativado automaticamente.")
+        _TT_HEADLESS_CONFIRMED = True
+        return True
+
+    # Se não houver VPN, executa a lógica de pergunta original.
     default_tt = os.getenv("TIKTOK_HEADLESS", "1").strip() != "0"
     ans = _perguntar_headless_tiktok(default_tt)
+    
     if ans is None:
         print("Cancelado antes da postagem.")
         return False
+        
     os.environ["TIKTOK_HEADLESS"] = "1" if ans else "0"
     logger.info("→ TikTok headless: %s", "ON" if ans else "OFF")
     _TT_HEADLESS_CONFIRMED = True
     return True
-
 # ------------------------ TikTok posting ------------------------
 _AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
 def _sanitize_arabic_hashtag(text: str) -> str:
@@ -661,9 +675,10 @@ def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
             pass
     return out[:k]
 
-def _postar_video(final_video: str, idioma: str, *, cleanup_slug: bool = True) -> bool:
-    # pergunta headless do TikTok (uma única vez por execução)
-    if not _ensure_tiktok_headless_prompt():
+# EM veo3.py
+def _postar_video(final_video: str, idioma: str, use_vpn: bool, *, cleanup_slug: bool = True) -> bool:
+    # A única mudança é que agora ela recebe 'use_vpn' e passa para a função abaixo
+    if not _ensure_tiktok_headless_prompt(use_vpn=use_vpn):
         return False
 
     try:
@@ -685,7 +700,8 @@ def _postar_video(final_video: str, idioma: str, *, cleanup_slug: bool = True) -
             imagem_base=capa_tmp if os.path.isfile(capa_tmp) else "",
             imagem_final=capa_tmp if os.path.isfile(capa_tmp) else "",
             video_final=final_video,
-            idioma=idioma
+            idioma=idioma,
+            use_vpn=use_vpn
         )
     except Exception as e:
         logger.exception("❌ Falha ao postar no TikTok: %s", e)
@@ -693,7 +709,6 @@ def _postar_video(final_video: str, idioma: str, *, cleanup_slug: bool = True) -
     if ok:
         print("✅ Postado com sucesso.")
         if cleanup_slug:
-            # deduz o slug a partir do arquivo final
             base = os.path.basename(final_video)
             m = _VID_RE.match(base)
             if m:
@@ -950,123 +965,70 @@ def _regenerar_cenas_faltantes(slug: str, idioma: str, persona: str) -> List[str
     logger.info("♻️ Regenerando cenas faltantes (%d no total); manterei as OK.", len(prompts))
     return _veo3_generate_batch(prompts, out_paths, idioma=idioma, persona=persona)
 
-def executar_interativo(persona: str, idioma: str) -> None:
+# VERSÃO NOVA para veo3.py
+def executar_interativo(persona: str, idioma: str, use_vpn: bool) -> None:
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
-
-    # Pergunta de headless do Flow (apenas quando backend=flow)
     global VEO3_HEADLESS
     if USE_BACKEND == "flow":
         ans = _perguntar_headless_flow(VEO3_HEADLESS)
-        if ans is None:
-            return
+        if ans is None: return
         VEO3_HEADLESS = bool(ans)
         os.environ["VEO3_CHROME_HEADLESS"] = "1" if VEO3_HEADLESS else "0"
         logger.info("→ Flow headless: %s", "ON" if VEO3_HEADLESS else "OFF")
-
+    
     while True:
         tema = _selecionar_assunto(persona)
-        if tema is None:
-            return
-
+        if tema is None: return
         n_cenas = _selecionar_qtd_cenas()
-        if n_cenas is None:
-            continue
-
+        if n_cenas is None: continue
         variacao = _selecionar_variacao()
-        if variacao is None:
-            continue
-
+        if variacao is None: continue
         escolha = _submenu_acao()
-        if escolha is None:
-            continue
-
-        # Se for postar (2 ou 5), já confirma o headless do TikTok aqui
-        if escolha in {"2", "5"}:
-            if not _ensure_tiktok_headless_prompt():
-                print("Cancelado antes da postagem.")
-                return
-
+        if escolha is None: continue
         slug = re.sub(r"[^a-z0-9]+", "-", f"{persona}-{tema.lower()}").strip("-")
-
-        if escolha == "3":
-            _menu_reutilizar_videos(idioma)
-            return
-
+        if escolha == "3": _menu_reutilizar_videos(idioma, use_vpn); return # Passa use_vpn
         if escolha == "5":
             mp4s = _regenerar_cenas_faltantes(slug, idioma, persona)
-            if not mp4s:
-                return
+            if not mp4s: return
             trilha = _pick_bgm_path()
-            saida  = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
-            try:
-                final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
-            except Exception as e:
-                logger.warning("Falha ao juntar/BGM (%s). Usarei a primeira cena.", e)
-                final_video = mp4s[0]
+            saida = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
+            try: final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
+            except Exception as e: logger.warning("Falha ao juntar/BGM (%s). Usarei a primeira cena.", e); final_video = mp4s[0]
             if POST_ZOOM > 1.0001:
                 z_out = os.path.splitext(final_video)[0] + f"_z{POST_ZOOM:.2f}.mp4"
-                try:
-                    final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
-                except Exception as e:
-                    logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
-            _postar_video(final_video, idioma, cleanup_slug=True)
+                try: final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
+                except Exception as e: logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
+            _postar_video(final_video, idioma, use_vpn=use_vpn, cleanup_slug=True) # Passa use_vpn
             return
-
         try:
             viral_context = _ask_gemini_viral_analysis(tema, persona, idioma)
             prompts = _ask_gemini_scene_prompts(persona, idioma, tema, n_cenas, variacao, viral_context)
         except Exception as e:
-            logger.exception("Falha ao obter prompts do Gemini: %s", e)
-            print("❌ Não foi possível obter prompts do Gemini. Tente novamente.")
-            return
-
-        if not prompts:
-            print("❌ Nenhum prompt foi gerado pelo Gemini. Voltando ao menu.")
-            continue
-
+            logger.exception("Falha ao obter prompts do Gemini: %s", e); print("❌ Não foi possível obter prompts do Gemini. Tente novamente."); return
+        if not prompts: print("❌ Nenhum prompt foi gerado pelo Gemini. Voltando ao menu."); continue
         approved = _preview_and_confirm_prompts(slug, prompts)
-        if approved is None:
-            continue
-        if not approved:
-            print("❌ Prompts reprovados. Voltando ao menu.")
-            continue
-
+        if approved is None: continue
+        if not approved: print("❌ Prompts reprovados. Voltando ao menu."); continue
         out_paths = [os.path.join(VIDEOS_DIR, f"veo3_{slug}_c{i+1}.mp4") for i in range(len(prompts))]
         logger.info("🎬 Gerando %d cena(s)…", len(prompts))
         mp4s = _veo3_generate_batch(prompts, out_paths, idioma=idioma, persona=persona)
-        if not mp4s:
-            print("❌ A geração de vídeo falhou. Verifique os logs.")
-            return
-
+        if not mp4s: print("❌ A geração de vídeo falhou. Verifique os logs."); return
         if escolha == "1":
             print("\n✅ Cenas de teste geradas:")
-            for p in mp4s:
-                print(" -", p)
+            for p in mp4s: print(" -", p)
             print("\nUse 'Reutilizar' ou a opção 5 para juntar/postar/exportar.")
             return
-
         trilha = _pick_bgm_path()
-        saida  = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
-        try:
-            final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
-        except Exception as e:
-            logger.warning("Falha ao juntar/BGM (%s). Usarei a primeira cena.", e)
-            final_video = mp4s[0]
-
+        saida = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
+        try: final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
+        except Exception as e: logger.warning("Falha ao juntar/BGM (%s). Usarei a primeira cena.", e); final_video = mp4s[0]
         if POST_ZOOM > 1.0001:
             z_out = os.path.splitext(final_video)[0] + f"_z{POST_ZOOM:.2f}.mp4"
-            try:
-                final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
-            except Exception as e:
-                logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
-
-        if escolha == "4":
-            print(f"✅ Exportado (sem postar): {final_video}")
-            return
-
-        _postar_video(final_video, idioma, cleanup_slug=True)
+            try: final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
+            except Exception as e: logger.warning("Falha no pós-zoom (%.2f): %s", POST_ZOOM, e)
+        if escolha == "4": print(f"✅ Exportado (sem postar): {final_video}"); return
+        _postar_video(final_video, idioma, use_vpn=use_vpn, cleanup_slug=True) # Passa use_vpn
         return
-
 # ------------------------ Batch (Flow/API) ------------------------
 def _veo3_generate_single_api(prompt_text: str, out_path: str, idioma: str, persona: str) -> str:
     raise NotImplementedError("Backend API não implementado. Use VEO3_BACKEND=flow.")
@@ -1143,104 +1105,62 @@ def _veo3_generate_batch(prompts: List[str], out_paths: List[str], idioma: str, 
     return sorted(done_paths, key=lambda p: p)
 
 # ------------------------ Automático (com pré-config) ------------------------
-def postar_em_intervalo(persona: str, idioma: str, cada_horas: float) -> None:
+# VERSÃO NOVA para veo3.py
+def postar_em_intervalo(persona: str, idioma: str, cada_horas: float, use_vpn: bool) -> None:
     persona, idioma = (persona or "luisa").lower(), (idioma or "pt-br").lower()
-
-    # 1) Pergunta headless do TikTok uma vez antes do loop (upload)
-    if not _ensure_tiktok_headless_prompt():
-        print("Cancelado.")
-        return
-
-    # 2) Pergunta headless do Flow no modo automático
     global VEO3_HEADLESS
     if USE_BACKEND == "flow":
         ans = _perguntar_headless_flow(VEO3_HEADLESS)
-        if ans is None:
-            print("Cancelado.")
-            return
+        if ans is None: print("Cancelado."); return
         VEO3_HEADLESS = bool(ans)
         os.environ["VEO3_CHROME_HEADLESS"] = "1" if VEO3_HEADLESS else "0"
         logger.info("→ Flow headless: %s", "ON" if VEO3_HEADLESS else "OFF")
-
     print("\n=== Configuração do Veo3 Automático ===")
     tema_fix = _selecionar_assunto(persona)
-    if tema_fix is None:
-        print("Cancelado.")
-        return
+    if tema_fix is None: print("Cancelado."); return
     usar_tema_aleatorio = tema_fix.strip().lower() in {"random", "aleatorio", "aleatório"}
-
     n_cenas = _selecionar_qtd_cenas()
-    if n_cenas is None:
-        print("Cancelado.")
-        return
-
+    if n_cenas is None: print("Cancelado."); return
     variacao_sel = _selecionar_variacao()
-    if variacao_sel is None:
-        print("Cancelado.")
-        return
+    if variacao_sel is None: print("Cancelado."); return
     variacao_random = (variacao_sel == "random")
-
     base_temas = _sugerir_assuntos(persona)
     intervalo = float(cada_horas) * 3600.0
-
+    
     try:
         while True:
             inicio = datetime.now()
             tema = random.choice(base_temas) if usar_tema_aleatorio else tema_fix
             print(f"\n🟢 Veo3 automático — {inicio:%d/%m %H:%M} | persona={persona} | tema={tema}")
-
             success = False
             try:
                 viral_context = _ask_gemini_viral_analysis(tema, persona, idioma)
-                variacao = (random.choice(["keep_all", "change_bg", "change_wardrobe", "change_both"])
-                            if variacao_random else variacao_sel)
-                prompts = _ask_gemini_scene_prompts(
-                    persona, idioma, tema, n=n_cenas, variation_mode=variacao, viral_context=viral_context
-                )
-                if not prompts:
-                    raise RuntimeError(f"Geração de prompts retornou lista vazia para o tema '{tema}'.")
+                variacao = (random.choice(["keep_all", "change_bg", "change_wardrobe", "change_both"]) if variacao_random else variacao_sel)
+                prompts = _ask_gemini_scene_prompts(persona, idioma, tema, n=n_cenas, variation_mode=variacao, viral_context=viral_context)
+                if not prompts: raise RuntimeError(f"Geração de prompts retornou lista vazia para o tema '{tema}'.")
                 slug = re.sub(r"[^a-z0-9]+", "-", f"{persona}-{tema.lower()}").strip("-")
-                for i, ptxt in enumerate(prompts, 1):
-                    _save_text(os.path.join(PROMPTS_DIR, f"veo3_{slug}_c{i}.prompt.txt"), ptxt)
-
+                for i, ptxt in enumerate(prompts, 1): _save_text(os.path.join(PROMPTS_DIR, f"veo3_{slug}_c{i}.prompt.txt"), ptxt)
                 out_paths = [os.path.join(VIDEOS_DIR, f"veo3_{slug}_c{i+1}.mp4") for i in range(len(prompts))]
                 mp4s = _veo3_generate_batch(prompts, out_paths, idioma=idioma, persona=persona)
-                if not mp4s:
-                    raise RuntimeError("Geração de vídeo batch não retornou arquivos.")
-
+                if not mp4s: raise RuntimeError("Geração de vídeo batch não retornou arquivos.")
                 trilha = _pick_bgm_path()
                 saida = os.path.join(VIDEOS_DIR, f"veo3_{slug}_final.mp4")
-                try:
-                    final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
-                except Exception as e:
-                    logger.warning("Falha stitch/BGM (%s). Publicarei a primeira cena.", e)
-                    final_video = mp4s[0]
-
+                try: final_video = _stitch_and_bgm_ffmpeg(mp4s, saida, trilha, bgm_db=BG_MIX_DB)
+                except Exception as e: logger.warning("Falha stitch/BGM (%s). Publicarei a primeira cena.", e); final_video = mp4s[0]
                 if POST_ZOOM > 1.0001:
                     z_out = os.path.splitext(final_video)[0] + f"_z{POST_ZOOM:.2f}.mp4"
-                    try:
-                        final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
-                    except Exception as e:
-                        logger.warning("Falha no pós-zoom auto (%.2f): %s", POST_ZOOM, e)
-
-                success = _postar_video(final_video, idioma, cleanup_slug=True)
-
-            except Exception as e:
-                logger.exception("Falha no ciclo Veo3: %s", e)
-
+                    try: final_video = _post_zoom_ffmpeg(final_video, z_out, POST_ZOOM)
+                    except Exception as e: logger.warning("Falha no pós-zoom auto (%.2f): %s", POST_ZOOM, e)
+                success = _postar_video(final_video, idioma, use_vpn=use_vpn, cleanup_slug=True) # Passa use_vpn
+            except Exception as e: logger.exception("Falha no ciclo Veo3: %s", e)
             retry_min = _auto_retry_minutes()
             if not success and retry_min > 0:
                 proxima = datetime.now() + timedelta(minutes=retry_min)
-                logger.warning("⚠️ Falha na execução; nova tentativa em %d min (às %s).",
-                               retry_min, proxima.strftime('%H:%M'))
-            else:
-                proxima = inicio + timedelta(seconds=intervalo)
-
+                logger.warning("⚠️ Falha na execução; nova tentativa em %d min (às %s).", retry_min, proxima.strftime('%H:%M'))
+            else: proxima = inicio + timedelta(seconds=intervalo)
             while True:
                 rem = (proxima - datetime.now()).total_seconds()
-                if rem <= 0:
-                    break
+                if rem <= 0: break
                 print(f"Próxima execução em {rem/3600.0:.2f} horas...", end="\r")
                 time.sleep(min(30.0, rem))
-    except KeyboardInterrupt:
-        print("\n🛑 Veo3 automático interrompido.")
+    except KeyboardInterrupt: print("\n🛑 Veo3 automático interrompido.")

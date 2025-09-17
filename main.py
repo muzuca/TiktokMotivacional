@@ -1,4 +1,4 @@
-# main.py (VERSÃO FINAL COM LÓGICA DE SETUP RESTAURADA)
+# main.py
 import os
 import sys
 import time
@@ -53,9 +53,11 @@ try:
     _HAVE_VEO3 = True
 except Exception: _HAVE_VEO3 = False
 try:
-    from utils.vpn_manager import setup_urban_vpn, is_vpn_setup_complete
+    # Atualizado para importar a nova função de setup orquestrada
+    from utils.vpn_manager import setup_vpn, is_vpn_setup_complete
     _HAVE_VPN = True
-except ImportError: _HAVE_VPN = False
+except ImportError:
+    _HAVE_VPN = False
 
 # ====== Constantes/UI ======
 STYLE_OPTIONS = {
@@ -285,37 +287,50 @@ def _menu_principal():
         idioma = _selecionar_idioma()
         if idioma is None: continue
 
+        # ##############################################################
+        # LÓGICA DE DECISÃO DA VPN E HEADLESS - CORRIGIDA E COMPLETA
+        # ##############################################################
         idioma_selecionado = idioma.lower().strip()
-        vpn_langs = [lang.strip().lower() for lang in os.getenv('URBANVPN_LANGS', '').split(',') if lang.strip()]
-        vpn_enabled_flag = os.getenv('URBANVPN_ENABLE') == '1'
+        provider = os.getenv("VPN_PROVIDER", "none").lower()
         
+        # Define a lista de idiomas que ativam a VPN com base no provedor escolhido
+        vpn_langs_str = ""
+        if provider == 'urban':
+            vpn_langs_str = os.getenv('URBANVPN_LANGS', '')
+        elif provider == 'zoog':
+            # **LÓGICA PARA ZOOGVPN ADICIONADA AQUI**
+            vpn_langs_str = os.getenv('ZOOGVPN_LANGS', '')
+        
+        vpn_langs = [lang.strip().lower() for lang in vpn_langs_str.split(',') if lang.strip()]
+        
+        # A variável 'use_vpn' agora controla todo o fluxo
         use_vpn = (
             _HAVE_VPN and
-            vpn_enabled_flag and
+            provider in ('urban', 'zoog') and
             idioma_selecionado in vpn_langs
         )
         
+        # Define o modo headless para o TikTok COM BASE em 'use_vpn'
         if use_vpn:
             os.environ['HEADLESS_UPLOAD'] = '0'
-            logger.info("ℹ️ O modo Headless foi desativado automaticamente para permitir a conexão da VPN.")
+            logger.info(f"ℹ️ VPN ({provider.upper()}) necessária. O modo Headless para o TikTok foi desativado automaticamente.")
         else:
-            if idioma_selecionado in ('ar-eg', 'ar', 'eg') and os.getenv('URBANVPN_ENABLE') == '1':
-                 logger.error("🔥 CRÍTICO: A intenção era usar VPN para 'ar-eg', mas a verificação falhou. Abortando por segurança para evitar banimento.")
-                 sys.exit(1)
+            # Se a VPN não for usada, aí sim pergunta ao usuário
             default_tt_headless = os.getenv('HEADLESS_UPLOAD', '0').strip() != '0'
             ans_tt = _perguntar_headless('o TikTok (upload)', default_tt_headless)
             if ans_tt is None: continue
             os.environ['HEADLESS_UPLOAD'] = '1' if ans_tt else '0'
-
+        # ##############################################################
+        
         conteudo = _submenu_conteudo_por_idioma(idioma)
         if conteudo is None: continue
         
         if conteudo[0] == "veo3":
             if modo == "2":
                 horas = _ler_intervalo_horas();
-                if horas is not None: veo3_postar_em_intervalo(persona=conteudo[1], idioma=idioma, cada_horas=horas)
+                if horas is not None: veo3_postar_em_intervalo(persona=conteudo[1], idioma=idioma, cada_horas=horas, use_vpn=use_vpn)
             else:
-                veo3_executar_interativo(persona=conteudo[1], idioma=idioma)
+                veo3_executar_interativo(persona=conteudo[1], idioma=idioma, use_vpn=use_vpn)
             continue
         
         if modo == "2":
@@ -351,18 +366,27 @@ if __name__ == "__main__":
     _reload_env_if_changed(force=True)
 
     # ##############################################################
-    # LÓGICA DE SETUP INICIAL DA VPN - RESTAURADA
+    # LÓGICA DE SETUP INICIAL DA VPN - ATUALIZADA E DINÂMICA
     # ##############################################################
-    if _HAVE_VPN and os.getenv('URBANVPN_ENABLE') == '1':
-        profile_name = os.getenv("URBANVPN_PROFILE_NAME")
-        if profile_name:
-            # Verifica se o setup já foi feito. Se não, executa.
-            if not is_vpn_setup_complete(profile_name):
-                logger.warning("="*50 + "\n‼️ ATENÇÃO: Configuração da VPN necessária (primeira execução).\n" + "="*50)
-                setup_urban_vpn()
-                logger.info("Setup da VPN concluído. Reinicie o script para continuar.")
-                sys.exit(0) # Encerra para o usuário reiniciar
-        else:
-            logger.error("URBANVPN_ENABLE=1 mas URBANVPN_PROFILE_NAME não está definido no .env!")
+    if _HAVE_VPN:
+        provider = os.getenv("VPN_PROVIDER", "none").lower()
+        
+        if provider in ('urban', 'zoog'):
+            profile_name = None
+            if provider == 'urban':
+                profile_name = os.getenv("URBANVPN_PROFILE_NAME")
+            elif provider == 'zoog':
+                profile_name = os.getenv("ZOOGVPN_PROFILE_NAME")
+
+            if profile_name:
+                if not is_vpn_setup_complete(profile_name):
+                    logger.warning("="*50)
+                    logger.warning(f"‼️ ATENÇÃO: Configuração da {provider.upper()} VPN necessária (primeira execução).")
+                    logger.warning("="*50)
+                    setup_vpn()
+                    logger.info(f"Setup da {provider.upper()} VPN concluído. Por favor, reinicie o script para continuar.")
+                    sys.exit(0)
+            else:
+                logger.error(f"VPN_PROVIDER='{provider}' mas o PROFILE_NAME correspondente não está definido no .env!")
     
     _menu_principal()

@@ -651,9 +651,18 @@ def upload_video(
     lang_tag = _lang_tag_from_idioma(idioma)
     logger.info("upload_video: idioma=%s | want_proxy=%s | use_vpn=%s | region=%s | lang_tag=%s", idioma, want_proxy, use_vpn, region or "-", lang_tag)
 
-    # **CORREÇÃO APLICADA AQUI**
-    # Recupera o nome do perfil da VPN do ambiente se a VPN estiver em uso
-    vpn_profile_name = os.getenv("URBANVPN_PROFILE_NAME") if use_vpn else None
+    # ##############################################################
+    # CORREÇÃO APLICADA AQUI
+    # Recupera o nome do perfil da VPN com base no provedor selecionado no .env
+    # ##############################################################
+    vpn_profile_name = None
+    if use_vpn:
+        provider = os.getenv("VPN_PROVIDER", "none").lower()
+        if provider == 'urban':
+            vpn_profile_name = os.getenv("URBANVPN_PROFILE_NAME")
+        elif provider == 'zoog':
+            vpn_profile_name = os.getenv("ZOOGVPN_PROFILE_NAME")
+    # ##############################################################
 
     # Gerenciamento do WebDriver
     driver = None
@@ -678,8 +687,6 @@ def upload_video(
             we_created_driver = True
             logger.info("Criando uma instância de navegador %s %s", browser, "(headless)" if headless else "")
             
-            # **CORREÇÃO APLICADA AQUI**
-            # Passa o `vpn_profile_name` para a função que cria o navegador
             driver = get_browser(
                 browser,
                 headless=headless,
@@ -689,16 +696,16 @@ def upload_video(
                 want_proxy=want_proxy,
                 region=region,
                 lang_tag=lang_tag,
-                vpn_profile_name=vpn_profile_name, # <-- LINHA ADICIONADA
+                vpn_profile_name=vpn_profile_name, # Passa o nome do perfil CORRETO
                 *args,
                 **kwargs
             )
 
         # Autenticação e Configuração
         if use_vpn:
-            from ..vpn_manager import connect_urban_vpn
+            from ..vpn_manager import connect_vpn
             logger.info("Iniciando procedimento de conexão da VPN...")
-            if not connect_urban_vpn(driver):
+            if not connect_vpn(driver):
                 raise VpnConnectionError("Não foi possível estabelecer conexão com a VPN.")
 
         auth = AuthBackend(username=username, password=password, cookies=cookies, cookies_list=cookies_list, sessionid=sessionid)
@@ -736,7 +743,7 @@ def upload_video(
                 driver.quit()
             except Exception:
                 pass
-
+            
 def complete_upload_form(
     driver: WebDriver,
     path: str,
@@ -1074,7 +1081,7 @@ def _post_video(driver: WebDriver) -> None:
         pass
     
     time.sleep(4)
-    
+
 def _check_valid_path(path: str) -> bool:
     return exists(path) and path.split(".")[-1].lower() in config["supported_file_types"]
 
