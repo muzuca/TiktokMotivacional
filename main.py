@@ -206,7 +206,7 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     if s in ("mono", "4"): return "minimal_center"
     return "minimal_center"
 
-def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, image_engine: str, use_vpn: bool):
+def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, image_engine: str, use_vpn: bool, headless_tiktok: bool):
     os.makedirs(IMAGENS_DIR, exist_ok=True); os.makedirs(VIDEOS_DIR, exist_ok=True); os.makedirs(AUDIOS_DIR, exist_ok=True)
     logger.info("Gerando conteúdos (%s | modo=%s | imagens=%s)...", idioma, modo_conteudo, image_engine)
     if modo_conteudo == "tarot" and _HAVE_TAROT_FUNCS:
@@ -251,7 +251,7 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         escrever_frase_na_imagem(imagem_path=img_path, frase=frase, saida_path=out_path, template=template_img, idioma=idioma)
         slides_para_video.append(out_path)
     gerar_video(imagem_path=slides_para_video[0], saida_path=video_final, preset="fullhd", idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_paths=slides_para_video, content_mode=modo_conteudo, long_text=long_text)
-    ok = postar_no_tiktok_e_renomear(descricao_personalizada=desc_tiktok, video_final=video_final, idioma=idioma, use_vpn=use_vpn)
+    ok = postar_no_tiktok_e_renomear(descricao_personalizada=desc_tiktok, video_final=video_final, idioma=idioma, use_vpn=use_vpn, headless=headless_tiktok)
     if ok: logger.info("✓ Processo concluído com sucesso!")
     else: logger.error("✗ Falha na postagem. Verifique os logs!")
 
@@ -348,9 +348,14 @@ def _menu_principal():
         image_engine = _selecionar_gerador_imagens(os.getenv("IMAGE_MODE", "pexels"))
         if image_engine is None: continue
 
+        # A variável 'headless_tiktok' é a mesma 'ans_tt' que você respondeu
+        # ou 'False' se a VPN estiver ativa.
+        headless_tiktok = not use_vpn and ans_tt if not use_vpn else False
+
         kwargs = {
             "modo_conteudo": conteudo[0], "idioma": idioma, "tts_engine": tts_engine, "legendas": legendas,
-            "video_style": video_style, "motion": motion, "image_engine": image_engine, "use_vpn": use_vpn
+            "video_style": video_style, "motion": motion, "image_engine": image_engine, "use_vpn": use_vpn,
+            "headless_tiktok": headless_tiktok
         }
         
         if modo == "2":

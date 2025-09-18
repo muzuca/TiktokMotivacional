@@ -726,7 +726,7 @@ def _load_saved_prompts(slug: str) -> List[str]:
             break
     return prompts
 
-def _menu_reutilizar_videos(idioma: str) -> None:
+def _menu_reutilizar_videos(idioma: str, use_vpn: bool) -> None:
     slugs = _listar_slugs()
     if not slugs:
         print("\nNenhum vídeo Veo3 encontrado em ./videos.")
@@ -788,7 +788,8 @@ def _menu_reutilizar_videos(idioma: str) -> None:
         if modo == "3":
             print(f"✅ Exportado (sem postar): {final_video}")
             return
-        _postar_video(final_video, idioma)
+        # AJUSTE APLICADO AQUI
+        _postar_video(final_video, idioma, use_vpn=use_vpn)
         return
 
     todos = d["final"] + d["test"] + d["cenas"]
@@ -804,7 +805,8 @@ def _menu_reutilizar_videos(idioma: str) -> None:
         return
     escolhido = todos[int(op2) - 1]
     if modo == "2":
-        _postar_video(escolhido, idioma)
+        # AJUSTE APLICADO AQUI
+        _postar_video(escolhido, idioma, use_vpn=use_vpn)
         return
     trilha = _pick_bgm_path()
     saida = os.path.join(VIDEOS_DIR, f"{os.path.splitext(os.path.basename(escolhido))[0]}_export.mp4")
@@ -816,7 +818,7 @@ def _menu_reutilizar_videos(idioma: str) -> None:
         print(f"✅ Exportado (sem postar): {exportado}")
     except Exception as e:
         logger.warning("Falha ao exportar: %s", e)
-
+        
 # ------------------------ Fluxo interativo ------------------------
 def _sugerir_assuntos(persona: str) -> List[str]:
     return ["Prosperidade", "Signos", "Sorte do dia", "Amor", "Proteção", "Limpeza energética"]
