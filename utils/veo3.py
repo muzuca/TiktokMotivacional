@@ -597,51 +597,6 @@ def _cleanup_core_videos_for_slug(slug: str) -> None:
     except Exception as e:
         logger.warning("Falha na limpeza pós-postagem: %s", e)
 
-# ------------------------ TikTok headless (pergunta 1x) ------------------------
-_TT_HEADLESS_CONFIRMED = False
-
-def _perguntar_headless_tiktok(default_on: bool) -> Optional[bool]:
-    padrao = "Sim" if default_on else "Não"
-    print("\nPostar no TikTok em modo headless?")
-    print(f"Enter = {padrao}  |  1. Sim  |  2. Não  |  b. Voltar")
-    op = input("Escolha: ").strip().lower()
-    if op in _BACK_TOKENS:
-        return None
-    if op in {"1", "s", "sim"}:
-        return True
-    if op in {"2", "n", "nao", "não"}:
-        return False
-    return default_on
-
-# EM veo3.py
-def _ensure_tiktok_headless_prompt(use_vpn: bool) -> bool:
-    """
-    Garante que o modo headless do TikTok esteja definido, perguntando ao usuário
-    APENAS se a VPN não estiver em uso.
-    """
-    global _TT_HEADLESS_CONFIRMED
-    if _TT_HEADLESS_CONFIRMED:
-        return True
-
-    # Se a VPN está ativa, FORÇA o modo não-headless e não pergunta.
-    if use_vpn:
-        os.environ["TIKTOK_HEADLESS"] = "0"
-        logger.info("ℹ️ VPN para TikTok ativada. O modo Headless foi desativado automaticamente.")
-        _TT_HEADLESS_CONFIRMED = True
-        return True
-
-    # Se não houver VPN, executa a lógica de pergunta original.
-    default_tt = os.getenv("TIKTOK_HEADLESS", "1").strip() != "0"
-    ans = _perguntar_headless_tiktok(default_tt)
-    
-    if ans is None:
-        print("Cancelado antes da postagem.")
-        return False
-        
-    os.environ["TIKTOK_HEADLESS"] = "1" if ans else "0"
-    logger.info("→ TikTok headless: %s", "ON" if ans else "OFF")
-    _TT_HEADLESS_CONFIRMED = True
-    return True
 # ------------------------ TikTok posting ------------------------
 _AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
 def _sanitize_arabic_hashtag(text: str) -> str:
@@ -677,10 +632,8 @@ def _normalize_hashtags(hashtags, k: int = HASHTAGS_TOP_N) -> List[str]:
 
 # EM veo3.py
 def _postar_video(final_video: str, idioma: str, use_vpn: bool, *, cleanup_slug: bool = True) -> bool:
-    # A única mudança é que agora ela recebe 'use_vpn' e passa para a função abaixo
-    if not _ensure_tiktok_headless_prompt(use_vpn=use_vpn):
-        return False
-
+    # A chamada para _ensure_tiktok_headless_prompt foi removida.
+    # A decisão do modo headless já foi feita no main.py.
     try:
         frase    = gerar_frase_motivacional(idioma=idioma)
         hashtags = gerar_hashtags_virais(frase, idioma=idioma, n=HASHTAGS_TOP_N)
