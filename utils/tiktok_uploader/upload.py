@@ -160,6 +160,11 @@ except ImportError:
         if not use_proxy: return opts
         host, port, user, pw = _resolve_proxy_env(region)
         if host and port:
+            # ==================================================================
+            # LINHA DE LOG ADICIONADA AQUI
+            # ==================================================================
+            logger.info(f"🔌 Carregando proxy para região '{region or 'PADRÃO'}': Host={host}, Porta={port}")
+            # ==================================================================            
             proxy_uri = f"http://{user}:{pw}@{host}:{port}" if user and pw else f"http://{host}:{port}"
             opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
             logging.info("Selenium-Wire proxy configurado (%s): %s", (region or "DEFAULT"), proxy_uri)
