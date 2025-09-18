@@ -212,7 +212,7 @@ def postar_no_tiktok_e_renomear(
                 cookies=COOKIES_PATH,
                 schedule=False,
                 headless=tt_headless,
-                lang=lang,
+                idioma=lang,
                 use_vpn=use_vpn,
             )
 
