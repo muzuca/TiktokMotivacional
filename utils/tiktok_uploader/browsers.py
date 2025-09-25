@@ -1,4 +1,4 @@
-# utils/tiktok_uploader/browsers.py (VERSÃO "MODO TESTE" - IDÊNTICA AO TESTE_PERFIL.PY)
+# utils/tiktok_uploader/browsers.py (VERSÃO CORRIGIDA PARA LOGS LIMPOS)
 import logging
 import os
 import uuid
@@ -13,6 +13,10 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+## AJUSTE 1: Silenciar a biblioteca webdriver-manager ##
+# Esta linha impede que as mensagens "====== WebDriver manager ======" apareçam.
+logging.getLogger("webdriver_manager").setLevel(logging.WARNING)
 
 # --- Funções auxiliares (mantidas para o modo sem vpn) ---
 def _idioma_norm(idioma: Optional[str]) -> str:
@@ -59,9 +63,6 @@ def _mk_seleniumwire_options(use_proxy: bool, region: Optional[str]):
     if not use_proxy: return opts
     host, port, user, pw = _resolve_proxy_env(region)
     if host and port:
-        # ==================================================================
-        # LOG ADICIONADO NO LOCAL CORRETO, CONFORME SUA SUGESTÃO
-        # ==================================================================
         logger.info(f"🔌 Carregando proxy para região '{region or 'PADRÃO'}': Host={host}, Porta={port}")
 
         proxy_uri = f"http://{user}:{pw}@{host}:{port}" if user and pw else f"http://{host}:{port}"
@@ -95,10 +96,14 @@ def get_browser(name: str = "chrome", options=None, proxy=None, idioma: str = "a
 
     logger.info("get_browser: idioma=%s | want_proxy=%s | region=%s | lang_tag=%s | vpn_profile=%s", idioma, want_proxy, region or "-", lang_tag, vpn_profile_name or "N/A")
 
+    ## AJUSTE 2: Criar o serviço silencioso uma única vez ##
+    # Esta configuração é aplicada em todos os casos (com ou sem VPN).
+    service = ChromeService(
+        ChromeDriverManager().install(),
+        log_output=os.devnull  # Redireciona o log do chromedriver.exe para o "nada"
+    )
+
     if vpn_profile_name:
-        # ######################################################################
-        # LÓGICA "À PROVA DE FALHAS" - IMITANDO O TESTE_PERFIL.PY
-        # ######################################################################
         logger.info("MODO VPN DETECTADO: Usando configuração mínima e estável, idêntica ao script de teste.")
         
         try:
@@ -111,22 +116,21 @@ def get_browser(name: str = "chrome", options=None, proxy=None, idioma: str = "a
         user_data_dir, _ = _profile_roots(None, vpn_profile_name=vpn_profile_name)
         _unlock_profile(user_data_dir)
         
-        # Argumentos EXATOS do teste que funcionou
         options.add_argument(f"--user-data-dir={os.path.abspath(user_data_dir)}")
         options.add_argument("--profile-directory=Default")
-        
-        # Mantemos apenas este, pois é necessário para a automação da extensão
         options.add_argument("--disable-web-security")
+        
+        ## AJUSTE 3: Adicionar as opções para silenciar o browser ##
+        options.add_argument('--log-level=3')
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
-        driver = std_webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+        # Usamos o 'service' silencioso que criamos acima
+        driver = std_webdriver.Chrome(service=service, options=options)
         
         logger.info("🗂️ Perfil Chrome (VPN - modo de teste): %s", os.path.abspath(user_data_dir))
         return driver
     
     else:
-        # ######################################################################
-        # LÓGICA NORMAL PARA CONEXÕES COM PROXY OU DIRETAS (sem VPN)
-        # ######################################################################
         logger.info("Modo padrão (sem VPN) detectado.")
         
         if options is None: options = ChromeOptions()
@@ -135,6 +139,10 @@ def get_browser(name: str = "chrome", options=None, proxy=None, idioma: str = "a
         if region is None: region = _compute_region_from_idioma(idioma)
         if lang_tag is None: lang_tag = _lang_tag_from_idioma(idioma)
         
+        ## AJUSTE 3 (Repetido): Adicionar as opções para silenciar o browser ##
+        options.add_argument('--log-level=3')
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
+
         options.add_argument(f"--lang={lang_tag}")
         options.add_argument("--disable-extensions")
         if headless:
@@ -148,10 +156,12 @@ def get_browser(name: str = "chrome", options=None, proxy=None, idioma: str = "a
         try:
             from seleniumwire import webdriver as wire_webdriver
             sw_opts = _mk_seleniumwire_options(want_proxy, region)
-            driver = wire_webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options, seleniumwire_options=sw_opts)
+            # Usamos o 'service' silencioso que criamos acima
+            driver = wire_webdriver.Chrome(service=service, options=options, seleniumwire_options=sw_opts)
         except (ImportError, RuntimeError):
             logger.warning("Selenium-Wire não encontrado/necessário. Usando Selenium padrão.")
-            driver = std_webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+            # Usamos o 'service' silencioso que criamos acima
+            driver = std_webdriver.Chrome(service=service, options=options)
         
         logger.info("🗂️ Perfil Chrome (Padrão): %s", os.path.abspath(user_data_dir))
         return driver

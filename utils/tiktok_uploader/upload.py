@@ -196,7 +196,15 @@ except ImportError:
                 options.add_argument("--enable-unsafe-swiftshader")
                 options.add_argument("--ignore-gpu-blocklist")
             sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            driver = wire_webdriver.Chrome(service=ChromeService(ChromeDriverManager().install(), port=0), options=options, seleniumwire_options=sw_opts)
+
+            # CRIAMOS O SERVIÇO SEPARADAMENTE PARA ADICIONAR A OPÇÃO
+            service = ChromeService(
+                ChromeDriverManager().install(),
+                port=0,
+                log_output=os.devnull  # <<-- ESTA É A LINHA QUE SILENCIA TUDO
+            )
+            driver = wire_webdriver.Chrome(service=service, options=options, seleniumwire_options=sw_opts)
+            
             try:
                 driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Accept-Language": _accept_header_from_tag(lang_tag), "Upgrade-Insecure-Requests": "1"}})
                 driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}"})
@@ -222,7 +230,7 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
-logging.getLogger("webdriver_manager").setLevel(logging.INFO)
+logging.getLogger("webdriver_manager").setLevel(logging.WARNING) # <<-- ADICIONE ESTA LINHA
 
 from .utils import bold
 from .types import VideoDict, ProxyDict, Cookie
@@ -697,7 +705,6 @@ def upload_video(
                 headless=headless,
                 proxy=proxy,
                 idioma=idioma,
-                options=ChromeOptions(), # Garante que options seja passado
                 want_proxy=want_proxy,
                 region=region,
                 lang_tag=lang_tag,

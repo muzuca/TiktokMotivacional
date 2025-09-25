@@ -66,7 +66,7 @@ NEGATIVE_PROMPT = (
 
 USE_BACKEND = os.getenv("VEO3_BACKEND", "flow").strip().lower()
 FLOW_PROJECT_URL  = os.getenv("FLOW_PROJECT_URL", "").strip()
-FLOW_COOKIES_FILE = os.getenv("FLOW_COOKIES_FILE", "cache/cookies/flow/veo3.txt").strip()
+FLOW_COOKIES_FILE = os.getenv("FLOW_COOKIES_FILE", "cookies_veo3.txt").strip()
 VEO3_HEADLESS     = os.getenv("VEO3_CHROME_HEADLESS", "1").strip() != "0"  # default do .env
 
 # ==== NOVO: número de tentativas para chamadas ao Gemini ====

@@ -103,6 +103,24 @@ def _menu_modo_execucao() -> str:
         if op in {"", "1"}: return "1"
         if op == "2": return "2"
 
+def _selecionar_modo_output() -> dict:
+    """
+    Pergunta ao usuário qual o modo de saída: Postar ou Só salvar.
+    Retorna: {"modo": "postar" | "salvar", "custom_pasta": path | None}
+    """
+    while True:
+        print("\nSelecione o modo de saída do vídeo:")
+        print("1. Gerar e postar normalmente [padrão]")
+        print("2. Só gerar o arquivo e salvar numa pasta personalizada")
+        op = input("Escolha 1 ou 2: ").strip().lower()
+        if op in {"", "1"}:
+            return {"modo": "postar", "custom_pasta": None}
+        elif op == "2":
+            while True:
+                custom_pasta = input("Cole o caminho COMPLETO da pasta para salvar o arquivo (ex: C:\\Users\\vinic\\OneDrive\\Documentos\\MuMuSharedFolder\\Camera):\n").strip()
+                if not custom_pasta: print("Por favor, preencha o caminho da pasta. Tente novamente!")
+                else: return {"modo": "salvar", "custom_pasta": custom_pasta}
+
 def _selecionar_idioma() -> Optional[str]:
     while True:
         print("\nEscolha o país para referência do idioma das mensagens:\n1. EUA (Inglês) *padrão\n2. Brasil (pt-br)\n3. Árabe (egípcio)\n4. Rússia (Russo)\n5. Indonésia (Indonésio)\nb. Voltar")
@@ -206,18 +224,26 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     if s in ("mono", "4"): return "minimal_center"
     return "minimal_center"
 
-def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, image_engine: str, use_vpn: bool, headless_tiktok: bool):
+# Substitua a sua função rotina por esta:
+def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, image_engine: str, use_vpn: bool, headless_tiktok: bool, apenas_salvar: bool = False) -> Optional[str]:
+    """
+    Executa a rotina principal de geração de vídeo.
+    Se 'apenas_salvar' for True, gera o vídeo e retorna o caminho do arquivo sem postar.
+    """
     os.makedirs(IMAGENS_DIR, exist_ok=True); os.makedirs(VIDEOS_DIR, exist_ok=True); os.makedirs(AUDIOS_DIR, exist_ok=True)
     logger.info("Gerando conteúdos (%s | modo=%s | imagens=%s)...", idioma, modo_conteudo, image_engine)
+    
     if modo_conteudo == "tarot" and _HAVE_TAROT_FUNCS:
         tema_imagem, frase = gerar_prompt_tarot(idioma), gerar_frase_tarot_curta(idioma)
     else:
         tema_imagem = frase = gerar_frase_motivacional(idioma)
+    
     try:
         hashtags_list = gerar_hashtags_virais(frase, idioma=idioma, n=3)
         desc_tiktok = (frase + " " + " ".join(hashtags_list)).strip()
     except Exception as e:
         logger.warning("Falha ao gerar hashtags: %s", e); desc_tiktok = frase
+    
     long_text = None
     if _HAVE_TAROT_FUNCS and modo_conteudo == "tarot":
         try: long_text = gerar_frase_tarot_longa(idioma)
@@ -225,13 +251,16 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
     if not long_text and _HAVE_LONGO_MOTIV:
         try: long_text = gerar_frase_motivacional_longa(idioma)
         except Exception: pass
+    
     dur_est = _estimativa_duracao_segundos(long_text, idioma) if long_text else 30.0
     slides_auto = int(round(dur_est / float(os.getenv("SLIDES_SECONDS_PER", "3.0")))) if float(os.getenv("SLIDES_SECONDS_PER", "3.0")) > 0 else DEFAULT_SLIDES_COUNT
     slides_count = max(SLIDES_MIN, min(SLIDES_MAX, slides_auto))
     slug_frase = gerar_slug(frase)
     video_final = os.path.join(VIDEOS_DIR, f"{slug_frase}.mp4")
+    
     logger.info(f"Gerando {slides_count} prompts de imagem com o tema: '{tema_imagem}'")
     prompts_de_imagem = gerar_prompts_de_imagem_variados(tema_imagem, slides_count, idioma)
+    
     generated_image_paths = []
     if image_engine == 'dalle': pass
     else:
@@ -242,7 +271,9 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
                 if os.path.exists(imagem_path) and os.path.getsize(imagem_path) > 1024:
                     generated_image_paths.append(imagem_path)
             except Exception as e: logger.error(f"Falha ao gerar a imagem {i+1}: {e}")
+
     if not generated_image_paths: raise RuntimeError("Nenhuma imagem foi gerada.")
+    
     slides_para_video = []
     template_img = _map_video_style_to_image_template(video_style)
     for img_path in generated_image_paths:
@@ -250,11 +281,21 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         out_path = os.path.join(IMAGENS_DIR, f"{nome_base}_com_texto.png")
         escrever_frase_na_imagem(imagem_path=img_path, frase=frase, saida_path=out_path, template=template_img, idioma=idioma)
         slides_para_video.append(out_path)
+        
     gerar_video(imagem_path=slides_para_video[0], saida_path=video_final, preset="fullhd", idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_paths=slides_para_video, content_mode=modo_conteudo, long_text=long_text)
-    ok = postar_no_tiktok_e_renomear(descricao_personalizada=desc_tiktok, video_final=video_final, idioma=idioma, use_vpn=use_vpn, headless=headless_tiktok)
-    if ok: logger.info("✓ Processo concluído com sucesso!")
-    else: logger.error("✗ Falha na postagem. Verifique os logs!")
-
+    
+    # --- LÓGICA DE DECISÃO CENTRAL ---
+    if apenas_salvar:
+        logger.info(f"✓ Vídeo gerado com sucesso em '{video_final}'. Pulando etapa de postagem.")
+        return video_final  # Retorna o caminho do arquivo para ser salvo externamente
+    else:
+        ok = postar_no_tiktok_e_renomear(descricao_personalizada=desc_tiktok, video_final=video_final, idioma=idioma, use_vpn=use_vpn, headless=headless_tiktok)
+        if ok:
+            logger.info("✓ Processo concluído com sucesso!")
+        else:
+            logger.error("✗ Falha na postagem. Verifique os logs!")
+        return None # Não precisa retornar o caminho pois o fluxo termina aqui
+    
 ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))
 def _run_rotina_once(args_tuple):
     try: rotina(*args_tuple); return True
@@ -279,6 +320,18 @@ def postar_em_intervalo(cada_horas: float, **kwargs):
             time.sleep(rem)
     except KeyboardInterrupt: logger.info("⏹️ Encerrado pelo usuário.")
 
+def _limpar_pasta(destino: str):
+    try:
+        if not os.path.exists(destino):
+            os.makedirs(destino)
+        for f in os.listdir(destino):
+            caminho = os.path.join(destino, f)
+            if os.path.isfile(caminho):
+                os.remove(caminho)
+    except Exception as e:
+        logger.warning(f"Falha ao limpar pasta '{destino}': {e}")
+
+# Substitua a sua função _menu_principal por esta:
 def _menu_principal():
     _reload_env_if_changed(force=False)
     while True:
@@ -287,41 +340,45 @@ def _menu_principal():
         idioma = _selecionar_idioma()
         if idioma is None: continue
 
-        # ##############################################################
-        # LÓGICA DE DECISÃO DA VPN E HEADLESS - CORRIGIDA E COMPLETA
-        # ##############################################################
-        idioma_selecionado = idioma.lower().strip()
-        provider = os.getenv("VPN_PROVIDER", "none").lower()
-        
-        # Define a lista de idiomas que ativam a VPN com base no provedor escolhido
-        vpn_langs_str = ""
-        if provider == 'urban':
-            vpn_langs_str = os.getenv('URBANVPN_LANGS', '')
-        elif provider == 'zoog':
-            # **LÓGICA PARA ZOOGVPN ADICIONADA AQUI**
-            vpn_langs_str = os.getenv('ZOOGVPN_LANGS', '')
-        
-        vpn_langs = [lang.strip().lower() for lang in vpn_langs_str.split(',') if lang.strip()]
-        
-        # A variável 'use_vpn' agora controla todo o fluxo
-        use_vpn = (
-            _HAVE_VPN and
-            provider in ('urban', 'zoog') and
-            idioma_selecionado in vpn_langs
-        )
-        
-        # Define o modo headless para o TikTok COM BASE em 'use_vpn'
-        if use_vpn:
-            os.environ['HEADLESS_UPLOAD'] = '0'
-            logger.info(f"ℹ️ VPN ({provider.upper()}) necessária. O modo Headless para o TikTok foi desativado automaticamente.")
-        else:
-            # Se a VPN não for usada, aí sim pergunta ao usuário
-            default_tt_headless = os.getenv('HEADLESS_UPLOAD', '0').strip() != '0'
-            ans_tt = _perguntar_headless('o TikTok (upload)', default_tt_headless)
-            if ans_tt is None: continue
-            os.environ['HEADLESS_UPLOAD'] = '1' if ans_tt else '0'
-        # ##############################################################
-        
+        op_output = _selecionar_modo_output()
+
+        # Variáveis com valores padrão para o caso de "apenas salvar"
+        use_vpn = False
+        ans_tt = False
+
+        # =============================================================================
+        # LÓGICA DE VPN E HEADLESS MOVIDA PARA DENTRO DESTA CONDIÇÃO
+        # Agora só executa se a intenção for postar o vídeo.
+        # =============================================================================
+        if op_output["modo"] == "postar":
+            idioma_selecionado = idioma.lower().strip()
+            provider = os.getenv("VPN_PROVIDER", "none").lower()
+            
+            vpn_langs_str = ""
+            if provider == 'urban':
+                vpn_langs_str = os.getenv('URBANVPN_LANGS', '')
+            elif provider == 'zoog':
+                vpn_langs_str = os.getenv('ZOOGVPN_LANGS', '')
+            
+            vpn_langs = [lang.strip().lower() for lang in vpn_langs_str.split(',') if lang.strip()]
+            
+            use_vpn = (
+                _HAVE_VPN and
+                provider in ('urban', 'zoog') and
+                idioma_selecionado in vpn_langs
+            )
+            
+            if use_vpn:
+                os.environ['HEADLESS_UPLOAD'] = '0'
+                logger.info(f"ℹ️ VPN ({provider.upper()}) necessária. O modo Headless para o TikTok foi desativado automaticamente.")
+            else:
+                default_tt_headless = os.getenv('HEADLESS_UPLOAD', '0').strip() != '0'
+                ans_tt_resp = _perguntar_headless('o TikTok (upload)', default_tt_headless)
+                if ans_tt_resp is None: continue
+                ans_tt = ans_tt_resp
+                os.environ['HEADLESS_UPLOAD'] = '1' if ans_tt else '0'
+        # =============================================================================
+
         conteudo = _submenu_conteudo_por_idioma(idioma)
         if conteudo is None: continue
         
@@ -333,9 +390,10 @@ def _menu_principal():
                 veo3_executar_interativo(persona=conteudo[1], idioma=idioma, use_vpn=use_vpn)
             continue
         
-        if modo == "2":
-            horas = _ler_intervalo_horas()
-            if horas is None: continue
+        # A pergunta de horas só faz sentido se for postar em intervalo
+        if modo == "2" and op_output["modo"] == "postar":
+             horas = _ler_intervalo_horas()
+             if horas is None: continue
         
         tts_engine = _selecionar_tts_engine()
         if tts_engine is None: continue
@@ -348,8 +406,6 @@ def _menu_principal():
         image_engine = _selecionar_gerador_imagens(os.getenv("IMAGE_MODE", "pexels"))
         if image_engine is None: continue
 
-        # A variável 'headless_tiktok' é a mesma 'ans_tt' que você respondeu
-        # ou 'False' se a VPN estiver ativa.
         headless_tiktok = not use_vpn and ans_tt if not use_vpn else False
 
         kwargs = {
@@ -357,12 +413,39 @@ def _menu_principal():
             "video_style": video_style, "motion": motion, "image_engine": image_engine, "use_vpn": use_vpn,
             "headless_tiktok": headless_tiktok
         }
-        
-        if modo == "2":
-            postar_em_intervalo(cada_horas=horas, **kwargs)
-        else:
-            rotina(**kwargs)
 
+        # --- EXECUÇÃO COM O FLUXO CORRIGIDO E ROBUSTO ---
+        if op_output["modo"] == "salvar":
+            import shutil
+            kwargs["apenas_salvar"] = True
+            
+            caminho_gerado = rotina(**kwargs)
+
+            if caminho_gerado and os.path.exists(caminho_gerado):
+                try:
+                    destino_pasta = op_output["custom_pasta"]
+                    nome_arquivo = os.path.basename(caminho_gerado)
+                    
+                    _limpar_pasta(destino_pasta)
+
+                    destino_final = os.path.join(destino_pasta, nome_arquivo)
+                    shutil.copy2(caminho_gerado, destino_final)
+                    
+                    print(f"\n✓ Vídeo salvo com sucesso em '{destino_final}'.")
+                    logger.info(f"Arquivo salvo em '{destino_final}' (pasta de destino limpa antes).")
+                except Exception as e:
+                    print(f"\n✗ Falha ao salvar o vídeo na pasta personalizada: {e}")
+                    logger.error(f"Falha ao salvar o vídeo na pasta personalizada: {e}")
+            else:
+                print("\n✗ Falha na geração do vídeo, arquivo não encontrado para salvar.")
+                logger.error("A rotina de geração não retornou um caminho de vídeo válido.")
+
+        else: # op_output["modo"] == "postar"
+            if modo == "2":
+                postar_em_intervalo(cada_horas=horas, **kwargs)
+            else:
+                rotina(**kwargs)
+                              
 if __name__ == "__main__":
     try:
         multiprocessing.freeze_support()
