@@ -1,0 +1,88 @@
++--- TiktokMotivacional
+    .env
+    .gitattributes
+    .gitignore
+    +--- audios
+        +--- tts
+    build_exe.bat
+    +--- cache
+        +--- chrome_cache
+        +--- chrome_profiles
+        +--- cookies
+            +--- flow
+                veo3.txt
+            +--- tiktok
+                ar.txt
+                br.txt
+        used_audios.json
+        used_long_phrases_ar.json
+        used_long_phrases_en.json
+        used_pexels_prompts_ar.json
+        used_pexels_prompts_en.json
+        used_phrases_ar.json
+        used_phrases_en.json
+    estrutura.txt
+    +--- fonts
+        Amiri-Regular.ttf
+        BebasNeue-Regular.ttf
+        Cinzel-Bold.ttf
+        Inter-Bold.ttf
+        Montserrat-ExtraBold.ttf
+        Montserrat-Regular.ttf
+        NotoNaskhArabic-Regular.ttf
+        PlayfairDisplay-Bold.ttf
+        PlayfairDisplay-Regular.ttf
+        bebas-neue-cyrillic.ttf
+    gerar_estrutura.py
+    +--- imagens
+    main.py
+    requirements.txt
+    +--- utils
+        audio.py
+        cache_store.py
+        chatgpt_image.py
+        cleanup.py
+        countries.py
+        frase.py
+        gemini_image.py
+        imagem.py
+        +--- personas
+            alina.json
+            luisa.json
+            yasmina.json
+        +--- prompts
+            context_generator.yaml
+            hashtags.yaml
+            image_prompts.yaml
+            image_prompts_pexels.yaml
+            long_motivational.yaml
+            long_tarot.yaml
+            short_motivational.yaml
+            short_tarot.yaml
+            stage_1_analysis.yaml
+            stage_2_scenes.yaml
+        +--- resources
+            fallback_phrases.json
+        subtitles.py
+        tiktok.py
+        +--- tiktok_uploader
+            __init__.py
+            __main__.py
+            auth.py
+            browsers.py
+            cli.py
+            config.toml
+            +--- proxy_auth_extension
+                __init__.py
+                background.js
+                manifest.json
+                proxy_auth_extension.py
+            proxy_check.py
+            types.py
+            upload.py
+            utils.py
+        veo3.py
+        veo3_flow.py
+        video.py
+        vpn_manager.py
+    +--- videos
