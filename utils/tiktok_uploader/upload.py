@@ -2,21 +2,8 @@
 """
 Módulo `tiktok_uploader` para fazer upload de vídeos no TikTok.
 
-Atualizações desta versão:
-- Espera inteligente de carregamento: injeção de contador de fetch/XHR e espera por
-  "network idle" antes de prosseguir; hidratação de SPA sem sleeps fixos.
-- Grace dinâmico antes do Post: quando a rede está quieta e sem modais bloqueando,
-  o fluxo publica de imediato (ou com um grace mínimo configurável).
-- Captura robusta do perfil autenticado logo após abrir o upload, com retry que volta
-  à rota `/tiktokstudio/upload` caso a página redirecione para o hub `/tiktokstudio`.
-- Suporte a timezone/locale via CDP (ex.: `Africa/Cairo` + `ar-EG`) para agendamentos.
-- Navegação resiliente para rede lenta/proxy: warm-up em `/explore`, múltiplas variantes
-  da URL de upload, antiredirecionamento para o hub e fallback para detecção de iframe/DOM.
-- Headless estável: flags SwiftShader/WebGL para evitar erros de GPU.
-- **Descompartimentação de país/idioma/região** via funções e mapeamentos,
-  adicionando **Rússia (RU)**: `ru-RU`, timezone `Europe/Moscow`, e `PROXY_RU_*`.
-- **Integração com VPN Manager**: orquestra a conexão de VPN antes de qualquer
-  navegação para o TikTok, abortando a operação em caso de falha.
+Este módulo agora delega a criação do navegador para o `browsers.py`,
+servindo como o orquestrador do processo de upload.
 """
 
 from __future__ import annotations
@@ -53,6 +40,8 @@ from selenium.webdriver.common.action_chains import ActionChains
 # ===== App modules =====
 from .auth import AuthBackend
 from . import config
+# Importa a função oficial de criação de browser. O fallback foi removido.
+from .browsers import get_browser
 
 # ===== VPN Manager =====
 try:
@@ -93,144 +82,8 @@ def _region_default(idioma: Optional[str]) -> Optional[str]:
 def _lang_tag_default(idioma: Optional[str]) -> str:
     return LANG_TO_TAG.get(_norm_lang(idioma), "en-US")
 
-def _env_first(*keys: str, default: str = "") -> str:
-    for k in keys:
-        v = os.getenv(k)
-        if v: return v
-    return default
-
-def _resolve_proxy_env(region: Optional[str]):
-    reg = (region or "").upper()
-    if reg == "US":
-        host = _env_first("PROXY_US_HOST", "PROXY_HOST_US", "PROXY_HOST")
-        port = _env_first("PROXY_US_PORT", "PROXY_PORT_US", "PROXY_PORT")
-        user = _env_first("PROXY_US_USER", "PROXY_USER_US", "PROXY_USER") or None
-        pw = _env_first("PROXY_US_PASS", "PROXY_PASS_US", "PROXY_PASS") or None
-        return host, port, user, pw
-    if reg == "EG":
-        host = _env_first("PROXY_EG_HOST", "PROXY_HOST_EG", "PROXY_HOST")
-        port = _env_first("PROXY_EG_PORT", "PROXY_PORT_EG", "PROXY_PORT")
-        user = _env_first("PROXY_EG_USER", "PROXY_USER_EG", "PROXY_USER") or None
-        pw = _env_first("PROXY_EG_PASS", "PROXY_PASS_EG", "PROXY_PASS") or None
-        return host, port, user, pw
-    if reg == "RU":
-        host = _env_first("PROXY_RU_HOST", "PROXY_HOST_RU", "PROXY_HOST")
-        port = _env_first("PROXY_RU_PORT", "PROXY_PORT_RU", "PROXY_PORT")
-        user = _env_first("PROXY_RU_USER", "PROXY_USER_RU", "PROXY_USER") or None
-        pw = _env_first("PROXY_RU_PASS", "PROXY_PASS_RU", "PROXY_PASS") or None
-        return host, port, user, pw
-    if reg == "ID":
-        host = _env_first("PROXY_ID_HOST", "PROXY_HOST_ID", "PROXY_HOST")
-        port = _env_first("PROXY_ID_PORT", "PROXY_PORT_ID", "PROXY_PORT")
-        user = _env_first("PROXY_ID_USER", "PROXY_USER_ID", "PROXY_USER") or None
-        pw = _env_first("PROXY_ID_PASS", "PROXY_PASS_ID", "PROXY_PASS") or None
-        return host, port, user, pw
-    host = _env_first("PROXY_BR_HOST", "PROXY_HOST_BR", "PROXY_HOST")
-    port = _env_first("PROXY_BR_PORT", "PROXY_PORT_BR", "PROXY_PORT")
-    user = _env_first("PROXY_BR_USER", "PROXY_USER_BR", "PROXY_USER") or None
-    pw = _env_first("PROXY_BR_PASS", "PROXY_PASS_BR", "PROXY_PASS") or None
-    return host, port, user, pw
-
-def _accept_header_from_tag(tag: Optional[str]) -> str:
-    tag = (tag or "").strip() or "en-US"
-    tl = tag.lower()
-    if tl.startswith("pt"): return "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tl.startswith("ar"): return "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tl.startswith("ru"): return "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-    if tl.startswith("id"): return "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"
-    return "en-US,en;q=0.9"
-
-try:
-    from .browsers import get_browser
-except ImportError:
-    from dotenv import load_dotenv
-    from seleniumwire import webdriver as wire_webdriver
-    from selenium import webdriver as std_webdriver
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    from webdriver_manager.chrome import ChromeDriverManager
-    from selenium.webdriver.firefox.options import Options as FirefoxOptions
-    from selenium.webdriver.firefox.service import Service as FirefoxService
-    from webdriver_manager.firefox import GeckoDriverManager
-    from selenium.webdriver.edge.options import Options as EdgeOptions
-    from selenium.webdriver.edge.service import Service as EdgeService
-    from webdriver_manager.microsoft import EdgeChromiumDriverManager
-    load_dotenv()
-    def _mk_sw_opts(use_proxy: bool, region: Optional[str]):
-        opts = {'request_storage': 'none', 'verify_ssl': False, 'scopes': [r".*\.tiktok\.com.*", r".*\.tiktokcdn\.com.*", r".*\.ttwstatic\.com.*"], 'port': 0, 'addr': '127.0.0.1', 'auto_config': True}
-        if not use_proxy: return opts
-        host, port, user, pw = _resolve_proxy_env(region)
-        if host and port:
-            # ==================================================================
-            # LINHA DE LOG ADICIONADA AQUI
-            # ==================================================================
-            logger.info(f"🔌 Carregando proxy para região '{region or 'PADRÃO'}': Host={host}, Porta={port}")
-            # ==================================================================            
-            proxy_uri = f"http://{user}:{pw}@{host}:{port}" if user and pw else f"http://{host}:{port}"
-            opts['proxy'] = {'http': proxy_uri, 'https': proxy_uri, 'no_proxy': 'localhost,127.0.0.1'}
-            logging.info("Selenium-Wire proxy configurado (%s): %s", (region or "DEFAULT"), proxy_uri)
-        else:
-            logging.warning("want_proxy=True mas variáveis de proxy ausentes (%s). Seguiremos sem upstream.", region or "DEFAULT")
-        return opts
-    def get_browser(name="chrome", options=None, proxy=None, idioma: str = "auto", headless: bool = False, *, want_proxy: Optional[bool] = None, region: Optional[str] = None, lang_tag: Optional[str] = None, **kwargs):
-        if want_proxy is None: want_proxy = _want_proxy_default(idioma)
-        if region is None: region = _region_default(idioma)
-        if lang_tag is None: lang_tag = _lang_tag_default(idioma)
-        logging.info("get_browser (fallback): idioma=%s | want_proxy=%s | region=%s | lang_tag=%s", idioma, want_proxy, region or "-", lang_tag)
-        if name == "chrome":
-            if options is None: options = ChromeOptions()
-            options.add_argument(f"--lang={lang_tag}")
-            options.add_argument("--disable-logging")
-            options.add_argument("--log-level=3")
-            options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
-            options.add_experimental_option("useAutomationExtension", False)
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-popup-blocking")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--remote-debugging-pipe")
-            if headless:
-                options.add_argument("--headless=new")
-                options.add_argument("--ignore-certificate-errors")
-                options.add_argument("--disable-gpu")
-                options.add_argument("--use-gl=swiftshader")
-                options.add_argument("--enable-unsafe-swiftshader")
-                options.add_argument("--ignore-gpu-blocklist")
-            sw_opts = _mk_sw_opts(bool(want_proxy), region)
-
-            # CRIAMOS O SERVIÇO SEPARADAMENTE PARA ADICIONAR A OPÇÃO
-            service = ChromeService(
-                ChromeDriverManager().install(),
-                port=0,
-                log_output=os.devnull  # <<-- ESTA É A LINHA QUE SILENCIA TUDO
-            )
-            driver = wire_webdriver.Chrome(service=service, options=options, seleniumwire_options=sw_opts)
-            
-            try:
-                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Accept-Language": _accept_header_from_tag(lang_tag), "Upgrade-Insecure-Requests": "1"}})
-                driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": "try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e){}"})
-            except Exception as e:
-                logging.error(f"Erro ao configurar CDP: {e}")
-            return driver
-        elif name == "firefox":
-            if options is None: options = FirefoxOptions()
-            if headless: options.add_argument("-headless")
-            try: options.set_preference("intl.accept_languages", _accept_header_from_tag(lang_tag))
-            except Exception: pass
-            sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            return wire_webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install(), port=0), options=options, seleniumwire_options=sw_opts)
-        elif name == "edge":
-            if options is None: options = EdgeOptions()
-            options.add_argument(f"--lang={lang_tag}")
-            options.add_argument("--remote-debugging-pipe")
-            if headless: options.add_argument("--headless=new")
-            sw_opts = _mk_sw_opts(bool(want_proxy), region)
-            return wire_webdriver.Edge(service=EdgeService(EdgeChromiumDriverManager().install(), port=0), options=options, seleniumwire_options=sw_opts)
-        else:
-            raise ValueError(f"Navegador {name} não suportado")
-
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
-logging.getLogger("webdriver_manager").setLevel(logging.WARNING) # <<-- ADICIONE ESTA LINHA
 
 from .utils import bold
 from .types import VideoDict, ProxyDict, Cookie
@@ -664,10 +517,6 @@ def upload_video(
     lang_tag = _lang_tag_from_idioma(idioma)
     logger.info("upload_video: idioma=%s | want_proxy=%s | use_vpn=%s | region=%s | lang_tag=%s", idioma, want_proxy, use_vpn, region or "-", lang_tag)
 
-    # ##############################################################
-    # CORREÇÃO APLICADA AQUI
-    # Recupera o nome do perfil da VPN com base no provedor selecionado no .env
-    # ##############################################################
     vpn_profile_name = None
     if use_vpn:
         provider = os.getenv("VPN_PROVIDER", "none").lower()
@@ -675,7 +524,6 @@ def upload_video(
             vpn_profile_name = os.getenv("URBANVPN_PROFILE_NAME")
         elif provider == 'zoog':
             vpn_profile_name = os.getenv("ZOOGVPN_PROFILE_NAME")
-    # ##############################################################
 
     # Gerenciamento do WebDriver
     driver = None
@@ -685,7 +533,6 @@ def upload_video(
     else:
         logger.info("Usando agente de navegador definido pelo usuário")
         driver = browser_agent
-        # Lógica para recriar o driver se necessário (mantida)
         is_wire = _is_seleniumwire_driver(driver)
         needs_network_features = want_proxy or use_vpn
         if needs_network_features and not is_wire:
@@ -708,7 +555,7 @@ def upload_video(
                 want_proxy=want_proxy,
                 region=region,
                 lang_tag=lang_tag,
-                vpn_profile_name=vpn_profile_name, # Passa o nome do perfil CORRETO
+                vpn_profile_name=vpn_profile_name,
                 *args,
                 **kwargs
             )

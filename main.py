@@ -4,6 +4,7 @@ import sys
 import time
 import logging
 import random
+import shutil
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import multiprocessing
@@ -29,6 +30,7 @@ LOG_LEVEL = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INF
 logging.basicConfig(level=LOG_LEVEL, format='[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S')
 logging.getLogger("seleniumwire").setLevel(logging.WARNING)
 logging.getLogger("hpack").setLevel(logging.WARNING)
+logging.getLogger("webdriver_manager").setLevel(logging.WARNING) # Adicionado para limpar logs
 logger = logging.getLogger(__name__)
 
 # ====== Imports do pipeline ======
@@ -53,7 +55,6 @@ try:
     _HAVE_VEO3 = True
 except Exception: _HAVE_VEO3 = False
 try:
-    # Atualizado para importar a nova função de setup orquestrada
     from utils.vpn_manager import setup_vpn, is_vpn_setup_complete
     _HAVE_VPN = True
 except ImportError:
@@ -104,10 +105,6 @@ def _menu_modo_execucao() -> str:
         if op == "2": return "2"
 
 def _selecionar_modo_output() -> dict:
-    """
-    Pergunta ao usuário qual o modo de saída: Postar ou Só salvar.
-    Retorna: {"modo": "postar" | "salvar", "custom_pasta": path | None}
-    """
     while True:
         print("\nSelecione o modo de saída do vídeo:")
         print("1. Gerar e postar normalmente [padrão]")
@@ -224,7 +221,6 @@ def _map_video_style_to_image_template(style_key: str) -> str:
     if s in ("mono", "4"): return "minimal_center"
     return "minimal_center"
 
-# Substitua a sua função rotina por esta:
 def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, video_style: str, motion: str, image_engine: str, use_vpn: bool, headless_tiktok: bool, apenas_salvar: bool = False) -> Optional[str]:
     """
     Executa a rotina principal de geração de vídeo.
@@ -284,17 +280,16 @@ def rotina(modo_conteudo: str, idioma: str, tts_engine: str, legendas: bool, vid
         
     gerar_video(imagem_path=slides_para_video[0], saida_path=video_final, preset="fullhd", idioma=idioma, tts_engine=tts_engine, legendas=legendas, video_style=video_style, motion=motion, slides_paths=slides_para_video, content_mode=modo_conteudo, long_text=long_text)
     
-    # --- LÓGICA DE DECISÃO CENTRAL ---
     if apenas_salvar:
         logger.info(f"✓ Vídeo gerado com sucesso em '{video_final}'. Pulando etapa de postagem.")
-        return video_final  # Retorna o caminho do arquivo para ser salvo externamente
+        return video_final
     else:
         ok = postar_no_tiktok_e_renomear(descricao_personalizada=desc_tiktok, video_final=video_final, idioma=idioma, use_vpn=use_vpn, headless=headless_tiktok)
         if ok:
             logger.info("✓ Processo concluído com sucesso!")
         else:
             logger.error("✗ Falha na postagem. Verifique os logs!")
-        return None # Não precisa retornar o caminho pois o fluxo termina aqui
+        return None
     
 ITERATION_TIMEOUT_MIN = float(os.getenv("ITERATION_TIMEOUT_MIN", "12.0"))
 def _run_rotina_once(args_tuple):
@@ -313,7 +308,7 @@ def postar_em_intervalo(cada_horas: float, **kwargs):
             _reload_env_if_changed()
             inicio = datetime.now()
             logger.info("⏳ Nova execução (%s).", inicio.strftime('%d/%m %H:%M:%S'))
-            ok = _executar_com_timeout(tuple(kwargs.values()))
+            _executar_com_timeout(tuple(kwargs.values()))
             proxima = inicio + timedelta(hours=cada_horas)
             rem = max(0.0, (proxima - datetime.now()).total_seconds())
             logger.info("Próxima execução em %.2f horas...", rem / 3600.0)
@@ -331,7 +326,54 @@ def _limpar_pasta(destino: str):
     except Exception as e:
         logger.warning(f"Falha ao limpar pasta '{destino}': {e}")
 
-# Substitua a sua função _menu_principal por esta:
+def _run_rotina_salvar_once(custom_pasta: str, **kwargs):
+    kwargs["apenas_salvar"] = True
+    caminho_gerado = rotina(**kwargs)
+    if caminho_gerado and os.path.exists(caminho_gerado):
+        try:
+            nome_arquivo = os.path.basename(caminho_gerado)
+            _limpar_pasta(custom_pasta)
+            destino_final = os.path.join(custom_pasta, nome_arquivo)
+            shutil.copy2(caminho_gerado, destino_final)
+            logger.info(f"✓ Vídeo salvo com sucesso em '{destino_final}' (pasta de destino limpa antes).")
+            return True
+        except Exception as e:
+            logger.error(f"✗ Falha ao salvar o vídeo na pasta personalizada: {e}")
+            return False
+    else:
+        logger.error("✗ Falha na geração do vídeo, arquivo não encontrado para salvar.")
+        return False
+
+def _executar_salvamento_com_timeout(args_tuple):
+    try:
+        custom_pasta, kwargs_dict = args_tuple
+        return _run_rotina_salvar_once(custom_pasta, **kwargs_dict)
+    except Exception as e:
+        logging.exception("Falha na execução única de salvamento: %s", e)
+        return False
+
+def salvar_em_intervalo(cada_horas: float, custom_pasta: str, **kwargs):
+    logger.info(f"⌛ Modo automático de SALVAMENTO: a cada {cada_horas:.2f} h em '{custom_pasta}' (Ctrl+C para parar).")
+    try:
+        while True:
+            _reload_env_if_changed()
+            inicio = datetime.now()
+            logger.info("⏳ Nova geração de vídeo (%s).", inicio.strftime('%d/%m %H:%M:%S'))
+            args_para_execucao = (custom_pasta, kwargs)
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
+                fut = ex.submit(_executar_salvamento_com_timeout, args_para_execucao)
+                try:
+                    fut.result(timeout=int(ITERATION_TIMEOUT_MIN * 60))
+                except TimeoutError:
+                    logging.error("✗ Iteração de salvamento excedeu %.1f min — abortando.", ITERATION_TIMEOUT_MIN)
+            proxima = inicio + timedelta(hours=cada_horas)
+            rem = max(0.0, (proxima - datetime.now()).total_seconds())
+            logger.info("Próxima geração de vídeo em %.2f horas...", rem / 3600.0)
+            time.sleep(rem)
+    except KeyboardInterrupt:
+        logger.info("⏹️ Encerrado pelo usuário.")
+
 def _menu_principal():
     _reload_env_if_changed(force=False)
     while True:
@@ -339,35 +381,18 @@ def _menu_principal():
         _reload_env_if_changed(force=False)
         idioma = _selecionar_idioma()
         if idioma is None: continue
-
         op_output = _selecionar_modo_output()
-
-        # Variáveis com valores padrão para o caso de "apenas salvar"
         use_vpn = False
         ans_tt = False
-
-        # =============================================================================
-        # LÓGICA DE VPN E HEADLESS MOVIDA PARA DENTRO DESTA CONDIÇÃO
-        # Agora só executa se a intenção for postar o vídeo.
-        # =============================================================================
+        horas = 0
         if op_output["modo"] == "postar":
             idioma_selecionado = idioma.lower().strip()
             provider = os.getenv("VPN_PROVIDER", "none").lower()
-            
             vpn_langs_str = ""
-            if provider == 'urban':
-                vpn_langs_str = os.getenv('URBANVPN_LANGS', '')
-            elif provider == 'zoog':
-                vpn_langs_str = os.getenv('ZOOGVPN_LANGS', '')
-            
+            if provider == 'urban': vpn_langs_str = os.getenv('URBANVPN_LANGS', '')
+            elif provider == 'zoog': vpn_langs_str = os.getenv('ZOOGVPN_LANGS', '')
             vpn_langs = [lang.strip().lower() for lang in vpn_langs_str.split(',') if lang.strip()]
-            
-            use_vpn = (
-                _HAVE_VPN and
-                provider in ('urban', 'zoog') and
-                idioma_selecionado in vpn_langs
-            )
-            
+            use_vpn = (_HAVE_VPN and provider in ('urban', 'zoog') and idioma_selecionado in vpn_langs)
             if use_vpn:
                 os.environ['HEADLESS_UPLOAD'] = '0'
                 logger.info(f"ℹ️ VPN ({provider.upper()}) necessária. O modo Headless para o TikTok foi desativado automaticamente.")
@@ -377,23 +402,20 @@ def _menu_principal():
                 if ans_tt_resp is None: continue
                 ans_tt = ans_tt_resp
                 os.environ['HEADLESS_UPLOAD'] = '1' if ans_tt else '0'
-        # =============================================================================
-
+        
+        if modo == "2":
+             horas = _ler_intervalo_horas()
+             if horas is None: continue
+        
         conteudo = _submenu_conteudo_por_idioma(idioma)
         if conteudo is None: continue
         
         if conteudo[0] == "veo3":
             if modo == "2":
-                horas = _ler_intervalo_horas();
                 if horas is not None: veo3_postar_em_intervalo(persona=conteudo[1], idioma=idioma, cada_horas=horas, use_vpn=use_vpn)
             else:
                 veo3_executar_interativo(persona=conteudo[1], idioma=idioma, use_vpn=use_vpn)
             continue
-        
-        # A pergunta de horas só faz sentido se for postar em intervalo
-        if modo == "2" and op_output["modo"] == "postar":
-             horas = _ler_intervalo_horas()
-             if horas is None: continue
         
         tts_engine = _selecionar_tts_engine()
         if tts_engine is None: continue
@@ -405,42 +427,18 @@ def _menu_principal():
         if motion is None: continue
         image_engine = _selecionar_gerador_imagens(os.getenv("IMAGE_MODE", "pexels"))
         if image_engine is None: continue
-
         headless_tiktok = not use_vpn and ans_tt if not use_vpn else False
-
         kwargs = {
             "modo_conteudo": conteudo[0], "idioma": idioma, "tts_engine": tts_engine, "legendas": legendas,
             "video_style": video_style, "motion": motion, "image_engine": image_engine, "use_vpn": use_vpn,
             "headless_tiktok": headless_tiktok
         }
-
-        # --- EXECUÇÃO COM O FLUXO CORRIGIDO E ROBUSTO ---
         if op_output["modo"] == "salvar":
-            import shutil
-            kwargs["apenas_salvar"] = True
-            
-            caminho_gerado = rotina(**kwargs)
-
-            if caminho_gerado and os.path.exists(caminho_gerado):
-                try:
-                    destino_pasta = op_output["custom_pasta"]
-                    nome_arquivo = os.path.basename(caminho_gerado)
-                    
-                    _limpar_pasta(destino_pasta)
-
-                    destino_final = os.path.join(destino_pasta, nome_arquivo)
-                    shutil.copy2(caminho_gerado, destino_final)
-                    
-                    print(f"\n✓ Vídeo salvo com sucesso em '{destino_final}'.")
-                    logger.info(f"Arquivo salvo em '{destino_final}' (pasta de destino limpa antes).")
-                except Exception as e:
-                    print(f"\n✗ Falha ao salvar o vídeo na pasta personalizada: {e}")
-                    logger.error(f"Falha ao salvar o vídeo na pasta personalizada: {e}")
+            if modo == "2":
+                salvar_em_intervalo(cada_horas=horas, custom_pasta=op_output["custom_pasta"], **kwargs)
             else:
-                print("\n✗ Falha na geração do vídeo, arquivo não encontrado para salvar.")
-                logger.error("A rotina de geração não retornou um caminho de vídeo válido.")
-
-        else: # op_output["modo"] == "postar"
+                _run_rotina_salvar_once(custom_pasta=op_output["custom_pasta"], **kwargs)
+        else:
             if modo == "2":
                 postar_em_intervalo(cada_horas=horas, **kwargs)
             else:
@@ -452,25 +450,15 @@ if __name__ == "__main__":
     except Exception:
         pass
     _reload_env_if_changed(force=True)
-
-    # ##############################################################
-    # LÓGICA DE SETUP INICIAL DA VPN - ATUALIZADA E DINÂMICA
-    # ##############################################################
     if _HAVE_VPN:
         provider = os.getenv("VPN_PROVIDER", "none").lower()
-        
         if provider in ('urban', 'zoog'):
             profile_name = None
-            if provider == 'urban':
-                profile_name = os.getenv("URBANVPN_PROFILE_NAME")
-            elif provider == 'zoog':
-                profile_name = os.getenv("ZOOGVPN_PROFILE_NAME")
-
+            if provider == 'urban': profile_name = os.getenv("URBANVPN_PROFILE_NAME")
+            elif provider == 'zoog': profile_name = os.getenv("ZOOGVPN_PROFILE_NAME")
             if profile_name:
                 if not is_vpn_setup_complete(profile_name):
-                    logger.warning("="*50)
-                    logger.warning(f"‼️ ATENÇÃO: Configuração da {provider.upper()} VPN necessária (primeira execução).")
-                    logger.warning("="*50)
+                    logger.warning("="*50); logger.warning(f"‼️ ATENÇÃO: Configuração da {provider.upper()} VPN necessária (primeira execução)."); logger.warning("="*50)
                     setup_vpn()
                     logger.info(f"Setup da {provider.upper()} VPN concluído. Por favor, reinicie o script para continuar.")
                     sys.exit(0)
